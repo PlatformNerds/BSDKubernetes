@@ -64,11 +64,23 @@ The first multi-node run: control plane `bsdk8s` (192.168.100.1) + worker `bsdk8
        `nonewprivs` through podman and checks the bit.
      Verified on both nodes with pods pinned per node: `false` → euid 1000, `true` and unset → euid 0 (Kubernetes
      semantics); the 3 `AllowPrivilegeEscalation` e2e tests pass.
-  2. **NodePort + session affinity across nodes.** `192.168.100.1:30756` was unreachable from a pod on node 2.
-     Most likely asymmetric routing: node 1 rdr's to an endpoint on node 2, which replies directly to the client on
-     node 2 without un-NAT. The pf proxier deliberately omits NodePort masquerading (its natRule is commented out).
-     Affinity pins the client to the broken path, while round-robin hides it. Fix: SNAT NodePort traffic forwarded to
-     remote endpoints.
+  2. **NodePort across nodes. Fixed.** `192.168.100.1:30756` was unreachable from a pod on node 2 when the endpoint
+     was on node 2. Confirmed asymmetric routing: node 1 rdr's to the endpoint on node 2, which replies straight to
+     the client without passing node 1, so the rdr is never reversed. The same broke a host or external client
+     whose return path skips the node. Affinity pins a client to the broken path; round-robin mostly hid it. Fix
+     (`PlatformNerds/kubernetes` `4f72bafa2a2`, patch `bsdk8s/0005`): NodePort rdr rules `tag KUBE_NODEPORT`, and
+     tagged traffic to **remote** endpoints is `nat`ed to the node IP. ClusterIP traffic keeps its source;
+     `externalTrafficPolicy: Local` (no remote endpoints) still preserves the client address. Verified with a
+     client × node matrix (pods on both nodes, both hosts → both NodeIPs: all connect). The backend sees the node IP
+     via the remote node and the pod IP via the local one. Also fixed: the IPv6 proxier was given the IPv4 node IP.
+     - **Found while testing: stale UDP states. Fixed** (`b2cb87563f3`, patch `bsdk8s/0006`). A UDP client with a
+       fixed source port stayed pinned by its pf state to a deleted endpoint (or old target port) indefinitely.
+       iptables mode deletes conntrack entries; the pf proxier now lists states after each sync and kills (`pfctl
+       -k key`) the UDP rdr states whose endpoint is no longer current. Its rules for a Service whose endpoints all
+       went away were also never removed; they are flushed now. Fixes 2 (non-conformance) `Conntrack` tests.
+     - **Open: hostNetwork clients can't reach ClusterIPs.** pf on 15.x doesn't rdr host-originated traffic (the same
+       root cause as the apiserver workaround above), so the `Conntrack ... client is hostNetwork` test fails. Next
+       step: `route-to lo0` + `rdr on lo0` for the Service CIDR.
   3. **Garbage collector:** the API call timed out (`context deadline exceeded`) under load. Likely flaky; re-run to
      confirm.
 

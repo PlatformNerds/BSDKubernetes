@@ -1,0 +1,253 @@
+From b2cb87563f303d0f6ef3ce80353ae6ce8ac82b4b Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 15:18:51 -0700
+Subject: [PATCH 6/6] proxy/pf: kill stale UDP states; flush rules of services
+ without endpoints
+
+UDP has no teardown, so a pf rdr state kept a client (fixed source address
+and port) pinned to the endpoint it first picked after that endpoint was
+deleted or the target port changed; a client that keeps sending never lets
+the state expire. After each sync, list pf states and kill (by key) the
+inbound UDP rdr states of known UDP Service frontends whose endpoint is no
+longer current: the pf equivalent of the iptables proxier's conntrack
+cleanup. Fixes the Conntrack e2e tests 'should be able to preserve UDP
+traffic when server pod cycles for a NodePort service' and '...cleanup
+conntrack entries when UDP service target port changes for a NodePort
+service'.
+
+Also, a service whose endpoints all went away kept its old rdr rules
+(the sync skipped it without rewriting its anchor); flush them.
+---
+ pkg/proxy/pf/proxier.go      |  22 +++++++
+ pkg/proxy/pf/proxier_test.go |  41 ++++++++++++-
+ pkg/proxy/pf/udpstates.go    | 108 +++++++++++++++++++++++++++++++++++
+ 3 files changed, 169 insertions(+), 2 deletions(-)
+ create mode 100644 pkg/proxy/pf/udpstates.go
+
+diff --git a/pkg/proxy/pf/proxier.go b/pkg/proxy/pf/proxier.go
+index 0dd901f6d2c..64a664afc64 100644
+--- a/pkg/proxy/pf/proxier.go
++++ b/pkg/proxy/pf/proxier.go
+@@ -509,6 +509,9 @@ func (proxier *Proxier) syncProxyRules() error {
+ 		klog.ErrorS(err, "Failed to get node ip address matching nodeport cidrs, services with nodeport may not work as intended", "CIDRs", proxier.nodePortAddresses)
+ 	}
+ 
++	// UDP frontends and their current endpoints, for killStaleUDPStates.
++	udpFronts := udpFrontends{}
++
+ 	// Build rules for each service-port.
+ 	for svcName, svc := range proxier.svcPortMap {
+ 		svcInfo, ok := svc.(*servicePortInfo)
+@@ -550,7 +553,25 @@ func (proxier *Proxier) syncProxyRules() error {
+ 				targetPort = port
+ 			}
+ 		}
++		if svcInfo.Protocol() == v1.ProtocolUDP {
++			endpoints := sets.New[string]()
++			for _, ep := range targetEndpoints {
++				endpoints.Insert(pfAddrPort(ep.IP(), targetPort))
++			}
++			udpFronts[pfAddrPort(svcInfo.ClusterIP().String(), svcInfo.Port())] = endpoints
++			if svcInfo.NodePort() != 0 {
++				for _, ip := range nodeIPs {
++					udpFronts[pfAddrPort(ip.String(), svcInfo.NodePort())] = endpoints
++				}
++			}
++		}
+ 		if len(targetEndpoints) == 0 {
++			// No endpoints (left): drop the rules that still redirect
++			// to the old ones.
++			cmd := proxier.exec.Command("pfctl", "-a", "cni-rdr/"+svcInfo.anchorName, "-F", "nat")
++			if out, err := cmd.CombinedOutput(); err != nil {
++				klog.ErrorS(err, "Failed to flush rules of service without endpoints", "service", svcName, "output", string(out))
++			}
+ 			continue
+ 		}
+ 
+@@ -624,6 +645,7 @@ func (proxier *Proxier) syncProxyRules() error {
+ 			klog.Errorf("error loading rules input: '%s', output: %s, err: %v", input, output, err)
+ 		}
+ 	}
++	proxier.killStaleUDPStates(udpFronts)
+ 	for a := range staleAnchors {
+ 		proxier.logger.V(2).Info("deleting PF anchor", a)
+ 		cmd := proxier.exec.Command("pfctl", "-a", "cni-rdr/"+a, "-F", "nat")
+diff --git a/pkg/proxy/pf/proxier_test.go b/pkg/proxy/pf/proxier_test.go
+index dfd29703856..79b35c4bc19 100644
+--- a/pkg/proxy/pf/proxier_test.go
++++ b/pkg/proxy/pf/proxier_test.go
+@@ -1,5 +1,3 @@
+-//go:build freebsd
+-
+ /*
+ Copyright 2026 The Kubernetes Authors.
+ 
+@@ -20,8 +18,10 @@ package pf
+ 
+ import (
+ 	"net"
++	"strings"
+ 	"testing"
+ 
++	"k8s.io/apimachinery/pkg/util/sets"
+ 	proxyutil "k8s.io/kubernetes/pkg/proxy/util"
+ )
+ 
+@@ -61,3 +61,40 @@ func TestNodePortSNATRule(t *testing.T) {
+ 		t.Errorf("got  %q\nwant %q", got, want)
+ 	}
+ }
++
++func TestStaleUDPStates(t *testing.T) {
++	out := `all tcp 10.244.1.7:8080 (192.168.100.2:30080) <- 10.244.0.88:5555       ESTABLISHED:ESTABLISHED
++all udp 10.244.1.7:8081 (192.168.100.2:30081) <- 10.244.0.88:4444       MULTIPLE:MULTIPLE
++all udp 10.244.1.9:8081 (10.96.0.20:81) <- 10.244.0.88:4445       MULTIPLE:MULTIPLE
++all udp 10.244.1.9:8082 (10.96.0.20:81) <- 10.244.0.88:4446       MULTIPLE:MULTIPLE
++all udp 10.244.1.5:53 (10.96.0.99:53) <- 10.244.0.88:4447       MULTIPLE:MULTIPLE
++all udp fd00::7[53] (fd01::a[53]) <- fd00::8[4448]       MULTIPLE:MULTIPLE
++all udp 192.168.100.1:61234 (10.244.0.88:4444) -> 10.244.1.7:8081       MULTIPLE:MULTIPLE
++all udp 10.0.2.15:68 <- 10.0.2.2:67       MULTIPLE:MULTIPLE
++`
++	states := parseRdrStates(out)
++	if len(states) != 6 {
++		t.Fatalf("parsed %d rdr states, want 6: %v", len(states), states)
++	}
++	fronts := udpFrontends{
++		// endpoint 10.244.1.7 is gone: state 4444 is stale
++		pfAddrPort("192.168.100.2", 30081): sets.New(pfAddrPort("10.244.1.8", 8081)),
++		// target port changed 8081 -> 8082: state 4445 is stale, 4446 is not
++		pfAddrPort("10.96.0.20", 81): sets.New(pfAddrPort("10.244.1.9", 8082)),
++		// no endpoints left: state 4448 is stale
++		pfAddrPort("fd01::a", 53): sets.New[string](),
++		// 10.96.0.99:53 is not a known UDP frontend: 4447 is left alone
++	}
++	var got []string
++	for _, s := range staleUDPStates(states, fronts) {
++		got = append(got, s.key())
++	}
++	want := []string{
++		"udp 192.168.100.2:30081 <- 10.244.0.88:4444",
++		"udp 10.96.0.20:81 <- 10.244.0.88:4445",
++		"udp fd01::a[53] <- fd00::8[4448]",
++	}
++	if strings.Join(got, "\n") != strings.Join(want, "\n") {
++		t.Errorf("stale states:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
++	}
++}
+diff --git a/pkg/proxy/pf/udpstates.go b/pkg/proxy/pf/udpstates.go
+new file mode 100644
+index 00000000000..b2125c9937d
+--- /dev/null
++++ b/pkg/proxy/pf/udpstates.go
+@@ -0,0 +1,108 @@
++/*
++Copyright 2026 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package pf
++
++import (
++	"fmt"
++	"strings"
++
++	"k8s.io/apimachinery/pkg/util/sets"
++	"k8s.io/klog/v2"
++)
++
++// UDP has no connection teardown, so a pf state created by an rdr rule keeps
++// sending a client (same source address and port) to the endpoint it first
++// picked, even after that endpoint is gone or the Service's target port has
++// changed, until the state expires; a client that keeps sending never lets it
++// expire. The iptables proxier deletes such conntrack entries; this is the pf
++// equivalent: after each sync, kill rdr states for UDP Service frontends whose
++// redirect target is no longer a current endpoint.
++
++// udpFrontends maps a UDP Service frontend (ClusterIP:port, NodeIP:nodePort),
++// formatted as pfctl prints it, to its current endpoints in the same format.
++// An empty set means the Service has no endpoints.
++type udpFrontends map[string]sets.Set[string]
++
++// pfAddrPort formats an address and port like pfctl -ss does: "a.b.c.d:port"
++// for IPv4, "addr[port]" for IPv6.
++func pfAddrPort(ip string, port int) string {
++	if strings.Contains(ip, ":") {
++		return fmt.Sprintf("%s[%d]", ip, port)
++	}
++	return fmt.Sprintf("%s:%d", ip, port)
++}
++
++// pfState is an inbound translated state from pfctl -ss, e.g.
++//
++//	all udp 10.244.1.7:8081 (192.168.100.2:30081) <- 10.244.0.88:4444       MULTIPLE:MULTIPLE
++//
++// stack is the address after rdr (the endpoint), wire the address the client
++// sent to (the Service frontend), peer the client.
++type pfState struct {
++	proto, stack, wire, peer string
++}
++
++// key is the state key that pfctl -k key accepts for this state.
++func (s pfState) key() string {
++	return s.proto + " " + s.wire + " <- " + s.peer
++}
++
++// parseRdrStates returns the inbound translated states in pfctl -ss output.
++func parseRdrStates(out string) []pfState {
++	var states []pfState
++	for _, line := range strings.Split(out, "\n") {
++		f := strings.Fields(line)
++		if len(f) < 6 || f[4] != "<-" || !strings.HasPrefix(f[3], "(") || !strings.HasSuffix(f[3], ")") {
++			continue
++		}
++		states = append(states, pfState{proto: f[1], stack: f[2], wire: strings.Trim(f[3], "()"), peer: f[5]})
++	}
++	return states
++}
++
++// staleUDPStates returns the UDP states to a known frontend whose endpoint is
++// no longer one of that frontend's endpoints.
++func staleUDPStates(states []pfState, frontends udpFrontends) []pfState {
++	var stale []pfState
++	for _, s := range states {
++		if s.proto != "udp" {
++			continue
++		}
++		if endpoints, ok := frontends[s.wire]; ok && !endpoints.Has(s.stack) {
++			stale = append(stale, s)
++		}
++	}
++	return stale
++}
++
++// killStaleUDPStates kills the stale UDP rdr states (see above).
++func (proxier *Proxier) killStaleUDPStates(frontends udpFrontends) {
++	if len(frontends) == 0 {
++		return
++	}
++	out, err := proxier.exec.Command("pfctl", "-ss").Output()
++	if err != nil {
++		klog.ErrorS(err, "Failed to list pf states, stale UDP states not cleared")
++		return
++	}
++	for _, s := range staleUDPStates(parseRdrStates(string(out)), frontends) {
++		proxier.logger.V(2).Info("Killing stale UDP state", "state", s.key(), "endpoint", s.stack)
++		if out, err := proxier.exec.Command("pfctl", "-k", "key", "-k", s.key()).CombinedOutput(); err != nil {
++			klog.ErrorS(err, "Failed to kill stale UDP state", "state", s.key(), "output", string(out))
++		}
++	}
++}
+-- 
+2.54.0 (Apple Git-157)
+

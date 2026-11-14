@@ -10,9 +10,10 @@ Raw results: [`conformance/`](../conformance/) (gzipped JUnit + failure lists).*
 | Run | Passed | Pass rate | Excluding `[LinuxOnly]` | Duration |
 |---|---|---|---|---|
 | run 1 | 381 / 446 | 85.4% | 356 / 400 = 89.0% | 1h34m |
-| **run 2** | **415 / 446** | **93.0%** | **388 / 400 = 97.0%** | 57m |
+| run 2 | 415 / 446 | 93.0% | 388 / 400 = 97.0% | 57m |
+| **run 3** | **423 / 446** | **94.8%** | **392 / 400 = 98.0%** | 48m |
 
-Run 2 fixed 34 tests and regressed none.
+Run 2 fixed 34 tests and regressed none. Run 3 (after the kube-proxy session-affinity fix and ocijail file mounts below devfs) fixed 8 more, again with no regressions. The only remaining non-`[LinuxOnly]` failures are in-place pod resize (6) and the two-node requirement (2).
 
 **Why report "excluding `[LinuxOnly]`":** upstream tags tests that check Linux-specific behaviour (`/proc`, sysctls,
 Linux error-message wording, bind-mount fs types, ...) as `[LinuxOnly]`. Windows nodes skip them in their conformance

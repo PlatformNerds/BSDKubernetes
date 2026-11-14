@@ -1,0 +1,125 @@
+From a6ad462869bc3203e9916ae0c081f12749d7ba78 Mon Sep 17 00:00:00 2001
+From: BSDKubernetes <bsdk8s@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 19:03:38 -0700
+Subject: [PATCH] kubelet/cadvisor: make FreeBSD build cgo-free; fix rctl racct
+ parsing
+
+- Replace the cgo use of struct vmtotal/sysconf with a Go mirror of
+  struct vmtotal and hw.physmem, so the kubelet builds with
+  CGO_ENABLED=0 and can be cross-compiled (amd64, arm64).
+- getRacct: add the missing format argument (go vet), grow the buffer
+  on ERANGE instead of failing at 1 KiB, tolerate a missing NUL, skip
+  malformed entries instead of panicking on kv[1], and skip (not
+  store 0 for) unparsable values.
+---
+ pkg/kubelet/cadvisor/cadvisor_freebsd.go | 68 +++++++++++++++---------
+ 1 file changed, 42 insertions(+), 26 deletions(-)
+
+diff --git a/pkg/kubelet/cadvisor/cadvisor_freebsd.go b/pkg/kubelet/cadvisor/cadvisor_freebsd.go
+index b9f92672362..55bf17c9122 100644
+--- a/pkg/kubelet/cadvisor/cadvisor_freebsd.go
++++ b/pkg/kubelet/cadvisor/cadvisor_freebsd.go
+@@ -18,12 +18,6 @@ limitations under the License.
+ 
+ package cadvisor
+ 
+-// #include <unistd.h>
+-// #include <sys/vmmeter.h>
+-// #include <sys/sysctl.h>
+-// #include <vm/vm_param.h>
+-import "C"
+-
+ import (
+ 	"bytes"
+ 	"context"
+@@ -168,20 +162,30 @@ func (cu *cadvisorClient) GetRequestedContainersInfo(containerName string, optio
+ 	return nil, nil
+ }
+ 
++// vmtotal mirrors struct vmtotal from <sys/vmmeter.h> (stable layout since FreeBSD 12).
++// Defined in Go so the kubelet can be built with CGO_ENABLED=0 and cross-compiled.
++type vmtotal struct {
++	VM, AVM, RM, ARM, VMShr, AVMShr, RMShr, ARMShr, Free uint64
++	RQ, DW, PW, SL, SW                                   int16
++	_                                                    [3]uint16
++}
++
+ func getMemInfo() (int64, int64, error) {
+ 	data, err := unix.SysctlRaw("vm.vmtotal")
+ 	if err != nil {
+ 		return -1, -1, fmt.Errorf("can't get kernel info: %w", err)
+ 	}
+-	if len(data) != C.sizeof_struct_vmtotal {
++	if len(data) != int(unsafe.Sizeof(vmtotal{})) {
+ 		return -1, -1, fmt.Errorf("unexpected vmtotal size %d", len(data))
+ 	}
++	total := (*vmtotal)(unsafe.Pointer(&data[0]))
+ 
+-	total := (*C.struct_vmtotal)(unsafe.Pointer(&data[0]))
+-
+-	pagesize := int64(C.sysconf(C._SC_PAGESIZE))
+-	npages := int64(C.sysconf(C._SC_PHYS_PAGES))
+-	return pagesize * npages, pagesize * int64(total.t_free), nil
++	physmem, err := unix.SysctlUint64("hw.physmem")
++	if err != nil {
++		return -1, -1, fmt.Errorf("can't get hw.physmem value: %w", err)
++	}
++	pagesize := int64(unix.Getpagesize())
++	return int64(physmem), pagesize * int64(total.Free), nil
+ }
+ 
+ func createRootContainerInfo() (*cadvisorapiv2.ContainerInfo, error) {
+@@ -297,24 +301,36 @@ func getRacct(filter string) (map[string]uint64, error) {
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	var buf [1024]byte
+-	_, _, errno := syscall.Syscall6(syscall.SYS_RCTL_GET_RACCT,
+-		uintptr(unsafe.Pointer(&bp[0])),
+-		uintptr(len(bp)),
+-		uintptr(unsafe.Pointer(&buf[0])),
+-		uintptr(len(buf)), 0, 0)
+-	if errno != 0 {
+-		return nil, fmt.Errorf("error calling rctl_get_racct with filter %s: %v", errno)
++	// rctl_get_racct returns ERANGE when the buffer is too small; grow and retry.
++	var buf []byte
++	for size := 1024; ; size *= 2 {
++		buf = make([]byte, size)
++		_, _, errno := syscall.Syscall6(syscall.SYS_RCTL_GET_RACCT,
++			uintptr(unsafe.Pointer(&bp[0])),
++			uintptr(len(bp)),
++			uintptr(unsafe.Pointer(&buf[0])),
++			uintptr(len(buf)), 0, 0)
++		if errno == syscall.ERANGE && size < 1<<20 {
++			continue
++		}
++		if errno != 0 {
++			return nil, fmt.Errorf("error calling rctl_get_racct with filter %s: %w", filter, errno)
++		}
++		break
++	}
++	if n := bytes.IndexByte(buf, 0); n >= 0 {
++		buf = buf[:n]
+ 	}
+-	len := bytes.IndexByte(buf[:], byte(0))
+-	entries := strings.Split(string(buf[:len]), ",")
+ 	res := make(map[string]uint64)
+-	for _, entry := range entries {
+-		kv := strings.SplitN(entry, "=", 2)
+-		key := kv[0]
+-		val, err := strconv.ParseUint(kv[1], 10, 0)
++	for _, entry := range strings.Split(string(buf), ",") {
++		key, value, ok := strings.Cut(entry, "=")
++		if !ok {
++			continue
++		}
++		val, err := strconv.ParseUint(value, 10, 64)
+ 		if err != nil {
+ 			klog.Warningf("unexpected rctl entry, ignoring: %s", entry)
++			continue
+ 		}
+ 		res[key] = val
+ 	}
+-- 
+2.54.0 (Apple Git-157)
+

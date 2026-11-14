@@ -1,0 +1,94 @@
+From 7c7bd95ee6b6466417eb4ddea9f603ac1778954d Mon Sep 17 00:00:00 2001
+From: Doug Rabson <dfr@rabson.org>
+Date: Mon, 21 Aug 2023 13:33:39 +0100
+Subject: [PATCH 11/12] Change the default kubelet root on FreeBSD
+
+The local path convention is to put persistent state in /var/db by default.
+---
+ cmd/kubelet/app/options/options.go         |  4 +---
+ cmd/kubelet/app/options/options_freebsd.go | 20 +++++++++++++++++++
+ cmd/kubelet/app/options/options_other.go   | 23 ++++++++++++++++++++++
+ 3 files changed, 44 insertions(+), 3 deletions(-)
+ create mode 100644 cmd/kubelet/app/options/options_freebsd.go
+ create mode 100644 cmd/kubelet/app/options/options_other.go
+
+diff --git a/cmd/kubelet/app/options/options.go b/cmd/kubelet/app/options/options.go
+index d518feeb562..b3f19f5df1f 100644
+--- a/cmd/kubelet/app/options/options.go
++++ b/cmd/kubelet/app/options/options.go
+@@ -41,8 +41,6 @@ import (
+ 	utilflag "k8s.io/kubernetes/pkg/util/flag"
+ )
+ 
+-const defaultRootDir = "/var/lib/kubelet"
+-
+ // KubeletFlags contains configuration flags for the Kubelet.
+ // A configuration field should go in KubeletFlags instead of KubeletConfiguration if any of these are true:
+ //   - its value will never, or cannot safely be changed during the lifetime of a node, or
+@@ -137,7 +135,7 @@ type KubeletFlags struct {
+ func NewKubeletFlags() *KubeletFlags {
+ 	return &KubeletFlags{
+ 		ContainerRuntimeOptions: kubeletconfig.ContainerRuntimeOptions{},
+-		CertDirectory:           "/var/lib/kubelet/pki",
++		CertDirectory:           filepath.Join(defaultRootDir, "pki"),
+ 		RootDirectory:           filepath.Clean(defaultRootDir),
+ 		MaxContainerCount:       -1,
+ 		MaxPerPodContainerCount: 1,
+diff --git a/cmd/kubelet/app/options/options_freebsd.go b/cmd/kubelet/app/options/options_freebsd.go
+new file mode 100644
+index 00000000000..d352161d147
+--- /dev/null
++++ b/cmd/kubelet/app/options/options_freebsd.go
+@@ -0,0 +1,20 @@
++/*
++Copyright 2015 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Package options contains all of the primary arguments for a kubelet.
++package options
++
++const defaultRootDir = "/var/db/kubelet"
+diff --git a/cmd/kubelet/app/options/options_other.go b/cmd/kubelet/app/options/options_other.go
+new file mode 100644
+index 00000000000..1e22e1806df
+--- /dev/null
++++ b/cmd/kubelet/app/options/options_other.go
+@@ -0,0 +1,23 @@
++//go:build !freebsd
++// +build !freebsd
++
++/*
++Copyright 2015 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Package options contains all of the primary arguments for a kubelet.
++package options
++
++const defaultRootDir = "/var/lib/kubelet"
+-- 
+2.54.0 (Apple Git-157)
+

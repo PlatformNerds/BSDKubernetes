@@ -1,0 +1,909 @@
+From 0a9557e60f80d27f36b55c0e3e9c6702f5c773a5 Mon Sep 17 00:00:00 2001
+From: Doug Rabson <dfr@rabson.org>
+Date: Sat, 31 Dec 2022 08:46:04 +0000
+Subject: [PATCH 2/2] WIP: kubeadm on FreeBSD
+
+FIXME: don't just comment out Linux capabilities
+---
+ .../app/apis/kubeadm/v1beta3/defaults.go      |   6 -
+ .../apis/kubeadm/v1beta3/defaults_common.go   |  31 +++++
+ .../apis/kubeadm/v1beta3/defaults_freebsd.go  |  32 +++++
+ .../app/apis/kubeadm/v1beta3/defaults_unix.go |   2 +-
+ .../app/apis/kubeadm/v1beta4/defaults.go      |   7 -
+ .../apis/kubeadm/v1beta4/defaults_common.go   |  31 +++++
+ .../apis/kubeadm/v1beta4/defaults_freebsd.go  |  32 +++++
+ .../app/apis/kubeadm/v1beta4/defaults_unix.go |   2 +-
+ .../app/cmd/phases/reset/cleanupnode.go       |   9 ++
+ cmd/kubeadm/app/cmd/phases/reset/unmount.go   |   2 +-
+ .../app/cmd/phases/reset/unmount_freebsd.go   |  91 ++++++++++++
+ cmd/kubeadm/app/constants/constants.go        |   5 -
+ .../app/constants/constants_freebsd.go        |  25 ++++
+ cmd/kubeadm/app/constants/constants_linux.go  |  25 ++++
+ .../app/constants/constants_windows.go        |   6 +
+ cmd/kubeadm/app/phases/addons/dns/dns.go      |   3 +
+ .../app/phases/addons/dns/manifests.go        |  12 +-
+ .../app/phases/addons/proxy/manifests.go      |   2 +-
+ cmd/kubeadm/app/phases/addons/proxy/proxy.go  |   4 +-
+ cmd/kubeadm/app/preflight/checks_freebsd.go   | 129 ++++++++++++++++++
+ cmd/kubeadm/app/preflight/checks_other.go     |   2 +-
+ .../app/util/initsystem/initsystem_freebsd.go |  84 ++++++++++++
+ .../app/util/initsystem/initsystem_unix.go    |   2 +-
+ .../validators/types_freebsd.go               |  56 ++++++++
+ .../validators/types_unix.go                  |   4 +-
+ 25 files changed, 571 insertions(+), 33 deletions(-)
+ create mode 100644 cmd/kubeadm/app/apis/kubeadm/v1beta3/defaults_common.go
+ create mode 100644 cmd/kubeadm/app/apis/kubeadm/v1beta3/defaults_freebsd.go
+ create mode 100644 cmd/kubeadm/app/apis/kubeadm/v1beta4/defaults_common.go
+ create mode 100644 cmd/kubeadm/app/apis/kubeadm/v1beta4/defaults_freebsd.go
+ create mode 100644 cmd/kubeadm/app/cmd/phases/reset/unmount_freebsd.go
+ create mode 100644 cmd/kubeadm/app/constants/constants_freebsd.go
+ create mode 100644 cmd/kubeadm/app/constants/constants_linux.go
+ create mode 100644 cmd/kubeadm/app/preflight/checks_freebsd.go
+ create mode 100644 cmd/kubeadm/app/util/initsystem/initsystem_freebsd.go
+ create mode 100644 vendor/k8s.io/system-validators/validators/types_freebsd.go
+
+diff --git a/cmd/kubeadm/app/apis/kubeadm/v1beta3/defaults.go b/cmd/kubeadm/app/apis/kubeadm/v1beta3/defaults.go
+index 27ef2a5342f..ac8bae753e7 100644
+--- a/cmd/kubeadm/app/apis/kubeadm/v1beta3/defaults.go
++++ b/cmd/kubeadm/app/apis/kubeadm/v1beta3/defaults.go
+@@ -37,18 +37,12 @@ const (
+ 	DefaultClusterDNSIP = "10.96.0.10"
+ 	// DefaultKubernetesVersion defines default kubernetes version
+ 	DefaultKubernetesVersion = "stable-1"
+-	// DefaultCertificatesDir defines default certificate directory
+-	DefaultCertificatesDir = "/etc/kubernetes/pki"
+ 	// DefaultImageRepository defines default image registry
+ 	// (previously this defaulted to k8s.gcr.io)
+ 	DefaultImageRepository = "registry.k8s.io"
+-	// DefaultManifestsDir defines default manifests directory
+-	DefaultManifestsDir = "/etc/kubernetes/manifests"
+ 	// DefaultClusterName defines the default cluster name
+ 	DefaultClusterName = "kubernetes"
+ 
+-	// DefaultEtcdDataDir defines default location of etcd where static pods will save data to
+-	DefaultEtcdDataDir = "/var/lib/etcd"
+ 	// DefaultProxyBindAddressv4 is the default bind address when the advertise address is v4
+ 	DefaultProxyBindAddressv4 = "0.0.0.0"
+ 	// DefaultProxyBindAddressv6 is the default bind address when the advertise address is v6
+diff --git a/cmd/kubeadm/app/apis/kubeadm/v1beta3/defaults_common.go b/cmd/kubeadm/app/apis/kubeadm/v1beta3/defaults_common.go
+new file mode 100644
+index 00000000000..529ceb3278f
+--- /dev/null
++++ b/cmd/kubeadm/app/apis/kubeadm/v1beta3/defaults_common.go
+@@ -0,0 +1,31 @@
++//go:build linux || windows
++// +build linux windows
++
++/*
++Copyright 2021 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package v1beta3
++
++const (
++	// DefaultCertificatesDir defines default certificate directory
++	DefaultCertificatesDir = "/etc/kubernetes/pki"
++	// DefaultManifestsDir defines default manifests directory
++	DefaultManifestsDir = "/etc/kubernetes/manifests"
++	// DefaultEtcdDataDir defines default location of etcd where static pods will save data to
++	DefaultEtcdDataDir = "/var/lib/etcd"
++	// DefaultCertificatesDir defines default certificate directory
++	DefaultCertificatesDir = "/etc/kubernetes/pki"
++)
+diff --git a/cmd/kubeadm/app/apis/kubeadm/v1beta3/defaults_freebsd.go b/cmd/kubeadm/app/apis/kubeadm/v1beta3/defaults_freebsd.go
+new file mode 100644
+index 00000000000..a941e95402c
+--- /dev/null
++++ b/cmd/kubeadm/app/apis/kubeadm/v1beta3/defaults_freebsd.go
+@@ -0,0 +1,32 @@
++//go:build freebsd
++
++/*
++Copyright 2021 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package v1beta3
++
++const (
++	// DefaultCACertPath defines default location of CA certificate on Linux
++	DefaultCACertPath = "/usr/local/etc/kubernetes/pki/ca.crt"
++	// DefaultContainerRuntimeURLScheme defines default socket url prefix
++	DefaultContainerRuntimeURLScheme = "unix"
++	// DefaultCertificatesDir defines default certificate directory
++	DefaultCertificatesDir = "/usr/local/etc/kubernetes/pki"
++	// DefaultManifestsDir defines default manifests directory
++	DefaultManifestsDir = "/usr/local/etc/kubernetes/manifests"
++	// DefaultEtcdDataDir defines default location of etcd where static pods will save data to
++	DefaultEtcdDataDir = "/var/db/etcd"
++)
+diff --git a/cmd/kubeadm/app/apis/kubeadm/v1beta3/defaults_unix.go b/cmd/kubeadm/app/apis/kubeadm/v1beta3/defaults_unix.go
+index f220ec70989..7457b7c327d 100644
+--- a/cmd/kubeadm/app/apis/kubeadm/v1beta3/defaults_unix.go
++++ b/cmd/kubeadm/app/apis/kubeadm/v1beta3/defaults_unix.go
+@@ -1,4 +1,4 @@
+-//go:build !windows
++//go:build !windows && !freebsd
+ 
+ /*
+ Copyright 2021 The Kubernetes Authors.
+diff --git a/cmd/kubeadm/app/apis/kubeadm/v1beta4/defaults.go b/cmd/kubeadm/app/apis/kubeadm/v1beta4/defaults.go
+index bbf449092dd..731c9b7ede5 100644
+--- a/cmd/kubeadm/app/apis/kubeadm/v1beta4/defaults.go
++++ b/cmd/kubeadm/app/apis/kubeadm/v1beta4/defaults.go
+@@ -37,18 +37,11 @@ const (
+ 	DefaultClusterDNSIP = "10.96.0.10"
+ 	// DefaultKubernetesVersion defines default kubernetes version
+ 	DefaultKubernetesVersion = "stable-1"
+-	// DefaultCertificatesDir defines default certificate directory
+-	DefaultCertificatesDir = "/etc/kubernetes/pki"
+ 	// DefaultImageRepository defines default image registry
+ 	// (previously this defaulted to k8s.gcr.io)
+ 	DefaultImageRepository = "registry.k8s.io"
+-	// DefaultManifestsDir defines default manifests directory
+-	DefaultManifestsDir = "/etc/kubernetes/manifests"
+ 	// DefaultClusterName defines the default cluster name
+ 	DefaultClusterName = "kubernetes"
+-
+-	// DefaultEtcdDataDir defines default location of etcd where static pods will save data to
+-	DefaultEtcdDataDir = "/var/lib/etcd"
+ 	// DefaultProxyBindAddressv4 is the default bind address when the advertise address is v4
+ 	DefaultProxyBindAddressv4 = "0.0.0.0"
+ 	// DefaultProxyBindAddressv6 is the default bind address when the advertise address is v6
+diff --git a/cmd/kubeadm/app/apis/kubeadm/v1beta4/defaults_common.go b/cmd/kubeadm/app/apis/kubeadm/v1beta4/defaults_common.go
+new file mode 100644
+index 00000000000..529ceb3278f
+--- /dev/null
++++ b/cmd/kubeadm/app/apis/kubeadm/v1beta4/defaults_common.go
+@@ -0,0 +1,31 @@
++//go:build linux || windows
++// +build linux windows
++
++/*
++Copyright 2021 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package v1beta3
++
++const (
++	// DefaultCertificatesDir defines default certificate directory
++	DefaultCertificatesDir = "/etc/kubernetes/pki"
++	// DefaultManifestsDir defines default manifests directory
++	DefaultManifestsDir = "/etc/kubernetes/manifests"
++	// DefaultEtcdDataDir defines default location of etcd where static pods will save data to
++	DefaultEtcdDataDir = "/var/lib/etcd"
++	// DefaultCertificatesDir defines default certificate directory
++	DefaultCertificatesDir = "/etc/kubernetes/pki"
++)
+diff --git a/cmd/kubeadm/app/apis/kubeadm/v1beta4/defaults_freebsd.go b/cmd/kubeadm/app/apis/kubeadm/v1beta4/defaults_freebsd.go
+new file mode 100644
+index 00000000000..aa99fe01463
+--- /dev/null
++++ b/cmd/kubeadm/app/apis/kubeadm/v1beta4/defaults_freebsd.go
+@@ -0,0 +1,32 @@
++//go:build freebsd
++
++/*
++Copyright 2021 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package v1beta4
++
++const (
++	// DefaultCACertPath defines default location of CA certificate on Linux
++	DefaultCACertPath = "/usr/local/etc/kubernetes/pki/ca.crt"
++	// DefaultContainerRuntimeURLScheme defines default socket url prefix
++	DefaultContainerRuntimeURLScheme = "unix"
++	// DefaultCertificatesDir defines default certificate directory
++	DefaultCertificatesDir = "/usr/local/etc/kubernetes/pki"
++	// DefaultManifestsDir defines default manifests directory
++	DefaultManifestsDir = "/usr/local/etc/kubernetes/manifests"
++	// DefaultEtcdDataDir defines default location of etcd where static pods will save data to
++	DefaultEtcdDataDir = "/var/db/etcd"
++)
+diff --git a/cmd/kubeadm/app/apis/kubeadm/v1beta4/defaults_unix.go b/cmd/kubeadm/app/apis/kubeadm/v1beta4/defaults_unix.go
+index 5393eef1107..db463be6ec0 100644
+--- a/cmd/kubeadm/app/apis/kubeadm/v1beta4/defaults_unix.go
++++ b/cmd/kubeadm/app/apis/kubeadm/v1beta4/defaults_unix.go
+@@ -1,4 +1,4 @@
+-//go:build !windows
++//go:build !windows && !freebsd
+ 
+ /*
+ Copyright 2023 The Kubernetes Authors.
+diff --git a/cmd/kubeadm/app/cmd/phases/reset/cleanupnode.go b/cmd/kubeadm/app/cmd/phases/reset/cleanupnode.go
+index 31ff487a666..1968037b44d 100644
+--- a/cmd/kubeadm/app/cmd/phases/reset/cleanupnode.go
++++ b/cmd/kubeadm/app/cmd/phases/reset/cleanupnode.go
+@@ -79,6 +79,15 @@ func runCleanupNode(c workflow.RunData) error {
+ 		}
+ 	}
+ 
++	if !r.DryRun() {
++		klog.V(1).Info("[reset] Removing Kubernetes-managed containers")
++		if err := removeContainers(r.CRISocketPath()); err != nil {
++			klog.Warningf("[reset] Failed to remove containers: %v\n", err)
++		}
++	} else {
++		fmt.Println("[reset] Would remove Kubernetes-managed containers")
++	}
++
+ 	if !r.DryRun() {
+ 		// In case KubeletRunDirectory holds a symbolic link, evaluate it.
+ 		// This would also throw an error if the directory does not exist.
+diff --git a/cmd/kubeadm/app/cmd/phases/reset/unmount.go b/cmd/kubeadm/app/cmd/phases/reset/unmount.go
+index d9e2fd8a41f..3d9686261f2 100644
+--- a/cmd/kubeadm/app/cmd/phases/reset/unmount.go
++++ b/cmd/kubeadm/app/cmd/phases/reset/unmount.go
+@@ -1,4 +1,4 @@
+-//go:build !linux
++//go:build !linux && !freebsd
+ 
+ /*
+ Copyright 2019 The Kubernetes Authors.
+diff --git a/cmd/kubeadm/app/cmd/phases/reset/unmount_freebsd.go b/cmd/kubeadm/app/cmd/phases/reset/unmount_freebsd.go
+new file mode 100644
+index 00000000000..ba3ef875f61
+--- /dev/null
++++ b/cmd/kubeadm/app/cmd/phases/reset/unmount_freebsd.go
+@@ -0,0 +1,91 @@
++//go:build freebsd
++
++/*
++Copyright 2019 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package phases
++
++import (
++	"bytes"
++	"strings"
++	"syscall"
++
++	"golang.org/x/sys/unix"
++
++	"k8s.io/klog/v2"
++
++	utilerrors "k8s.io/apimachinery/pkg/util/errors"
++
++	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
++	"k8s.io/kubernetes/cmd/kubeadm/app/util/errors"
++)
++
++var flagMap = map[string]int{
++	kubeadmapi.UnmountFlagMNTForce:       unix.MNT_FORCE,
++	kubeadmapi.UnmountFlagMNTDetach:      unix.MNT_FORCE,
++	kubeadmapi.UnmountFlagMNTExpire:      0,
++	kubeadmapi.UnmountFlagUmountNoFollow: 0,
++}
++
++func flagsToInt(flags []string) int {
++	res := 0
++	for _, f := range flags {
++		res |= flagMap[f]
++	}
++	return res
++}
++
++func getMounts() ([]unix.Statfs_t, error) {
++	count, err := unix.Getfsstat(nil, unix.MNT_NOWAIT)
++	if err != nil {
++		return nil, err
++	}
++	mounts := make([]unix.Statfs_t, count)
++	count, err = unix.Getfsstat(mounts, unix.MNT_NOWAIT)
++	if err != nil {
++		return nil, err
++	}
++
++	return mounts, nil
++}
++
++// unmountKubeletDirectory unmounts all paths that contain KubeletRunDirectory
++func unmountKubeletDirectory(kubeletRunDirectory string, flags []string) error {
++	mounts, err := getMounts()
++	if err != nil {
++		return err
++	}
++
++	if !strings.HasSuffix(kubeletRunDirectory, "/") {
++		// trailing "/" is needed to ensure that possibly mounted /var/lib/kubelet is skipped
++		kubeletRunDirectory += "/"
++	}
++
++	var errList []error
++	flagsInt := flagsToInt(flags)
++	for _, mount := range mounts {
++		mountPoint := string(mount.Mntonname[:bytes.IndexByte(mount.Mntonname[:], 0)])
++		if !strings.HasPrefix(mountPoint, kubeletRunDirectory) {
++			continue
++		}
++		klog.V(5).Infof("[reset] Unmounting %q", mountPoint)
++		if err := syscall.Unmount(mountPoint, flagsInt); err != nil {
++			errList = append(errList, errors.WithMessagef(err, "failed to unmount %q", mountPoint))
++		}
++	}
++	return errors.Wrapf(utilerrors.NewAggregate(errList),
++		"encountered the following errors while unmounting directories in %q", kubeletRunDirectory)
++}
+diff --git a/cmd/kubeadm/app/constants/constants.go b/cmd/kubeadm/app/constants/constants.go
+index 26389dfb7c0..c5ca3a60deb 100644
+--- a/cmd/kubeadm/app/constants/constants.go
++++ b/cmd/kubeadm/app/constants/constants.go
+@@ -34,8 +34,6 @@ import (
+ )
+ 
+ const (
+-	// KubernetesDir is the directory Kubernetes owns for storing various configuration files
+-	KubernetesDir = "/etc/kubernetes"
+ 	// ManifestsSubDirName defines directory name to store manifests
+ 	ManifestsSubDirName = "manifests"
+ 	// TempDir defines temporary directory for kubeadm
+@@ -304,9 +302,6 @@ const (
+ 	// KubeletBaseConfigurationConfigMapKey specifies in what ConfigMap key the initial remote configuration of kubelet should be stored
+ 	KubeletBaseConfigurationConfigMapKey = "kubelet"
+ 
+-	// KubeletRunDirectory specifies the directory where the kubelet runtime information is stored.
+-	KubeletRunDirectory = "/var/lib/kubelet"
+-
+ 	// KubeletConfigurationFileName specifies the file name on the node which stores initial remote configuration of kubelet
+ 	// This file should exist under KubeletRunDirectory
+ 	KubeletConfigurationFileName = "config.yaml"
+diff --git a/cmd/kubeadm/app/constants/constants_freebsd.go b/cmd/kubeadm/app/constants/constants_freebsd.go
+new file mode 100644
+index 00000000000..5765c61947c
+--- /dev/null
++++ b/cmd/kubeadm/app/constants/constants_freebsd.go
+@@ -0,0 +1,25 @@
++/*
++Copyright 2019 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package constants
++
++const (
++	// KubernetesDir is the directory Kubernetes owns for storing various configuration files
++	KubernetesDir = "/usr/local/etc/kubernetes"
++
++	// KubeletRunDirectory specifies the directory where the kubelet runtime information is stored.
++	KubeletRunDirectory = "/var/db/kubelet"
++)
+diff --git a/cmd/kubeadm/app/constants/constants_linux.go b/cmd/kubeadm/app/constants/constants_linux.go
+new file mode 100644
+index 00000000000..a7b1cb8316f
+--- /dev/null
++++ b/cmd/kubeadm/app/constants/constants_linux.go
+@@ -0,0 +1,25 @@
++/*
++Copyright 2019 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package constants
++
++const (
++	// KubernetesDir is the directory Kubernetes owns for storing various configuration files
++	KubernetesDir = "/etc/kubernetes"
++
++	// KubeletRunDirectory specifies the directory where the kubelet runtime information is stored.
++	KubeletRunDirectory = "/var/lib/kubelet"
++)
+diff --git a/cmd/kubeadm/app/constants/constants_windows.go b/cmd/kubeadm/app/constants/constants_windows.go
+index 5d89692b619..06205ee15ec 100644
+--- a/cmd/kubeadm/app/constants/constants_windows.go
++++ b/cmd/kubeadm/app/constants/constants_windows.go
+@@ -19,6 +19,9 @@ limitations under the License.
+ package constants
+ 
+ const (
++	// KubernetesDir is the directory Kubernetes owns for storing various configuration files
++	KubernetesDir = "/etc/kubernetes"
++
+ 	// CRISocketContainerd is the containerd CRI endpoint
+ 	CRISocketContainerd = "npipe:////./pipe/containerd-containerd"
+ 	// CRISocketCRIO is the cri-o CRI endpoint
+@@ -29,4 +32,7 @@ const (
+ 
+ 	// DefaultCRISocket defines the default CRI socket
+ 	DefaultCRISocket = CRISocketContainerd
++
++	// KubeletRunDirectory specifies the directory where the kubelet runtime information is stored.
++	KubeletRunDirectory = "/var/lib/kubelet"
+ )
+diff --git a/cmd/kubeadm/app/phases/addons/dns/dns.go b/cmd/kubeadm/app/phases/addons/dns/dns.go
+index e89d6e688a7..5fcf687ccb0 100644
+--- a/cmd/kubeadm/app/phases/addons/dns/dns.go
++++ b/cmd/kubeadm/app/phases/addons/dns/dns.go
+@@ -20,6 +20,7 @@ import (
+ 	"context"
+ 	"fmt"
+ 	"io"
++	"runtime"
+ 	"strings"
+ 
+ 	"github.com/coredns/corefile-migration/migration"
+@@ -107,11 +108,13 @@ func coreDNSAddon(cfg *kubeadmapi.ClusterConfiguration, client clientset.Interfa
+ 	coreDNSDeploymentBytes, err := kubeadmutil.ParseTemplate(CoreDNSDeployment, struct {
+ 		DeploymentName, Image, ControlPlaneTaintKey string
+ 		Replicas                                    *int32
++		OS                                          string
+ 	}{
+ 		DeploymentName:       kubeadmconstants.CoreDNSDeploymentName,
+ 		Image:                images.GetDNSImage(cfg),
+ 		ControlPlaneTaintKey: kubeadmconstants.LabelNodeRoleControlPlane,
+ 		Replicas:             replicas,
++		OS:                   runtime.GOOS,
+ 	})
+ 	if err != nil {
+ 		return errors.Wrap(err, "error when parsing CoreDNS deployment template")
+diff --git a/cmd/kubeadm/app/phases/addons/dns/manifests.go b/cmd/kubeadm/app/phases/addons/dns/manifests.go
+index f44e597763d..f032f81a900 100644
+--- a/cmd/kubeadm/app/phases/addons/dns/manifests.go
++++ b/cmd/kubeadm/app/phases/addons/dns/manifests.go
+@@ -95,7 +95,7 @@ spec:
+       - key: {{ .ControlPlaneTaintKey }}
+         effect: NoSchedule
+       nodeSelector:
+-        kubernetes.io/os: linux
++        kubernetes.io/os: {{ .OS }}
+       containers:
+       - name: coredns
+         image: {{ .Image }}
+@@ -143,11 +143,11 @@ spec:
+             scheme: HTTP
+         securityContext:
+           allowPrivilegeEscalation: false
+-          capabilities:
+-            add:
+-            - NET_BIND_SERVICE
+-            drop:
+-            - ALL
++          #capabilities:
++          #  add:
++          #  - NET_BIND_SERVICE
++          #  drop:
++          #  - ALL
+           readOnlyRootFilesystem: true
+       dnsPolicy: Default
+       volumes:
+diff --git a/cmd/kubeadm/app/phases/addons/proxy/manifests.go b/cmd/kubeadm/app/phases/addons/proxy/manifests.go
+index 58119eb97ae..1c4223057e6 100644
+--- a/cmd/kubeadm/app/phases/addons/proxy/manifests.go
++++ b/cmd/kubeadm/app/phases/addons/proxy/manifests.go
+@@ -111,6 +111,6 @@ spec:
+       tolerations:
+       - operator: Exists
+       nodeSelector:
+-        kubernetes.io/os: linux
++        kubernetes.io/os: {{ .ProxyOS }}
+ `
+ )
+diff --git a/cmd/kubeadm/app/phases/addons/proxy/proxy.go b/cmd/kubeadm/app/phases/addons/proxy/proxy.go
+index ee2e072ba07..6b5c0bb2cd6 100644
+--- a/cmd/kubeadm/app/phases/addons/proxy/proxy.go
++++ b/cmd/kubeadm/app/phases/addons/proxy/proxy.go
+@@ -21,6 +21,7 @@ import (
+ 	"bytes"
+ 	"fmt"
+ 	"io"
++	"runtime"
+ 
+ 	apps "k8s.io/api/apps/v1"
+ 	v1 "k8s.io/api/core/v1"
+@@ -246,10 +247,11 @@ func createKubeProxyConfigMap(cfg *kubeadmapi.ClusterConfiguration, localEndpoin
+ }
+ 
+ func createKubeProxyAddon(cfg *kubeadmapi.ClusterConfiguration, client clientset.Interface, printManifest bool) ([]byte, error) {
+-	daemonSetbytes, err := kubeadmutil.ParseTemplate(KubeProxyDaemonSet19, struct{ Image, ProxyConfigMap, ProxyConfigMapKey string }{
++	daemonSetbytes, err := kubeadmutil.ParseTemplate(KubeProxyDaemonSet19, struct{ Image, ProxyConfigMap, ProxyConfigMapKey, ProxyOS string }{
+ 		Image:             images.GetKubernetesImage(constants.KubeProxy, cfg),
+ 		ProxyConfigMap:    constants.KubeProxyConfigMap,
+ 		ProxyConfigMapKey: constants.KubeProxyConfigMapKey,
++		ProxyOS:           runtime.GOOS,
+ 	})
+ 	if err != nil {
+ 		return []byte(""), errors.Wrap(err, "error when parsing kube-proxy daemonset template")
+diff --git a/cmd/kubeadm/app/preflight/checks_freebsd.go b/cmd/kubeadm/app/preflight/checks_freebsd.go
+new file mode 100644
+index 00000000000..27567a9ec84
+--- /dev/null
++++ b/cmd/kubeadm/app/preflight/checks_freebsd.go
+@@ -0,0 +1,129 @@
++//go:build freebsd
++
++/*
++Copyright 2019 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package preflight
++
++import (
++	"fmt"
++	"strings"
++
++	"golang.org/x/sys/unix"
++
++	"k8s.io/klog/v2"
++	system "k8s.io/system-validators/validators"
++	utilsexec "k8s.io/utils/exec"
++
++	"k8s.io/kubernetes/cmd/kubeadm/app/util/errors"
++)
++
++const (
++	bridgepf      = "net.link.bridge.pfil_member"
++	ipforwarding  = "net.inet.ip.forwarding"
++	ip6forwarding = "net.inet6.ip6.forwarding"
++	pffilter      = "net.pf.filter_local"
++)
++
++// Check number of memory required by kubeadm
++func (mc MemCheck) Check() (warnings, errorList []error) {
++	physmem, err := unix.SysctlUint64("hw.physmem")
++	if err != nil {
++		errorList = append(errorList, errors.Wrapf(err, "can't get hw.physmem value: %w"))
++	}
++
++	// Physmem holds the total usable memory in bytes.
++	actual := physmem / 1024 / 1024
++	if actual < mc.Mem {
++		errorList = append(errorList, errors.Errorf("the system RAM (%d MB) is less than the minimum %d MB", actual, mc.Mem))
++	}
++	return warnings, errorList
++}
++
++// SysctlCheck checks that the given file contains the string Content.
++type SysctlCheck struct {
++	Path    string
++	Content string
++	Label   string
++}
++
++// Name returns label for individual SysctlChecks. If not known, will return based on path.
++func (scc SysctlCheck) Name() string {
++	if scc.Label != "" {
++		return scc.Label
++	}
++	return fmt.Sprintf("Sysctl-%s", scc.Path)
++}
++
++// Check validates if the given file contains the given content.
++func (scc SysctlCheck) Check() (warnings, errorList []error) {
++	klog.V(1).Infof("validating the value of sysctl %s", scc.Path)
++	cmd := utilsexec.New().Command("sysctl", "-n", scc.Path)
++	buf, err := cmd.CombinedOutput()
++	if err != nil {
++		return nil, []error{errors.Errorf("%s could not be read", scc.Path)}
++	}
++
++	val := strings.TrimSpace(string(buf))
++	if val != scc.Content {
++		return nil, []error{errors.Errorf("%s value is not %s", scc.Path, scc.Content)}
++	}
++	return nil, []error{}
++
++}
++
++// addOSValidator adds a new OSValidator
++func addOSValidator(validators []system.Validator, reporter *system.StreamReporter, _ string) []system.Validator {
++	validators = append(validators, &system.OSValidator{Reporter: reporter}, &system.CgroupsValidator{Reporter: reporter})
++	return validators
++}
++
++// addIPv6Checks adds IPv6 related bridgenf and forwarding checks
++func addIPv6Checks(checks []Checker) []Checker {
++	checks = append(checks,
++		SysctlCheck{Path: bridgepf, Content: "1"},
++		SysctlCheck{Path: ip6forwarding, Content: "1"},
++		SysctlCheck{Path: pffilter, Content: "1"},
++	)
++	return checks
++}
++
++// addIPv4Checks adds IPv4 related bridgenf and forwarding checks
++func addIPv4Checks(checks []Checker) []Checker {
++	checks = append(checks,
++		SysctlCheck{Path: bridgepf, Content: "1"},
++		SysctlCheck{Path: ipforwarding, Content: "1"},
++		SysctlCheck{Path: pffilter, Content: "1"},
++	)
++	return checks
++}
++
++// addSwapCheck adds a swap check
++func addSwapCheck(checks []Checker) []Checker {
++	checks = append(checks, SwapCheck{})
++	return checks
++}
++
++// addExecChecks adds checks that verify if certain binaries are in PATH
++func addExecChecks(checks []Checker, execer utilsexec.Interface, _ string) []Checker {
++	checks = append(checks,
++		InPathCheck{executable: "crictl", mandatory: true, exec: execer},
++		InPathCheck{executable: "ifconfig", mandatory: true, exec: execer},
++		InPathCheck{executable: "pfctl", mandatory: true, exec: execer},
++		InPathCheck{executable: "mount", mandatory: true, exec: execer},
++		InPathCheck{executable: "touch", mandatory: false, exec: execer})
++	return checks
++}
+diff --git a/cmd/kubeadm/app/preflight/checks_other.go b/cmd/kubeadm/app/preflight/checks_other.go
+index 26f91e4355d..5658002d33c 100644
+--- a/cmd/kubeadm/app/preflight/checks_other.go
++++ b/cmd/kubeadm/app/preflight/checks_other.go
+@@ -1,4 +1,4 @@
+-//go:build !linux
++//go:build !linux && !freebsd
+ 
+ /*
+ Copyright 2022 The Kubernetes Authors.
+diff --git a/cmd/kubeadm/app/util/initsystem/initsystem_freebsd.go b/cmd/kubeadm/app/util/initsystem/initsystem_freebsd.go
+new file mode 100644
+index 00000000000..089a0b512c1
+--- /dev/null
++++ b/cmd/kubeadm/app/util/initsystem/initsystem_freebsd.go
+@@ -0,0 +1,84 @@
++//go:build !windows
++// +build !windows
++
++/*
++Copyright 2017 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package initsystem
++
++import (
++	"fmt"
++	"os/exec"
++	"strings"
++)
++
++// FreeBSDInitSystem defines freebsd
++type FreeBSDInitSystem struct{}
++
++// ServiceStart tries to start a specific service
++func (rcd FreeBSDInitSystem) ServiceStart(service string) error {
++	args := []string{service, "start"}
++	return exec.Command("service", args...).Run()
++}
++
++// ServiceStop tries to stop a specific service
++func (rcd FreeBSDInitSystem) ServiceStop(service string) error {
++	args := []string{service, "stop"}
++	return exec.Command("service", args...).Run()
++}
++
++// ServiceRestart tries to reload the environment and restart the specific service
++func (rcd FreeBSDInitSystem) ServiceRestart(service string) error {
++	args := []string{service, "restart"}
++	return exec.Command("service", args...).Run()
++}
++
++// ServiceExists ensures the service is defined for this init system.
++// rcd writes to stderr if a service is not found or not enabled
++// this is in contrast to systemd which only writes to stdout.
++// Hence, we use the Combinedoutput, and ignore the error.
++func (rcd FreeBSDInitSystem) ServiceExists(service string) bool {
++	args := []string{service, "status"}
++	outBytes, _ := exec.Command("service", args...).CombinedOutput()
++	return !strings.Contains(string(outBytes), "does not exist")
++}
++
++// ServiceIsEnabled ensures the service is enabled to start on each boot.
++func (rcd FreeBSDInitSystem) ServiceIsEnabled(service string) bool {
++	args := []string{service, "enabled"}
++	outBytes, err := exec.Command("service", args...).Output()
++	return err == nil && string(outBytes) == ""
++}
++
++// ServiceIsActive ensures the service is running, or attempting to run. (crash looping in the case of kubelet)
++func (rcd FreeBSDInitSystem) ServiceIsActive(service string) bool {
++	args := []string{service, "status"}
++	outBytes, _ := exec.Command("service", args...).CombinedOutput()
++	outStr := string(outBytes)
++	return !strings.Contains(outStr, "not running") && !strings.Contains(outStr, "does not exist")
++}
++
++// EnableCommand return a string describing how to enable a service
++func (rcd FreeBSDInitSystem) EnableCommand(service string) string {
++	return fmt.Sprintf("service %s enable", service)
++}
++
++// GetInitSystem returns an InitSystem for the current system, or nil
++// if we cannot detect a supported init system.
++// This indicates we will skip init system checks, not an error.
++func GetInitSystem() (InitSystem, error) {
++	return &FreeBSDInitSystem{}, nil
++}
+diff --git a/cmd/kubeadm/app/util/initsystem/initsystem_unix.go b/cmd/kubeadm/app/util/initsystem/initsystem_unix.go
+index 355adfd83c7..8fa6542669f 100644
+--- a/cmd/kubeadm/app/util/initsystem/initsystem_unix.go
++++ b/cmd/kubeadm/app/util/initsystem/initsystem_unix.go
+@@ -1,4 +1,4 @@
+-//go:build !windows
++//go:build !windows && !freebsd
+ 
+ /*
+ Copyright 2017 The Kubernetes Authors.
+diff --git a/vendor/k8s.io/system-validators/validators/types_freebsd.go b/vendor/k8s.io/system-validators/validators/types_freebsd.go
+new file mode 100644
+index 00000000000..9dec6d247c7
+--- /dev/null
++++ b/vendor/k8s.io/system-validators/validators/types_freebsd.go
+@@ -0,0 +1,56 @@
++//go:build freebsd
++// +build freebsd
++
++/*
++Copyright 2017 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package system
++
++import (
++	"os/exec"
++	"strings"
++)
++
++// DefaultSysSpec is the default SysSpec for Linux
++var DefaultSysSpec = SysSpec{
++	OS: "FreeBSD",
++	KernelSpec: KernelSpec{
++		Versions:  []string{`^1[4-9]\.[0-9]-.*$`, `^[2-9][0-9]\.[0-9]-.*$`}, // Requires 14.0 or newer
++		Required:  []KernelConfig{},
++		Optional:  []KernelConfig{},
++		Forbidden: []KernelConfig{},
++	},
++	RuntimeSpec: RuntimeSpec{
++		DockerSpec: &DockerSpec{
++			Version:     []string{`1\.1[1-3]\..*`, `17\.0[3,6,9]\..*`, `18\.0[6,9]\..*`, `19\.03\..*`, `20\.10\..*`},
++			GraphDriver: []string{"zfs"},
++		},
++	},
++}
++
++// KernelValidatorHelperImpl is the 'linux' implementation of KernelValidatorHelper
++type KernelValidatorHelperImpl struct{}
++
++var _ KernelValidatorHelper = &KernelValidatorHelperImpl{}
++
++// GetKernelReleaseVersion returns the kernel release version (ex. 4.4.0-96-generic) as a string
++func (o *KernelValidatorHelperImpl) GetKernelReleaseVersion() (string, error) {
++	releaseVersion, err := exec.Command("uname", "-r").CombinedOutput()
++	if err != nil {
++		return "", err
++	}
++	return strings.TrimSpace(string(releaseVersion)), nil
++}
+diff --git a/vendor/k8s.io/system-validators/validators/types_unix.go b/vendor/k8s.io/system-validators/validators/types_unix.go
+index 1edd0ecb03c..09723f41ba3 100644
+--- a/vendor/k8s.io/system-validators/validators/types_unix.go
++++ b/vendor/k8s.io/system-validators/validators/types_unix.go
+@@ -1,5 +1,5 @@
+-//go:build !windows
+-// +build !windows
++//go:build !windows && !freebsd
++// +build !windows,!freebsd
+ 
+ /*
+ Copyright 2017 The Kubernetes Authors.
+-- 
+2.54.0 (Apple Git-157)
+

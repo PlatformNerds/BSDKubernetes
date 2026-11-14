@@ -1,0 +1,28 @@
+From 733fafa97501a8827b42aadd60cd11652b763e8e Mon Sep 17 00:00:00 2001
+From: Doug Rabson <dfr@rabson.org>
+Date: Wed, 26 Jul 2023 15:00:48 +0100
+Subject: [PATCH 1/2] allow freebsd as a host os
+
+Control plane components build and work on FreeBSD. This change just
+removes a confusing error message when building on FreeBSD.
+---
+ hack/lib/util.sh | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/hack/lib/util.sh b/hack/lib/util.sh
+index ed067cc7a30..14f6ed96c9b 100755
+--- a/hack/lib/util.sh
++++ b/hack/lib/util.sh
+@@ -144,6 +144,9 @@ kube::util::host_os() {
+     Darwin)
+       host_os=darwin
+       ;;
++    FreeBSD)
++      host_os=freebsd
++      ;;
+     Linux)
+       host_os=linux
+       ;;
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,178 @@
+From f924b028ac6cc4454337d22cc77dd43ef2ec4fff Mon Sep 17 00:00:00 2001
+From: Doug Rabson <dfr@rabson.org>
+Date: Wed, 11 Jan 2023 17:47:52 +0000
+Subject: [PATCH 09/12] api: Change TerminationMessagePathDefault on FreeBSD
+
+The Linux default path "/dev/termination-log" cannot work on FreeBSD.
+The FreeBSD devfs filesystem does not allow regular files which prevents
+mounting the log into /dev. This changes the default path to
+"/var/run/termination-log" on FreeBSD.
+---
+ pkg/apis/core/types.go                        |  2 --
+ pkg/apis/core/types_common.go                 | 25 +++++++++++++++++++
+ pkg/apis/core/types_freebsd.go                | 25 +++++++++++++++++++
+ staging/src/k8s.io/api/core/v1/types.go       |  5 ----
+ .../src/k8s.io/api/core/v1/types_common.go    | 25 +++++++++++++++++++
+ .../src/k8s.io/api/core/v1/types_freebsd.go   | 25 +++++++++++++++++++
+ 6 files changed, 100 insertions(+), 7 deletions(-)
+ create mode 100644 pkg/apis/core/types_common.go
+ create mode 100644 pkg/apis/core/types_freebsd.go
+ create mode 100644 staging/src/k8s.io/api/core/v1/types_common.go
+ create mode 100644 staging/src/k8s.io/api/core/v1/types_freebsd.go
+
+diff --git a/pkg/apis/core/types.go b/pkg/apis/core/types.go
+index ed0bb0ea878..b7c02f6fb61 100644
+--- a/pkg/apis/core/types.go
++++ b/pkg/apis/core/types.go
+@@ -37,8 +37,6 @@ const (
+ 	NamespacePublic = "kube-public"
+ 	// NamespaceNodeLease is the namespace where we place node lease objects (used for node heartbeats)
+ 	NamespaceNodeLease = "kube-node-lease"
+-	// TerminationMessagePathDefault means the default path to capture the application termination message running in a container
+-	TerminationMessagePathDefault = "/dev/termination-log"
+ )
+ 
+ // Volume represents a named volume in a pod that may be accessed by any containers in the pod.
+diff --git a/pkg/apis/core/types_common.go b/pkg/apis/core/types_common.go
+new file mode 100644
+index 00000000000..bd8b9734746
+--- /dev/null
++++ b/pkg/apis/core/types_common.go
+@@ -0,0 +1,25 @@
++//go:build !freebsd
++// +build !freebsd
++
++/*
++Copyright 2014 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package core
++
++const (
++	// TerminationMessagePathDefault means the default path to capture the application termination message running in a container
++	TerminationMessagePathDefault = "/dev/termination-log"
++)
+diff --git a/pkg/apis/core/types_freebsd.go b/pkg/apis/core/types_freebsd.go
+new file mode 100644
+index 00000000000..4c67fe5da8e
+--- /dev/null
++++ b/pkg/apis/core/types_freebsd.go
+@@ -0,0 +1,25 @@
++//go:build freebsd
++// +build freebsd
++
++/*
++Copyright 2014 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package core
++
++const (
++	// TerminationMessagePathDefault means the default path to capture the application termination message running in a container
++	TerminationMessagePathDefault = "/var/run/termination-log"
++)
+diff --git a/staging/src/k8s.io/api/core/v1/types.go b/staging/src/k8s.io/api/core/v1/types.go
+index ac0494f3c51..9024484e93d 100644
+--- a/staging/src/k8s.io/api/core/v1/types.go
++++ b/staging/src/k8s.io/api/core/v1/types.go
+@@ -2900,11 +2900,6 @@ type ResourceClaim struct {
+ 	Request string `json:"request,omitempty" protobuf:"bytes,2,opt,name=request"`
+ }
+ 
+-const (
+-	// TerminationMessagePathDefault means the default path to capture the application termination message running in a container
+-	TerminationMessagePathDefault string = "/dev/termination-log"
+-)
+-
+ // A single application container that you want to run within a pod.
+ type Container struct {
+ 	// Name of the container specified as a DNS_LABEL.
+diff --git a/staging/src/k8s.io/api/core/v1/types_common.go b/staging/src/k8s.io/api/core/v1/types_common.go
+new file mode 100644
+index 00000000000..fd7a6dba3a8
+--- /dev/null
++++ b/staging/src/k8s.io/api/core/v1/types_common.go
+@@ -0,0 +1,25 @@
++//go:build !freebsd
++// +build !freebsd
++
++/*
++Copyright 2015 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package v1
++
++const (
++	// TerminationMessagePathDefault means the default path to capture the application termination message running in a container
++	TerminationMessagePathDefault string = "/dev/termination-log"
++)
+diff --git a/staging/src/k8s.io/api/core/v1/types_freebsd.go b/staging/src/k8s.io/api/core/v1/types_freebsd.go
+new file mode 100644
+index 00000000000..2dd88673dd8
+--- /dev/null
++++ b/staging/src/k8s.io/api/core/v1/types_freebsd.go
+@@ -0,0 +1,25 @@
++//go:build freebsd
++// +build freebsd
++
++/*
++Copyright 2015 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package v1
++
++const (
++	// TerminationMessagePathDefault means the default path to capture the application termination message running in a container
++	TerminationMessagePathDefault string = "/var/run/termination-log"
++)
+-- 
+2.54.0 (Apple Git-157)
+

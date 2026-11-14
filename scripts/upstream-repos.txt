@@ -1,0 +1,19 @@
+https://github.com/freebsd/freebsd-src.git
+https://github.com/openbsd/src.git openbsd-src
+https://github.com/DragonFlyBSD/DragonFlyBSD.git
+https://github.com/NetBSD/src.git netbsd-src
+https://github.com/kubernetes/kubernetes.git
+https://github.com/containerd/containerd.git
+https://github.com/samuelkarp/runj.git
+https://github.com/dfr/ocijail.git
+https://github.com/opencontainers/runtime-spec.git
+https://github.com/containernetworking/plugins.git cni-plugins
+https://github.com/containers/podman.git
+https://github.com/containers/common.git containers-common
+https://github.com/containers/storage.git containers-storage
+https://github.com/kata-containers/kata-containers.git
+https://github.com/kubernetes-sigs/cri-tools.git
+https://github.com/flannel-io/flannel.git
+https://github.com/k3s-io/k3s.git
+https://github.com/opencontainers/runc.git
+https://github.com/kubernetes/kube-openapi.git

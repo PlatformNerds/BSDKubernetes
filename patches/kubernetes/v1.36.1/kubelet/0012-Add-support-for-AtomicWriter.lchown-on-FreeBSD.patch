@@ -1,0 +1,57 @@
+From edf7be819240b65fd16808e216d17f89a3b849eb Mon Sep 17 00:00:00 2001
+From: Doug Rabson <dfr@rabson.org>
+Date: Sat, 18 Jul 2026 14:55:33 +0100
+Subject: [PATCH 12/12] Add support for AtomicWriter.lchown on FreeBSD
+
+---
+ pkg/volume/util/atomic_writer_freebsd.go     | 27 ++++++++++++++++++++
+ pkg/volume/util/atomic_writer_unsupported.go |  2 +-
+ 2 files changed, 28 insertions(+), 1 deletion(-)
+ create mode 100644 pkg/volume/util/atomic_writer_freebsd.go
+
+diff --git a/pkg/volume/util/atomic_writer_freebsd.go b/pkg/volume/util/atomic_writer_freebsd.go
+new file mode 100644
+index 00000000000..55f11c28cd2
+--- /dev/null
++++ b/pkg/volume/util/atomic_writer_freebsd.go
+@@ -0,0 +1,27 @@
++//go:build freebsd
++
++/*
++Copyright 2024 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package util
++
++import "os"
++
++// lchown changes the numeric uid and gid of the named file.
++// If the file is a symbolic link, it changes the uid and gid of the link itself.
++func (w *AtomicWriter) lchown(name string, uid, gid int) error {
++	return os.Lchown(name, uid, gid)
++}
+diff --git a/pkg/volume/util/atomic_writer_unsupported.go b/pkg/volume/util/atomic_writer_unsupported.go
+index a77ef9414e9..8127c345382 100644
+--- a/pkg/volume/util/atomic_writer_unsupported.go
++++ b/pkg/volume/util/atomic_writer_unsupported.go
+@@ -1,4 +1,4 @@
+-//go:build !linux
++//go:build !linux && !freebsd
+ 
+ /*
+ Copyright 2024 The Kubernetes Authors.
+-- 
+2.54.0 (Apple Git-157)
+

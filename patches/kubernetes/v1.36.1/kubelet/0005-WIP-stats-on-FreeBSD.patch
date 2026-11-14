@@ -1,0 +1,662 @@
+From cf82c951b3f1fa486da6c627ec6a122c2ba9822a Mon Sep 17 00:00:00 2001
+From: Doug Rabson <dfr@rabson.org>
+Date: Sat, 31 Dec 2022 08:37:05 +0000
+Subject: [PATCH 05/12] WIP: stats on FreeBSD
+
+---
+ pkg/kubelet/cadvisor/cadvisor_freebsd.go      | 326 ++++++++++++++++++
+ pkg/kubelet/cadvisor/cadvisor_unsupported.go  |   2 +-
+ .../server/stats/summary_sys_containers.go    |   2 +-
+ .../stats/summary_sys_containers_freebsd.go   |  98 ++++++
+ pkg/kubelet/stats/cri_stats_provider.go       |   5 +
+ .../stats/cri_stats_provider_freebsd.go       | 153 ++++++++
+ .../stats/cri_stats_provider_others.go        |   2 +-
+ 7 files changed, 585 insertions(+), 3 deletions(-)
+ create mode 100644 pkg/kubelet/cadvisor/cadvisor_freebsd.go
+ create mode 100644 pkg/kubelet/server/stats/summary_sys_containers_freebsd.go
+ create mode 100644 pkg/kubelet/stats/cri_stats_provider_freebsd.go
+
+diff --git a/pkg/kubelet/cadvisor/cadvisor_freebsd.go b/pkg/kubelet/cadvisor/cadvisor_freebsd.go
+new file mode 100644
+index 00000000000..b9f92672362
+--- /dev/null
++++ b/pkg/kubelet/cadvisor/cadvisor_freebsd.go
+@@ -0,0 +1,326 @@
++//go:build freebsd
++
++/*
++Copyright 2015 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package cadvisor
++
++// #include <unistd.h>
++// #include <sys/vmmeter.h>
++// #include <sys/sysctl.h>
++// #include <vm/vm_param.h>
++import "C"
++
++import (
++	"bytes"
++	"context"
++	"fmt"
++	"os"
++	"strconv"
++	"strings"
++	"syscall"
++	//"runtime"
++	"time"
++	"unsafe"
++
++	"github.com/google/cadvisor/events"
++	cadvisorapi "github.com/google/cadvisor/info/v1"
++	cadvisorapiv2 "github.com/google/cadvisor/info/v2"
++	"golang.org/x/sys/unix"
++	"k8s.io/klog/v2"
++)
++
++type cadvisorClient struct {
++	imageFsInfoProvider ImageFsInfoProvider
++	rootPath            string
++}
++
++var _ Interface = new(cadvisorClient)
++
++var startTime time.Time
++
++func init() {
++	startTime = time.Now()
++}
++
++// New creates a new cAdvisor Interface for freebsd systems.
++func New(_ klog.Logger, imageFsInfoProvider ImageFsInfoProvider, rootPath string, cgroupRoots []string, usingLegacyStats, localStorageCapacityIsolation bool) (Interface, error) {
++	return &cadvisorClient{
++		imageFsInfoProvider: imageFsInfoProvider,
++		rootPath:            rootPath,
++	}, nil
++}
++
++func (cc *cadvisorClient) Start() error {
++	return nil
++}
++
++func (cu *cadvisorClient) DockerContainer(name string, req *cadvisorapi.ContainerInfoRequest) (cadvisorapi.ContainerInfo, error) {
++	return cadvisorapi.ContainerInfo{}, nil
++}
++
++func (cc *cadvisorClient) ContainerInfo(name string, req *cadvisorapi.ContainerInfoRequest) (*cadvisorapi.ContainerInfo, error) {
++	return &cadvisorapi.ContainerInfo{}, nil
++}
++
++func (cc *cadvisorClient) ContainerInfoV2(name string, options cadvisorapiv2.RequestOptions) (map[string]cadvisorapiv2.ContainerInfo, error) {
++	infos := make(map[string]cadvisorapiv2.ContainerInfo)
++	rootContainerInfo, err := createRootContainerInfo()
++	if err != nil {
++		return nil, err
++	}
++
++	infos["/"] = *rootContainerInfo
++
++	return infos, nil
++}
++
++func (cc *cadvisorClient) VersionInfo() (*cadvisorapi.VersionInfo, error) {
++	return &cadvisorapi.VersionInfo{}, nil
++}
++
++func (cc *cadvisorClient) SubcontainerInfo(name string, req *cadvisorapi.ContainerInfoRequest) (map[string]*cadvisorapi.ContainerInfo, error) {
++	return map[string]*cadvisorapi.ContainerInfo{}, nil
++}
++
++func (cc *cadvisorClient) MachineInfo() (*cadvisorapi.MachineInfo, error) {
++	hostname, err := os.Hostname()
++	if err != nil {
++		return nil, err
++	}
++
++	memTotal, _, err := getMemInfo()
++	if err != nil {
++		return nil, err
++	}
++
++	cores, err := unix.SysctlUint32("kern.smp.cpus")
++	if err != nil {
++		return nil, err
++	}
++
++	physCores, err := unix.SysctlUint32("kern.smp.cores")
++	if err != nil {
++		return nil, err
++	}
++
++	return &cadvisorapi.MachineInfo{
++		NumCores:         int(cores),
++		NumPhysicalCores: int(physCores),
++		NumSockets:       1,
++		MemoryCapacity:   uint64(memTotal),
++		MachineID:        hostname,
++	}, nil
++}
++
++func (cc *cadvisorClient) ImagesFsInfo(context.Context) (cadvisorapiv2.FsInfo, error) {
++	// TODO: don't hardcode the path here
++	return cc.GetDirFsInfo("/var/db/containers")
++}
++
++func (cu *cadvisorClient) ContainerFsInfo(context.Context) (cadvisorapiv2.FsInfo, error) {
++	return cadvisorapiv2.FsInfo{}, nil
++}
++
++func (cc *cadvisorClient) RootFsInfo() (cadvisorapiv2.FsInfo, error) {
++	return cc.GetDirFsInfo(cc.rootPath)
++}
++
++func (cc *cadvisorClient) WatchEvents(request *events.Request) (*events.EventChannel, error) {
++	return &events.EventChannel{}, nil
++}
++
++func toString(bs []byte) string {
++	return string(bs[:bytes.IndexByte(bs, 0)])
++}
++
++func (cu *cadvisorClient) GetDirFsInfo(path string) (cadvisorapiv2.FsInfo, error) {
++	var stat unix.Statfs_t
++	if err := unix.Statfs(path, &stat); err != nil {
++		return cadvisorapiv2.FsInfo{}, err
++	}
++
++	return cadvisorapiv2.FsInfo{
++		Device:     toString(stat.Mntfromname[:]),
++		Mountpoint: toString(stat.Mntonname[:]),
++		Capacity:   stat.Blocks * stat.Bsize,
++		Available:  uint64(stat.Bavail) * stat.Bsize,
++		Usage:      (stat.Blocks - uint64(stat.Bavail)) * stat.Bsize,
++		Inodes:     nil,
++		InodesFree: nil,
++	}, nil
++}
++
++func (cu *cadvisorClient) GetRequestedContainersInfo(containerName string, options cadvisorapiv2.RequestOptions) (map[string]*cadvisorapi.ContainerInfo, error) {
++	return nil, nil
++}
++
++func getMemInfo() (int64, int64, error) {
++	data, err := unix.SysctlRaw("vm.vmtotal")
++	if err != nil {
++		return -1, -1, fmt.Errorf("can't get kernel info: %w", err)
++	}
++	if len(data) != C.sizeof_struct_vmtotal {
++		return -1, -1, fmt.Errorf("unexpected vmtotal size %d", len(data))
++	}
++
++	total := (*C.struct_vmtotal)(unsafe.Pointer(&data[0]))
++
++	pagesize := int64(C.sysconf(C._SC_PAGESIZE))
++	npages := int64(C.sysconf(C._SC_PHYS_PAGES))
++	return pagesize * npages, pagesize * int64(total.t_free), nil
++}
++
++func createRootContainerInfo() (*cadvisorapiv2.ContainerInfo, error) {
++	// Jail id zero represents the host.
++	entries, err := getRacct("jail:0")
++	if err != nil {
++		return nil, err
++	}
++	cpu, err := getCPUTime()
++
++	physmem, err := unix.SysctlUint64("hw.physmem")
++	if err != nil {
++		return nil, fmt.Errorf("can't get hw.physmem value: %w", err)
++	}
++
++	stats := &cadvisorapiv2.ContainerStats{Timestamp: time.Now()}
++	userTime := cpu.user + cpu.nice
++	sysTime := cpu.sys + cpu.intr
++	stats.Cpu = &cadvisorapi.CpuStats{
++		Usage: cadvisorapi.CpuUsage{
++			Total:  uint64((userTime + sysTime) * 1000000000),
++			User:   uint64(userTime * 1000000000),
++			System: uint64(sysTime * 1000000000),
++		},
++	}
++	if val, ok := entries["pcpu"]; ok {
++		stats.CpuInst = &cadvisorapiv2.CpuInstStats{
++			Usage: cadvisorapiv2.CpuInstUsage{
++				Total: (val / 100.0) * 1000000000,
++			},
++		}
++	}
++	if val, ok := entries["memoryuse"]; ok {
++		stats.Memory = &cadvisorapi.MemoryStats{
++			WorkingSet: val,
++		}
++	}
++	// TODO: network stats?
++
++	rootInfo := cadvisorapiv2.ContainerInfo{
++		Spec: cadvisorapiv2.ContainerSpec{
++			CreationTime: startTime,
++			HasCpu:       true,
++			HasMemory:    true,
++			HasNetwork:   false,
++			Memory: cadvisorapiv2.MemorySpec{
++				Limit: physmem,
++			},
++		},
++		Stats: []*cadvisorapiv2.ContainerStats{stats},
++	}
++
++	return &rootInfo, nil
++}
++
++// TODO: factor this out and add the prometheus copyright
++
++type clockinfo struct {
++	hz     int32 // clock frequency
++	tick   int32 // micro-seconds per hz tick
++	spare  int32
++	stathz int32 // statistics clock frequency
++	profhz int32 // profiling clock frequency
++}
++
++type cputime struct {
++	user float64
++	nice float64
++	sys  float64
++	intr float64
++	idle float64
++}
++
++func getCPUTime() (*cputime, error) {
++	const states = 5
++
++	clockb, err := unix.SysctlRaw("kern.clockrate")
++	if err != nil {
++		return nil, err
++	}
++	clock := *(*clockinfo)(unsafe.Pointer(&clockb[0]))
++	cpb, err := unix.SysctlRaw("kern.cp_time")
++	if err != nil {
++		return nil, err
++	}
++
++	var cpufreq float64
++	if clock.stathz > 0 {
++		cpufreq = float64(clock.stathz)
++	} else {
++		cpufreq = float64(clock.hz)
++	}
++	var times []float64
++	for len(cpb) >= int(unsafe.Sizeof(int(0))) {
++		t := *(*int)(unsafe.Pointer(&cpb[0]))
++		times = append(times, float64(t)/cpufreq)
++		cpb = cpb[unsafe.Sizeof(int(0)):]
++	}
++
++	cpu := &cputime{
++		user: times[0],
++		nice: times[0],
++		sys:  times[0],
++		intr: times[0],
++		idle: times[0],
++	}
++
++	return cpu, nil
++}
++
++func getRacct(filter string) (map[string]uint64, error) {
++	bp, err := syscall.ByteSliceFromString(filter)
++	if err != nil {
++		return nil, err
++	}
++	var buf [1024]byte
++	_, _, errno := syscall.Syscall6(syscall.SYS_RCTL_GET_RACCT,
++		uintptr(unsafe.Pointer(&bp[0])),
++		uintptr(len(bp)),
++		uintptr(unsafe.Pointer(&buf[0])),
++		uintptr(len(buf)), 0, 0)
++	if errno != 0 {
++		return nil, fmt.Errorf("error calling rctl_get_racct with filter %s: %v", errno)
++	}
++	len := bytes.IndexByte(buf[:], byte(0))
++	entries := strings.Split(string(buf[:len]), ",")
++	res := make(map[string]uint64)
++	for _, entry := range entries {
++		kv := strings.SplitN(entry, "=", 2)
++		key := kv[0]
++		val, err := strconv.ParseUint(kv[1], 10, 0)
++		if err != nil {
++			klog.Warningf("unexpected rctl entry, ignoring: %s", entry)
++		}
++		res[key] = val
++	}
++	return res, nil
++}
++
++func IsPsiEnabled(_ klog.Logger) bool {
++	return false
++}
+diff --git a/pkg/kubelet/cadvisor/cadvisor_unsupported.go b/pkg/kubelet/cadvisor/cadvisor_unsupported.go
+index 5c7b63e0408..eba5e27e29a 100644
+--- a/pkg/kubelet/cadvisor/cadvisor_unsupported.go
++++ b/pkg/kubelet/cadvisor/cadvisor_unsupported.go
+@@ -1,4 +1,4 @@
+-//go:build !linux && !windows
++//go:build !linux && !windows && !freebsd
+ 
+ /*
+ Copyright 2015 The Kubernetes Authors.
+diff --git a/pkg/kubelet/server/stats/summary_sys_containers.go b/pkg/kubelet/server/stats/summary_sys_containers.go
+index 10fe13cd9f9..e0cc34fcd00 100644
+--- a/pkg/kubelet/server/stats/summary_sys_containers.go
++++ b/pkg/kubelet/server/stats/summary_sys_containers.go
+@@ -1,4 +1,4 @@
+-//go:build !windows
++//go:build linux
+ 
+ /*
+ Copyright 2018 The Kubernetes Authors.
+diff --git a/pkg/kubelet/server/stats/summary_sys_containers_freebsd.go b/pkg/kubelet/server/stats/summary_sys_containers_freebsd.go
+new file mode 100644
+index 00000000000..879cc608cd9
+--- /dev/null
++++ b/pkg/kubelet/server/stats/summary_sys_containers_freebsd.go
+@@ -0,0 +1,98 @@
++//go:build freebsd
++
++/*
++Copyright 2018 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package stats
++
++import (
++	"context"
++	"time"
++
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	statsapi "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
++	"k8s.io/kubernetes/pkg/kubelet/cm"
++)
++
++func (sp *summaryProviderImpl) GetSystemContainersStats(_ context.Context, nodeConfig cm.NodeConfig, podStats []statsapi.PodStats, updateStats bool) (stats []statsapi.ContainerStats) {
++	stats = append(stats, sp.getSystemPodsCPUAndMemoryStats(nodeConfig, podStats, updateStats))
++	return stats
++}
++
++func (sp *summaryProviderImpl) GetSystemContainersCPUAndMemoryStats(_ context.Context, nodeConfig cm.NodeConfig, podStats []statsapi.PodStats, updateStats bool) (stats []statsapi.ContainerStats) {
++	stats = append(stats, sp.getSystemPodsCPUAndMemoryStats(nodeConfig, podStats, updateStats))
++	return stats
++}
++
++func (sp *summaryProviderImpl) getSystemPodsCPUAndMemoryStats(nodeConfig cm.NodeConfig, podStats []statsapi.PodStats, updateStats bool) statsapi.ContainerStats {
++	now := metav1.NewTime(time.Now())
++	podsSummary := statsapi.ContainerStats{
++		StartTime: now,
++		CPU:       &statsapi.CPUStats{},
++		Memory:    &statsapi.MemoryStats{},
++		Name:      statsapi.SystemContainerPods,
++	}
++
++	// Sum up all pod's stats.
++	var usageCoreNanoSeconds uint64
++	var usageNanoCores uint64
++	var availableBytes uint64
++	var usageBytes uint64
++	var workingSetBytes uint64
++	for _, pod := range podStats {
++		if pod.CPU != nil {
++			podsSummary.CPU.Time = now
++			if pod.CPU.UsageCoreNanoSeconds != nil {
++				usageCoreNanoSeconds = usageCoreNanoSeconds + *pod.CPU.UsageCoreNanoSeconds
++			}
++			if pod.CPU.UsageNanoCores != nil {
++				usageNanoCores = usageNanoCores + *pod.CPU.UsageNanoCores
++			}
++		}
++
++		if pod.Memory != nil {
++			podsSummary.Memory.Time = now
++			if pod.Memory.AvailableBytes != nil {
++				availableBytes = availableBytes + *pod.Memory.AvailableBytes
++			}
++			if pod.Memory.UsageBytes != nil {
++				usageBytes = usageBytes + *pod.Memory.UsageBytes
++			}
++			if pod.Memory.WorkingSetBytes != nil {
++				workingSetBytes = workingSetBytes + *pod.Memory.WorkingSetBytes
++			}
++		}
++	}
++
++	// Set results only if they are not zero.
++	if usageCoreNanoSeconds != 0 {
++		podsSummary.CPU.UsageCoreNanoSeconds = &usageCoreNanoSeconds
++	}
++	if usageNanoCores != 0 {
++		podsSummary.CPU.UsageNanoCores = &usageNanoCores
++	}
++	if availableBytes != 0 {
++		podsSummary.Memory.AvailableBytes = &availableBytes
++	}
++	if usageBytes != 0 {
++		podsSummary.Memory.UsageBytes = &usageBytes
++	}
++	if workingSetBytes != 0 {
++		podsSummary.Memory.WorkingSetBytes = &workingSetBytes
++	}
++
++	return podsSummary
++}
+diff --git a/pkg/kubelet/stats/cri_stats_provider.go b/pkg/kubelet/stats/cri_stats_provider.go
+index 14f2fb3171c..ff0e1b44e6f 100644
+--- a/pkg/kubelet/stats/cri_stats_provider.go
++++ b/pkg/kubelet/stats/cri_stats_provider.go
+@@ -388,6 +388,11 @@ func (p *criStatsProvider) ListPodCPUAndMemoryStats(ctx context.Context) ([]stat
+ 
+ 	result := make([]statsapi.PodStats, 0, len(podSandboxMap))
+ 	if p.podAndContainerStatsFromCRI {
++		// fsIDtoInfo is a map from filesystem id to its stats. This will be used
++		// as a cache to avoid querying cAdvisor for the filesystem stats with the
++		// same filesystem id many times.
++		//fsIDtoInfo := make(map[runtimeapi.FilesystemIdentifier]*cadvisorapiv2.FsInfo)
++		//rootFsInfo, err := p.cadvisor.RootFsInfo()
+ 		criSandboxStats, err := p.runtimeService.ListPodSandboxStats(ctx, &runtimeapi.PodSandboxStatsFilter{})
+ 		// Call succeeded
+ 		if err == nil {
+diff --git a/pkg/kubelet/stats/cri_stats_provider_freebsd.go b/pkg/kubelet/stats/cri_stats_provider_freebsd.go
+new file mode 100644
+index 00000000000..a391991476f
+--- /dev/null
++++ b/pkg/kubelet/stats/cri_stats_provider_freebsd.go
+@@ -0,0 +1,153 @@
++//go:build freebsd
++
++/*
++Copyright 2023 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package stats
++
++import (
++	"fmt"
++	"time"
++
++	cadvisorapiv2 "github.com/google/cadvisor/info/v2"
++
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	utilfeature "k8s.io/apiserver/pkg/util/feature"
++	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
++	"k8s.io/klog/v2"
++	statsapi "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
++	"k8s.io/kubernetes/pkg/features"
++)
++
++func (p *criStatsProvider) addCRIPodContainerStats(
++	logger klog.Logger,
++	criSandboxStat *runtimeapi.PodSandboxStats,
++	ps *statsapi.PodStats,
++	fsIDtoInfo map[string]*cadvisorapiv2.FsInfo,
++	containerMap map[string]*runtimeapi.Container,
++	podSandbox *runtimeapi.PodSandbox,
++	rootFsInfo *cadvisorapiv2.FsInfo, updateCPUNanoCoreUsage bool) error {
++	for _, criContainerStat := range criSandboxStat.Linux.Containers {
++		container, found := containerMap[criContainerStat.Attributes.Id]
++		if !found {
++			continue
++		}
++		// Fill available stats for full set of required pod stats
++		cs, err := p.makeContainerStats(logger, criContainerStat, container, rootFsInfo, fsIDtoInfo, podSandbox.GetMetadata(),
++			updateCPUNanoCoreUsage)
++		if err != nil {
++			return fmt.Errorf("make container stats: %w", err)
++		}
++		ps.Containers = append(ps.Containers, *cs)
++	}
++	return nil
++}
++
++// addCRIPodContainerCPUAndMemoryStats adds container CPU and memory stats from CRI to the PodStats.
++// This is a lighter-weight version of addCRIPodContainerStats that only populates CPU and memory
++// stats needed for the resource metrics endpoint.
++func (p *criStatsProvider) addCRIPodContainerCPUAndMemoryStats(
++	criSandboxStat *runtimeapi.PodSandboxStats,
++	ps *statsapi.PodStats,
++	containerMap map[string]*runtimeapi.Container) {
++	if criSandboxStat == nil || criSandboxStat.Linux == nil {
++		return
++	}
++	for _, criContainerStat := range criSandboxStat.Linux.Containers {
++		container, found := containerMap[criContainerStat.Attributes.Id]
++		if !found {
++			continue
++		}
++		// Fill available CPU and memory stats for resource metrics
++		cs := p.makeContainerCPUAndMemoryStats(criContainerStat, time.Unix(0, container.CreatedAt), true)
++		ps.Containers = append(ps.Containers, *cs)
++	}
++}
++
++func addCRIPodNetworkStats(ps *statsapi.PodStats, criPodStat *runtimeapi.PodSandboxStats) {
++	if criPodStat == nil || criPodStat.Linux == nil || criPodStat.Linux.Network == nil {
++		return
++	}
++	criNetwork := criPodStat.Linux.Network
++	iStats := statsapi.NetworkStats{
++		Time:           metav1.NewTime(time.Unix(0, criNetwork.Timestamp)),
++		InterfaceStats: criInterfaceToSummary(criNetwork.DefaultInterface),
++		Interfaces:     make([]statsapi.InterfaceStats, 0, len(criNetwork.Interfaces)),
++	}
++	for _, iface := range criNetwork.Interfaces {
++		iStats.Interfaces = append(iStats.Interfaces, criInterfaceToSummary(iface))
++	}
++	ps.Network = &iStats
++}
++
++func addCRIPodMemoryStats(ps *statsapi.PodStats, criPodStat *runtimeapi.PodSandboxStats) {
++	if criPodStat == nil || criPodStat.Linux == nil || criPodStat.Linux.Memory == nil {
++		return
++	}
++	criMemory := criPodStat.Linux.Memory
++	ps.Memory = &statsapi.MemoryStats{
++		Time:            metav1.NewTime(time.Unix(0, criMemory.Timestamp)),
++		AvailableBytes:  valueOfUInt64Value(criMemory.AvailableBytes),
++		UsageBytes:      valueOfUInt64Value(criMemory.UsageBytes),
++		WorkingSetBytes: valueOfUInt64Value(criMemory.WorkingSetBytes),
++		RSSBytes:        valueOfUInt64Value(criMemory.RssBytes),
++		PageFaults:      valueOfUInt64Value(criMemory.PageFaults),
++		MajorPageFaults: valueOfUInt64Value(criMemory.MajorPageFaults),
++		PSI:             makePSIStats(criMemory.Psi),
++	}
++}
++
++func addCRIPodCPUStats(ps *statsapi.PodStats, criPodStat *runtimeapi.PodSandboxStats) {
++	if criPodStat == nil || criPodStat.Linux == nil || criPodStat.Linux.Cpu == nil {
++		return
++	}
++	criCPU := criPodStat.Linux.Cpu
++	ps.CPU = &statsapi.CPUStats{
++		Time:                 metav1.NewTime(time.Unix(0, criCPU.Timestamp)),
++		UsageNanoCores:       valueOfUInt64Value(criCPU.UsageNanoCores),
++		UsageCoreNanoSeconds: valueOfUInt64Value(criCPU.UsageCoreNanoSeconds),
++		PSI:                  makePSIStats(criCPU.Psi),
++	}
++}
++
++func addCRIPodIOStats(ps *statsapi.PodStats, criPodStat *runtimeapi.PodSandboxStats) {
++	if !utilfeature.DefaultFeatureGate.Enabled(features.KubeletPSI) {
++		return
++	}
++	if criPodStat == nil || criPodStat.Linux == nil || criPodStat.Linux.Io == nil {
++		return
++	}
++	criIO := criPodStat.Linux.Io
++	ps.IO = &statsapi.IOStats{
++		Time: metav1.NewTime(time.Unix(0, criIO.Timestamp)),
++		PSI:  makePSIStats(criIO.Psi),
++	}
++}
++
++func addCRIPodProcessStats(ps *statsapi.PodStats, criPodStat *runtimeapi.PodSandboxStats) {
++	if criPodStat == nil || criPodStat.Linux == nil || criPodStat.Linux.Process == nil {
++		return
++	}
++	ps.ProcessStats = &statsapi.ProcessStats{
++		ProcessCount: valueOfUInt64Value(criPodStat.Linux.Process.ProcessCount),
++	}
++}
++
++// listContainerNetworkStats returns the network stats of all the running containers.
++// It should return (nil, nil) for platforms other than Windows.
++func (p *criStatsProvider) listContainerNetworkStats(klog.Logger) (map[string]*statsapi.NetworkStats, error) {
++	return nil, nil
++}
+diff --git a/pkg/kubelet/stats/cri_stats_provider_others.go b/pkg/kubelet/stats/cri_stats_provider_others.go
+index 4d075114db4..a82d70e350d 100644
+--- a/pkg/kubelet/stats/cri_stats_provider_others.go
++++ b/pkg/kubelet/stats/cri_stats_provider_others.go
+@@ -1,4 +1,4 @@
+-//go:build !linux && !windows
++//go:build !linux && !windows && !freebsd
+ 
+ /*
+ Copyright 2019 The Kubernetes Authors.
+-- 
+2.54.0 (Apple Git-157)
+

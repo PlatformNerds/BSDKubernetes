@@ -1,0 +1,332 @@
+From 7289e960a452ec9e35225b661cd3384319c7a10d Mon Sep 17 00:00:00 2001
+From: Doug Rabson <dfr@rabson.org>
+Date: Sat, 31 Dec 2022 08:35:02 +0000
+Subject: [PATCH 04/12] Add noop stubs for FreeBSD in pkg/volume/util
+
+---
+ pkg/volume/util/fs/fs.go                      |   2 +-
+ pkg/volume/util/fs/fs_unsupported.go          |   2 +-
+ pkg/volume/util/fsquota/quota_freebsd.go      |  58 ++++++++
+ pkg/volume/util/fsquota/quota_unsupported.go  |   2 +-
+ pkg/volume/util/hostutil/hostutil_freebsd.go  | 130 ++++++++++++++++++
+ .../util/hostutil/hostutil_unsupported.go     |   2 +-
+ pkg/volume/util/subpath/subpath_freebsd.go    |  54 ++++++++
+ .../util/subpath/subpath_unsupported.go       |   2 +-
+ 8 files changed, 247 insertions(+), 5 deletions(-)
+ create mode 100644 pkg/volume/util/fsquota/quota_freebsd.go
+ create mode 100644 pkg/volume/util/hostutil/hostutil_freebsd.go
+ create mode 100644 pkg/volume/util/subpath/subpath_freebsd.go
+
+diff --git a/pkg/volume/util/fs/fs.go b/pkg/volume/util/fs/fs.go
+index fea83301b4c..f27d815e34f 100644
+--- a/pkg/volume/util/fs/fs.go
++++ b/pkg/volume/util/fs/fs.go
+@@ -1,4 +1,4 @@
+-//go:build linux || darwin
++//go:build linux || darwin || freebsd
+ 
+ /*
+ Copyright 2014 The Kubernetes Authors.
+diff --git a/pkg/volume/util/fs/fs_unsupported.go b/pkg/volume/util/fs/fs_unsupported.go
+index 82065e31601..52165743f6b 100644
+--- a/pkg/volume/util/fs/fs_unsupported.go
++++ b/pkg/volume/util/fs/fs_unsupported.go
+@@ -1,4 +1,4 @@
+-//go:build !linux && !darwin && !windows
++//go:build !linux && !darwin && !windows && !freebsd
+ 
+ /*
+ Copyright 2014 The Kubernetes Authors.
+diff --git a/pkg/volume/util/fsquota/quota_freebsd.go b/pkg/volume/util/fsquota/quota_freebsd.go
+new file mode 100644
+index 00000000000..ae7aa3ed87a
+--- /dev/null
++++ b/pkg/volume/util/fsquota/quota_freebsd.go
+@@ -0,0 +1,58 @@
++//go:build freebsd
++
++/*
++Copyright 2018 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package fsquota
++
++import (
++	"errors"
++
++	"k8s.io/mount-utils"
++
++	"k8s.io/apimachinery/pkg/api/resource"
++	"k8s.io/apimachinery/pkg/types"
++)
++
++// Dummy quota implementation for systems that do not implement support
++// for volume quotas
++
++var errNotImplemented = errors.New("not implemented")
++
++// SupportsQuotas -- dummy implementation
++func SupportsQuotas(_ mount.Interface, _ string, _ bool) (bool, error) {
++	return false, nil
++}
++
++// AssignQuota -- dummy implementation
++func AssignQuota(_ mount.Interface, _ string, _ types.UID, _ *resource.Quantity, _ bool) error {
++	return errNotImplemented
++}
++
++// GetConsumption -- dummy implementation
++func GetConsumption(_ string) (*resource.Quantity, error) {
++	return nil, errNotImplemented
++}
++
++// GetInodes -- dummy implementation
++func GetInodes(_ string) (*resource.Quantity, error) {
++	return nil, errNotImplemented
++}
++
++// ClearQuota -- dummy implementation
++func ClearQuota(_ mount.Interface, _ string, _ bool) error {
++	return nil
++}
+diff --git a/pkg/volume/util/fsquota/quota_unsupported.go b/pkg/volume/util/fsquota/quota_unsupported.go
+index dcebb4faa4d..bdd7641225e 100644
+--- a/pkg/volume/util/fsquota/quota_unsupported.go
++++ b/pkg/volume/util/fsquota/quota_unsupported.go
+@@ -1,4 +1,4 @@
+-//go:build !linux
++//go:build !linux && !freebsd
+ 
+ /*
+ Copyright 2018 The Kubernetes Authors.
+diff --git a/pkg/volume/util/hostutil/hostutil_freebsd.go b/pkg/volume/util/hostutil/hostutil_freebsd.go
+new file mode 100644
+index 00000000000..2b1c33ea607
+--- /dev/null
++++ b/pkg/volume/util/hostutil/hostutil_freebsd.go
+@@ -0,0 +1,130 @@
++//go:build freebsd
++
++/*
++Copyright 2017 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package hostutil
++
++import (
++	"fmt"
++	"os"
++	"path"
++	"path/filepath"
++	"strings"
++
++	"k8s.io/klog/v2"
++	"k8s.io/mount-utils"
++	utilpath "k8s.io/utils/path"
++)
++
++// HostUtil implements HostUtils for Windows platforms.
++type HostUtil struct{}
++
++// NewHostUtil returns a struct that implements HostUtils on Windows platforms
++func NewHostUtil() *HostUtil {
++	return &HostUtil{}
++}
++
++// GetDeviceNameFromMount given a mnt point, find the device
++func (hu *HostUtil) GetDeviceNameFromMount(mounter mount.Interface, mountPath, pluginMountDir string) (string, error) {
++	return getDeviceNameFromMount(mounter, mountPath, pluginMountDir)
++}
++
++// getDeviceNameFromMount find the device(drive) name in which
++// the mount path reference should match the given plugin mount directory. In case no mount path reference
++// matches, returns the volume name taken from its given mountPath
++func getDeviceNameFromMount(mounter mount.Interface, mountPath, pluginMountDir string) (string, error) {
++	refs, err := mounter.GetMountRefs(mountPath)
++	if err != nil {
++		klog.V(4).Infof("GetMountRefs failed for mount path %q: %v", mountPath, err)
++		return "", err
++	}
++	if len(refs) == 0 {
++		return "", fmt.Errorf("directory %s is not mounted", mountPath)
++	}
++	basemountPath := pluginMountDir
++	for _, ref := range refs {
++		if strings.Contains(ref, basemountPath) {
++			volumeID, err := filepath.Rel(basemountPath, ref)
++			if err != nil {
++				klog.Errorf("Failed to get volume id from mount %s - %v", mountPath, err)
++				return "", err
++			}
++			return volumeID, nil
++		}
++	}
++
++	return path.Base(mountPath), nil
++}
++
++// DeviceOpened determines if the device is in use elsewhere
++func (hu *HostUtil) DeviceOpened(pathname string) (bool, error) {
++	return false, nil
++}
++
++// PathIsDevice determines if a path is a device.
++func (hu *HostUtil) PathIsDevice(pathname string) (bool, error) {
++	return false, nil
++}
++
++// MakeRShared checks that given path is on a mount with 'rshared' mount
++// propagation. Empty implementation here.
++func (hu *HostUtil) MakeRShared(path string) error {
++	return nil
++}
++
++// GetFileType checks for sockets/block/character devices
++func (hu *(HostUtil)) GetFileType(pathname string) (FileType, error) {
++	return getFileType(pathname)
++}
++
++// PathExists checks whether the path exists
++func (hu *HostUtil) PathExists(pathname string) (bool, error) {
++	return utilpath.Exists(utilpath.CheckFollowSymlink, pathname)
++}
++
++// EvalHostSymlinks returns the path name after evaluating symlinks
++func (hu *HostUtil) EvalHostSymlinks(pathname string) (string, error) {
++	return filepath.EvalSymlinks(pathname)
++}
++
++// GetOwner returns the integer ID for the user and group of the given path
++// Note that on windows, it always returns 0. We actually don't set Group on
++// windows platform, see SetVolumeOwnership implementation.
++func (hu *HostUtil) GetOwner(pathname string) (int64, int64, error) {
++	return -1, -1, nil
++}
++
++// GetSELinuxSupport returns a boolean indicating support for SELinux.
++// Windows does not support SELinux.
++func (hu *HostUtil) GetSELinuxSupport(pathname string) (bool, error) {
++	return false, nil
++}
++
++// GetMode returns permissions of the path.
++func (hu *HostUtil) GetMode(pathname string) (os.FileMode, error) {
++	info, err := os.Stat(pathname)
++	if err != nil {
++		return 0, err
++	}
++	return info.Mode(), nil
++}
++
++// GetSELinuxMountContext returns value of -o context=XYZ mount option on
++// given mount point.
++func (hu *HostUtil) GetSELinuxMountContext(pathname string) (string, error) {
++	return "", nil
++}
+diff --git a/pkg/volume/util/hostutil/hostutil_unsupported.go b/pkg/volume/util/hostutil/hostutil_unsupported.go
+index 2fd765938a2..29baf9218c8 100644
+--- a/pkg/volume/util/hostutil/hostutil_unsupported.go
++++ b/pkg/volume/util/hostutil/hostutil_unsupported.go
+@@ -1,4 +1,4 @@
+-//go:build !linux && !windows
++//go:build !linux && !windows && !freebsd
+ 
+ /*
+ Copyright 2014 The Kubernetes Authors.
+diff --git a/pkg/volume/util/subpath/subpath_freebsd.go b/pkg/volume/util/subpath/subpath_freebsd.go
+new file mode 100644
+index 00000000000..2723076c1dc
+--- /dev/null
++++ b/pkg/volume/util/subpath/subpath_freebsd.go
+@@ -0,0 +1,54 @@
++//go:build freebsd
++
++/*
++Copyright 2014 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package subpath
++
++import (
++	"errors"
++	"os"
++
++	"k8s.io/mount-utils"
++	"k8s.io/utils/nsenter"
++)
++
++type subpath struct{}
++
++var errUnsupported = errors.New("util/subpath on this platform is not supported")
++
++// New returns a subpath.Interface for the current system.
++func New(mount.Interface) Interface {
++	return &subpath{}
++}
++
++// NewNSEnter is to satisfy the compiler for having NewSubpathNSEnter exist for all
++// OS choices. however, NSEnter is only valid on Linux
++func NewNSEnter(mounter mount.Interface, ne *nsenter.Nsenter, rootDir string) Interface {
++	return nil
++}
++
++func (sp *subpath) PrepareSafeSubpath(subPath Subpath) (newHostPath string, cleanupAction func(), err error) {
++	return subPath.Path, nil, errors.New("util/subpath.PrepareSafeSubpath on this platform is not supported")
++}
++
++func (sp *subpath) CleanSubPaths(podDir string, volumeName string) error {
++	return nil
++}
++
++func (sp *subpath) SafeMakeDir(pathname string, base string, perm os.FileMode) error {
++	return errors.New("util/subpath.SafeMakeDir on this platform is not supported")
++}
+diff --git a/pkg/volume/util/subpath/subpath_unsupported.go b/pkg/volume/util/subpath/subpath_unsupported.go
+index b294ffdfd6d..fc8abbe3056 100644
+--- a/pkg/volume/util/subpath/subpath_unsupported.go
++++ b/pkg/volume/util/subpath/subpath_unsupported.go
+@@ -1,4 +1,4 @@
+-//go:build !linux && !windows
++//go:build !linux && !windows && !freebsd
+ 
+ /*
+ Copyright 2014 The Kubernetes Authors.
+-- 
+2.54.0 (Apple Git-157)
+

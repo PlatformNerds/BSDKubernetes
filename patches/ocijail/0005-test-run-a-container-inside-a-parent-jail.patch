@@ -1,0 +1,44 @@
+From a61613cd2e09e47399e3ded715fc2ef535e10f32 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 22:01:20 -0700
+Subject: [PATCH 5/5] test: run a container inside a parent jail
+
+---
+ test/run_test.py | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/test/run_test.py b/test/run_test.py
+index 3cf5c65..6a11a4d 100644
+--- a/test/run_test.py
++++ b/test/run_test.py
+@@ -215,6 +215,27 @@ class test_run(unittest.TestCase):
+             self.assertEqual(rctl_rules(subject), [])
+         finally:
+             subprocess.run(["rctl", "-r", subject], capture_output=True)
++    def test_parent_jail(self):
++        # Containers created inside a parent jail (as CRI-O does for every
++        # pod container via org.freebsd.parentJail) read and update the
++        # parent's parameters with jail::get/jail::set.
++        # The parent must allow what ocijail sets on its children
++        # (enforce_statfs=1, allow.raw_sockets), as a pod sandbox jail
++        # created by ocijail does.
++        parent = f"{self.container_id}_parent"
++        subprocess.run(["jail", "-c", f"name={parent}", "path=/", "persist",
++                        "enforce_statfs=1", "allow.raw_sockets",
++                        "allow.chflags"],
++                       check=True)
++        try:
++            c = self.config()
++            c["annotations"] = {"org.freebsd.parentJail": parent}
++            c["process"]["args"] = ["sh", "-c", "exit 42"]
++            ret, _, _ = self.run_with_config(c)
++            self.assertEqual(ret, 42)
++        finally:
++            self.delete(False)
++            subprocess.run(["jail", "-r", parent])
+ 
+     def test_stdout(self):
+         c = self.config()
+-- 
+2.54.0 (Apple Git-157)
+

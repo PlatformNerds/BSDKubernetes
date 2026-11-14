@@ -72,7 +72,7 @@ Caveats of `memoryuse:sigkill`:
 ## Upstream candidates (fork-first, then upstream; see docs/FORKS.md)
 
 1. ocijail `jail: fix config::set type validation`: **opened as [dfr/ocijail#39](https://github.com/dfr/ocijail/pull/39)** (2026-11-14).
-2. ocijail `rctl` resources: needs agreement on using `linux.resources` on FreeBSD vs a future `freebsd.resources` in runtime-spec. Proposal: accept `linux.resources` now (every engine already emits it), add `freebsd.resources` later.
+2. ocijail `rctl` resources: **opened as [dfr/ocijail#40](https://github.com/dfr/ocijail/pull/40)** (2026-11-14), adding stale-rule cleanup at create, EPERM tolerance (ocijail inside a jail) and 3 root tests. Open design question for dfr: `linux.resources` on FreeBSD now vs a future `freebsd.resources`.
 3. kubelet FreeBSD resources: rides on dfr's kubelet series. Eventually a CRI `FreeBSDContainerResources` message (KEP).
 
 ## Next steps

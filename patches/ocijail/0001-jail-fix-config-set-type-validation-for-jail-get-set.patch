@@ -1,7 +1,7 @@
 From 6df77cd7159873b8827011643606bd724648dd20 Mon Sep 17 00:00:00 2001
 From: BSDKubernetes <bsdk8s@users.noreply.github.com>
 Date: Fri, 13 Nov 2026 20:29:09 -0700
-Subject: [PATCH 1/2] jail: fix config::set type validation for jail::get/set
+Subject: [PATCH 1/5] jail: fix config::set type validation for jail::get/set
  callers
 
 config::set asserted types that only match the create path. jail::get()

@@ -1,0 +1,39 @@
+From 1b9faefd11cd9df8f47423d72a61f25e5f7e5cee Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 22:11:38 -0700
+Subject: [PATCH 4/5] test: remove the planted rctl rule even if
+ test_resources_stale_rules fails
+
+On a build without stale-rule cleanup the test fails and would otherwise
+leave jail:<id>:openfiles:deny=1000 behind on the test host.
+---
+ test/run_test.py | 13 ++++++++-----
+ 1 file changed, 8 insertions(+), 5 deletions(-)
+
+diff --git a/test/run_test.py b/test/run_test.py
+index cc5489d..3cf5c65 100644
+--- a/test/run_test.py
++++ b/test/run_test.py
+@@ -207,11 +207,14 @@ class test_run(unittest.TestCase):
+         subject = f"jail:{self.container_id}"
+         subprocess.run(["rctl", "-a", f"{subject}:openfiles:deny=1000"],
+                        check=True)
+-        c = self.config()
+-        c["process"]["args"] = ["sh", "-c", "exit 0"]
+-        ret, _, _ = self.run_with_config(c)
+-        self.assertEqual(ret, 0)
+-        self.assertEqual(rctl_rules(subject), [])
++        try:
++            c = self.config()
++            c["process"]["args"] = ["sh", "-c", "exit 0"]
++            ret, _, _ = self.run_with_config(c)
++            self.assertEqual(ret, 0)
++            self.assertEqual(rctl_rules(subject), [])
++        finally:
++            subprocess.run(["rctl", "-r", subject], capture_output=True)
+ 
+     def test_stdout(self):
+         c = self.config()
+-- 
+2.54.0 (Apple Git-157)
+

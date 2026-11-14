@@ -1,7 +1,7 @@
 From 17fd892b69825804f26454b81bfc55c3053044d1 Mon Sep 17 00:00:00 2001
 From: BSDKubernetes <bsdk8s@users.noreply.github.com>
 Date: Fri, 13 Nov 2026 20:34:37 -0700
-Subject: [PATCH 2/2] Enforce OCI linux.resources with rctl(8) rules on the
+Subject: [PATCH 2/5] Enforce OCI linux.resources with rctl(8) rules on the
  container jail
 
 FreeBSD has no cgroups, but CRI-O (and other engines) already express

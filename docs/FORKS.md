@@ -7,7 +7,8 @@ first (he owns the FreeBSD ports of these projects), then to the real upstream p
 ## The forks
 
 Since 2026-11-14 these are **real GitHub forks** (public), so PRs can be opened directly from them to `dfr/*` or to the
-fork-network root. (Before that they were private mirrors; those are archived as `PlatformNerds/<name>-mirror-old`.)
+fork-network root. (Before that they were private mirrors; those were replaced by these forks with all branches
+verified identical, then deleted.)
 
 | Fork | Parent → network root | Our working branch (default) | Status |
 |---|---|---|---|

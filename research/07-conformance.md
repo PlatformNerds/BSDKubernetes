@@ -48,11 +48,22 @@ The first multi-node run: control plane `bsdk8s` (192.168.100.1) + worker `bsdk8
 
 - **Fixed (2):** the two tests that require two nodes (DaemonSet rollback, "at least two untainted nodes").
 - **New failures (3), each triaged:**
-  1. **`allowPrivilegeEscalation: false` is not enforced (security gap).** On node 2 the setuid `nnp` helper reached
-     `Effective uid: 0`. Run 3's "pass" on node 1 was accidental: setuid didn't take effect there at all, and the
-     `...when true` tests that would expose that aren't in the conformance set. Fix: ocijail should call
-     `procctl(PROC_NO_NEW_PRIVS_CTL)` (FreeBSD ≥ 14) when the OCI `process.noNewPrivileges` is set. Also find out why
-     setuid had no effect on node 1.
+  1. **`allowPrivilegeEscalation: false` was not enforced (security gap). Fixed.** On node 2 the setuid `nnp` helper
+     reached `Effective uid: 0`. Run 3's "pass" on node 1 was accidental, and there were two bugs:
+     - **ocijail ignored OCI `process.noNewPrivileges`.** It now calls `procctl(PROC_NO_NEW_PRIVS_CTL)` (FreeBSD ≥ 14)
+       after dropping to the container user, just before exec; on older releases it refuses instead of silently
+       ignoring the flag (`PlatformNerds/ocijail` `no-new-privs`, in `bsdk8s-main`; patch `ocijail/0009`). Tests: a
+       setuid-root `id` run as nobody reports euid 0 without the flag and 65534 with it.
+     - **Setuid bits are lost when unpacking image layers on FreeBSD.** containers/storage `pkg/archive/archive_bsd.go`
+       passed `uint32(os.FileMode)` to `fchmodat(2)`, but Go keeps setuid/setgid/sticky in high bits
+       (`os.ModeSetuid` is `1<<23`), so the kernel never saw them. Node 1 built the image with `buildah commit`
+       (buggy vendored storage), so its `nnp` was not setuid at all; node 2 got the same image via `podman load`,
+       which kept the bit. Already fixed upstream (container-libs `8f9b4818cc`, June 2026), but CRI-O 1.37 and the
+       FreeBSD `buildah` 1.43.2 package predate it: **every image CRI-O pulls on FreeBSD loses its setuid binaries**.
+       Backported into `PlatformNerds/cri-o` `bsdk8s-1.37` (patch `cri-o/0001`); the e2e image build re-loads
+       `nonewprivs` through podman and checks the bit.
+     Verified on both nodes with pods pinned per node: `false` → euid 1000, `true` and unset → euid 0 (Kubernetes
+     semantics); the 3 `AllowPrivilegeEscalation` e2e tests pass.
   2. **NodePort + session affinity across nodes.** `192.168.100.1:30756` was unreachable from a pod on node 2.
      Most likely asymmetric routing: node 1 rdr's to an endpoint on node 2, which replies directly to the client on
      node 2 without un-NAT. The pf proxier deliberately omits NodePort masquerading (its natRule is commented out).

@@ -1,0 +1,152 @@
+From e8ee68560f81fcfd57ba8f3d97881d9648953cd7 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 14:45:56 -0700
+Subject: [PATCH] process: honour process.noNewPrivileges with
+ procctl(PROC_NO_NEW_PRIVS_CTL)
+
+The OCI runtime spec's process.noNewPrivileges was ignored, so a container
+created with allowPrivilegeEscalation: false could still gain privileges
+through setuid binaries. Set PROC_NO_NEW_PRIVS_CTL (FreeBSD 14.0+) after
+dropping to the container user and before exec; the flag is inherited and
+cannot be cleared. On older releases, refuse instead of silently ignoring it.
+
+Tests: a setuid-root copy of id(1) run as nobody reports euid 0 without
+the flag and 65534 with it.
+---
+ ocijail/process.cpp | 30 ++++++++++++++++++++++++++++++
+ ocijail/process.h   |  2 ++
+ test/run_test.py    | 37 +++++++++++++++++++++++++++++++++++++
+ 3 files changed, 69 insertions(+)
+
+diff --git a/ocijail/process.cpp b/ocijail/process.cpp
+index 6a036c3..dcc32c2 100644
+--- a/ocijail/process.cpp
++++ b/ocijail/process.cpp
+@@ -1,5 +1,6 @@
+ #include <err.h>
+ #include <signal.h>
++#include <sys/procctl.h>
+ #include <sys/stat.h>
+ #include <unistd.h>
+ #include <filesystem>
+@@ -96,6 +97,13 @@ process::process(const json& process_json,
+         gids_.push_back(0);
+     }
+ 
++    if (process_json.contains("noNewPrivileges")) {
++        if (!process_json["noNewPrivileges"].is_boolean()) {
++            malformed_config("process.noNewPrivileges must be a boolean");
++        }
++        no_new_privs_ = process_json["noNewPrivileges"];
++    }
++
+     if (process_json.contains("env")) {
+         auto& config_env = process_json["env"];
+         if (!config_env.is_array()) {
+@@ -268,6 +276,21 @@ void process::set_uid_gid() {
+     }
+ }
+ 
++void process::set_no_new_privs() {
++#ifdef PROC_NO_NEW_PRIVS_CTL
++    int arg = PROC_NO_NEW_PRIVS_ENABLE;
++    if (::procctl(P_PID, ::getpid(), PROC_NO_NEW_PRIVS_CTL, &arg) < 0) {
++        throw std::system_error{errno,
++                                std::system_category(),
++                                "error calling procctl(PROC_NO_NEW_PRIVS_CTL)"};
++    }
++#else
++    // Refuse rather than silently running without the requested restriction.
++    throw std::runtime_error{
++        "process.noNewPrivileges requires FreeBSD 14.0 or later"};
++#endif
++}
++
+ void process::exec(int stdin_fd, int stdout_fd, int stderr_fd) {
+     // Make sure that HOME is set and is not empty
+     auto home = getenv("HOME");
+@@ -301,6 +324,13 @@ void process::exec(int stdin_fd, int stdout_fd, int stderr_fd) {
+     // Set the uid, gid etc.
+     set_uid_gid();
+ 
++    // process.noNewPrivileges: setuid/setgid bits and other privilege
++    // granting mechanisms are ignored by execve from here on. The flag is
++    // inherited by all descendants and cannot be cleared.
++    if (no_new_privs_) {
++        set_no_new_privs();
++    }
++
+     // Setup stdin, stdout and stderr. Close everything else.
+     if (stdin_fd != 0) {
+         ::dup2(stdin_fd, 0);
+diff --git a/ocijail/process.h b/ocijail/process.h
+index 0dc3d0c..4c40b50 100644
+--- a/ocijail/process.h
++++ b/ocijail/process.h
+@@ -31,6 +31,7 @@ struct process {
+    private:
+     void reset_signals();
+     void set_uid_gid();
++    void set_no_new_privs();
+ 
+     std::optional<std::filesystem::path> console_socket_;
+     bool detach_;
+@@ -45,6 +46,7 @@ struct process {
+     gid_t gid_;
+     std::optional<mode_t> umask_;
+     bool terminal_{false};
++    bool no_new_privs_{false};
+ };
+ 
+ }  // namespace ocijail
+diff --git a/test/run_test.py b/test/run_test.py
+index 8391028..8e0ec58 100644
+--- a/test/run_test.py
++++ b/test/run_test.py
+@@ -236,6 +236,43 @@ class test_run(unittest.TestCase):
+         finally:
+             self.delete(False)
+             subprocess.run(["jail", "-r", parent])
++    def suid_scratch(self):
++        # A scratch directory on a filesystem that honours setuid bits (/tmp
++        # is often nosuid, e.g. in the default ZFS layout).
++        scratch = tempfile.TemporaryDirectory(dir=os.path.dirname(os.path.abspath(__file__)))
++        if os.statvfs(scratch.name).f_flag & os.ST_NOSUID:
++            scratch.cleanup()
++            self.skipTest("test directory is on a nosuid filesystem")
++        return scratch
++
++    def setuid_id(self, scratch):
++        # A setuid-root copy of id(1): run as nobody, it reports euid 0
++        # unless no_new_privs is in effect.
++        path = os.path.join(scratch, "id")
++        shutil.copy("/usr/bin/id", path)
++        os.chown(path, 0, 0)
++        os.chmod(path, 0o4755)
++        os.chmod(scratch, 0o755)
++        return path
++
++    def test_no_new_privs(self):
++        with self.suid_scratch() as scratch:
++            c = self.config()
++            c["process"]["user"] = {"uid": 65534, "gid": 65534}
++            c["process"]["noNewPrivileges"] = True
++            c["process"]["args"] = [self.setuid_id(scratch), "-u"]
++            ret, out, _ = self.run_with_config(c)
++            self.assertEqual(ret, 0)
++            self.assertEqual(out.strip(), "65534")
++
++    def test_no_new_privs_unset(self):
++        with self.suid_scratch() as scratch:
++            c = self.config()
++            c["process"]["user"] = {"uid": 65534, "gid": 65534}
++            c["process"]["args"] = [self.setuid_id(scratch), "-u"]
++            ret, out, _ = self.run_with_config(c)
++            self.assertEqual(ret, 0)
++            self.assertEqual(out.strip(), "0")
+ 
+     def test_stdout(self):
+         c = self.config()
+-- 
+2.54.0 (Apple Git-157)
+

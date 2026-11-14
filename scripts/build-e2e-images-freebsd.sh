@@ -138,6 +138,17 @@ if [ -n "$nnp" ]; then
   install -m 4755 "$nnp" "$m/usr/local/bin/nnp"
   buildah config --cmd nnp "$c"
   commit "$reg/nonewprivs:$(mtag Nonewprivs)"
+  # buildah <= 1.43 on FreeBSD drops setuid bits when it stores the committed layer
+  # (containers/storage pkg/archive passed uint32(os.FileMode) to fchmodat; fixed upstream in
+  # container-libs 8f9b4818cc). The layer tar is correct, so re-load it through podman, whose
+  # unpack keeps the bit, and verify: without setuid the AllowPrivilegeEscalation tests are void.
+  t=$work/nonewprivs.tar
+  podman save -q -o "$t" "$reg/nonewprivs:$(mtag Nonewprivs)"
+  podman rmi -f "$reg/nonewprivs:$(mtag Nonewprivs)" >/dev/null
+  podman load -q -i "$t" >/dev/null; rm -f "$t"
+  mm=$(podman image mount "$reg/nonewprivs:$(mtag Nonewprivs)")
+  [ -u "$mm/usr/local/bin/nnp" ] || { echo "nonewprivs: nnp lost its setuid bit"; exit 1; }
+  podman image unmount "$reg/nonewprivs:$(mtag Nonewprivs)" >/dev/null
   echo "built nonewprivs"
 fi
 

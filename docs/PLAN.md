@@ -182,7 +182,7 @@ Details, file lists and LOC are in `research/02` §5. The upstream-friendly item
 | K13 | `mac_capabilities` MAC module (PRIV_* ↔ CAP_*) | 0.8–1.5k | High (module) | 2 |
 | K1 | hierarchical rctl semantics, delegation, in-jail view | 0.8–1.5k | Likely | 2 |
 | K12b | per-jail syscall deny bitmap (RuntimeDefault-like) | 0.4–0.8k | Contentious | 2 |
-| **K14** | **`allow.pf` (and `allow.ipfw`) jail permission**: grant `PRIV_NETINET_PF` to a non-VNET (hostNetwork) jail, so kube-proxy / CNI / NetworkPolicy agents can run as pods. Also make pf's ioctl and netlink paths enforce the same privilege. **Found in the first real cluster run** (MAC-DEV-VM.md §4 #4). | ~50–100 | High | **1** |
+| **K14** ✅ | **`allow.pf` jail permission: IMPLEMENTED & VERIFIED** ([research/08](../research/08-allow-pf.md)); `allow.ipfw` not done: grant `PRIV_NETINET_PF` to a non-VNET (hostNetwork) jail, so kube-proxy / CNI / NetworkPolicy agents can run as pods. Also make pf's ioctl and netlink paths enforce the same privilege. **Found in the first real cluster run** (MAC-DEV-VM.md §4 #4). | ~50–100 | High | **1** |
 | N1 | pf "service map" O(1) lookup for kube-proxy | ~2–3 mo | Plausible | 3 |
 | V1 | bhyve virtio-vsock (userspace, FC protocol) + direct kernel boot | ~1.5k + ~1k | High | 2 |
 | K6 | PSI for racct | 0.8–1.5k | Plausible | 3 |

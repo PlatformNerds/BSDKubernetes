@@ -13,9 +13,10 @@ verified identical, then deleted.)
 | Fork | Parent → network root | Our working branch (default) | Status |
 |---|---|---|---|
 | [PlatformNerds/kubernetes](https://github.com/PlatformNerds/kubernetes) | `dfr/kubernetes` → `kubernetes/kubernetes` | **`bsdk8s-v1.36.1`**: dfr kubelet + kube-proxy(pf) + kubeadm merged, plus cgo-free kubelet/rctl parsing fix and container resource limits | ✅ all k8s binaries build for FreeBSD amd64/arm64 (CI) |
-| [PlatformNerds/cri-o](https://github.com/PlatformNerds/cri-o) | `dfr/cri-o` → `cri-o/cri-o` | **`bsdk8s-1.37`** (= `dfr/freebsd-wip-1.37.0`, ~1.4 kLOC FreeBSD WIP) | ✅ `crio` builds for FreeBSD |
+| [PlatformNerds/cri-o](https://github.com/PlatformNerds/cri-o) | `dfr/cri-o` → `cri-o/cri-o` | **`bsdk8s-1.37`** (= `dfr/freebsd-wip-1.37.0`, ~1.4 kLOC FreeBSD WIP) | ✅ builds; **must be built natively with cgo** (a `CGO_ENABLED=0` cross-build compiles but panics on the first mount) |
 | [PlatformNerds/ocijail](https://github.com/PlatformNerds/ocijail) | `dfr/ocijail` | **`bsdk8s-main`**: resource limits via rctl + jail type-assert fix | ✅ running in the dev VM (demo builds it from source) |
 | [PlatformNerds/cni-plugins](https://github.com/PlatformNerds/cni-plugins) | `dfr/plugins` → `containernetworking/plugins` | **`freebsd`** (unchanged) | the branch behind FreeBSD's `net/containernetworking-plugins` port |
+| [PlatformNerds/freebsd-src](https://github.com/PlatformNerds/freebsd-src) | `freebsd/freebsd-src` | **`bsdk8s/allow-pf`** (main), **`bsdk8s/allow-pf-15.1`** (tested backport) | kernel work (K-series); `allow.pf` booted and verified |
 | [PlatformNerds/kubernetes-demo](https://github.com/PlatformNerds/kubernetes-demo) | `dfr/kubernetes-demo` | **`bsdk8s`**: builds CRI-O, k8s and ocijail from our forks (`BSDK8S_GIT_BASE`, `*_BRANCH` overrides), arm64 support, fixes | single-node FreeBSD cluster bootstrap |
 
 > Correction to the original research: CRI-O's FreeBSD *pod* support is **not fully upstream**. dfr's demo builds

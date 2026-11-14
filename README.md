@@ -21,6 +21,7 @@ as **Linux containers** where the Linuxulator can handle them, and inside **bhyv
 | [research/05-storage-security-controlplane.md](research/05-storage-security-controlplane.md) | ZFS snapshotters, CSI, security mapping, control plane, ecosystem |
 | [research/06-resource-limits.md](research/06-resource-limits.md) | **Implemented:** pod CPU/memory limits → rctl. Measured rctl semantics (`memoryuse:sigkill`, `pcpu` accuracy) |
 | [research/07-conformance.md](research/07-conformance.md) | **Conformance: 415/446 (93.0%), 97.0% excluding `[LinuxOnly]`** on a single FreeBSD arm64 node; remaining gaps ranked |
+| [research/08-allow-pf.md](research/08-allow-pf.md) | **Kernel K14 `allow.pf` implemented:** kube-proxy runs as a normal pod (kernel + ocijail + CRI-O) |
 | [research/UPSTREAM-PINS.md](research/UPSTREAM-PINS.md) | Exact upstream commits the research was done against |
 | [patches/kubernetes/v1.36.1/](patches/kubernetes/v1.36.1/) | Doug Rabson's FreeBSD patch series for kubelet, kube-proxy and kubeadm (Apache-2.0, credit: dfr) |
 

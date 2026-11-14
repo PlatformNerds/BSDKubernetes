@@ -250,11 +250,11 @@ The fork branches (`bsdk8s-*`) are the source of truth for code. `patches/` is a
 | Repo | Purpose | Status |
 |---|---|---|
 | `BSDKubernetes` | Plan, research, patch series, build scripts, CI | **created** |
-| `kubernetes` (private fork) | kubelet / kube-proxy pf / kubeadm, branch `bsdk8s-v1.36.1` | **created** ✅ builds |
-| `cri-o` (private fork) | CRI-O FreeBSD WIP, branch `bsdk8s-1.37` | **created** ✅ builds |
-| `ocijail` (private fork) | OCI runtime on jails; add rctl resources, containerd shim later | **created** |
-| `cni-plugins` (private fork) | dfr's FreeBSD CNI plugins, branch `freebsd` | **created** |
-| `kubernetes-demo` (private fork) | single-node bootstrap from our forks, branch `bsdk8s` | **created** |
+| `kubernetes` (public mirror-fork) | kubelet / kube-proxy pf / kubeadm, branch `bsdk8s-v1.36.1` | **created** ✅ builds |
+| `cri-o` (public mirror-fork) | CRI-O FreeBSD WIP, branch `bsdk8s-1.37` | **created** ✅ builds |
+| `ocijail` (public mirror-fork) | OCI runtime on jails; add rctl resources, containerd shim later | **created** |
+| `cni-plugins` (public mirror-fork) | dfr's FreeBSD CNI plugins, branch `freebsd` | **created** |
+| `kubernetes-demo` (public mirror-fork) | single-node bootstrap from our forks, branch `bsdk8s` | **created** |
 | `bsdk8s-kernel` | FreeBSD src branches for K-series patches (fork of freebsd-src) | create when K0 work starts |
 | `kube-proxy-pf` | Out-of-tree pf proxier + service-map experiments | create in Phase 1 |
 | `bsd-cni` | FreeBSD CNI plugins (VNET bridge, flannel port, pf portmap/policy) | Phase 1 |

@@ -36,7 +36,7 @@ Images land in local containers storage (shared with CRI-O), so kubeadm finds th
 ## 3. Bring up the cluster
 
 ```sh
-# in the VM, with sources from the PlatformNerds forks (private: use git credentials or a local copy)
+# in the VM, with sources from the PlatformNerds forks (public: no credentials needed)
 cd kubernetes-demo   # branch bsdk8s
 BSDK8S_GIT_BASE=<git base> ./build-cluster.sh vtnet0
 ```

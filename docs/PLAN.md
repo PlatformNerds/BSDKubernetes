@@ -182,6 +182,7 @@ Details, file lists and LOC are in `research/02` §5. The upstream-friendly item
 | K13 | `mac_capabilities` MAC module (PRIV_* ↔ CAP_*) | 0.8–1.5k | High (module) | 2 |
 | K1 | hierarchical rctl semantics, delegation, in-jail view | 0.8–1.5k | Likely | 2 |
 | K12b | per-jail syscall deny bitmap (RuntimeDefault-like) | 0.4–0.8k | Contentious | 2 |
+| **K14** | **`allow.pf` (and `allow.ipfw`) jail permission**: grant `PRIV_NETINET_PF` to a non-VNET (hostNetwork) jail, so kube-proxy / CNI / NetworkPolicy agents can run as pods. Also make pf's ioctl and netlink paths enforce the same privilege. **Found in the first real cluster run** (MAC-DEV-VM.md §4 #4). | ~50–100 | High | **1** |
 | N1 | pf "service map" O(1) lookup for kube-proxy | ~2–3 mo | Plausible | 3 |
 | V1 | bhyve virtio-vsock (userspace, FC protocol) + direct kernel boot | ~1.5k + ~1k | High | 2 |
 | K6 | PSI for racct | 0.8–1.5k | Plausible | 3 |
@@ -201,7 +202,8 @@ Honest-beta kernel set = **K0, K1, K5, K7, K10, K13** ≈ 4–6 kLOC ≈ **1 per
 - [x] Import the dfr patch series; integrate; cgo-free kubelet; cross-compile all binaries for amd64/arm64 **[verified]**.
 - [ ] **Talk to people before writing more code:** Doug Rabson (dfr), Samuel Karp (runj/containerd), the FreeBSD Foundation's container/cloud working group. Offer to co-maintain rather than fork. *The number-one risk is maintainer bandwidth, not technology.*
 - [ ] CI: nightly GitHub Actions job that builds the patch series against Kubernetes `master` and the latest release (cross-compile). Plus a FreeBSD VM job (`vmactions/freebsd-vm`) that runs `build-cluster.sh` and a smoke test.
-- [ ] A FreeBSD 15.x bare-metal or nested-virt test host (bhyve work needs bare metal).
+- [x] FreeBSD 15.1 arm64 dev VM on Apple Silicon (QEMU+HVF), with arm64 control-plane images built locally. See [MAC-DEV-VM.md](MAC-DEV-VM.md).
+- [ ] An x86 bare-metal FreeBSD 15.x host for bhyve / kata-bhyve work (needs real virtualization; not possible in the Mac VM).
 
 **Phase 1 — MVP: Linux control plane + FreeBSD workers (months 1–3)**
 - CRI-O + ocijail + patched kubelet + pf kube-proxy, joined to a stock Linux control plane via kubeadm.

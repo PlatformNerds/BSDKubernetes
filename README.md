@@ -11,6 +11,7 @@ as **Linux containers** where the Linuxulator can handle them, and inside **bhyv
 | Doc | What it is |
 |---|---|
 | [docs/PLAN.md](docs/PLAN.md) | **Master plan.** Architecture, phases, blockers and solutions, what to drop, kill criteria |
+| [docs/MAC-DEV-VM.md](docs/MAC-DEV-VM.md) | **FreeBSD arm64 dev VM on Apple Silicon** (QEMU+HVF), arm64 control-plane images, running the demo cluster |
 | [docs/FORKS.md](docs/FORKS.md) | **Fork-first workflow.** Private forks (kubernetes, cri-o, ocijail, cni-plugins, kubernetes-demo), branches, sync, upstreaming |
 | [research/00-strategy-prior-art.md](research/00-strategy-prior-art.md) | Prior art (Doug Rabson's working demo), upstream politics, which BSD, strategy options |
 | [research/01-kubelet-cri-oci.md](research/01-kubelet-cri-oci.md) | kubelet / CRI / OCI runtime port; cross-compile results |

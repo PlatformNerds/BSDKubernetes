@@ -92,9 +92,9 @@ Every one of these has a workable answer below. Some answers involve **dropping 
 ### 5.2 Resource isolation (cgroups → RCTL/RACCT/cpuset): `research/02`
 | Kubernetes feature | Linux | FreeBSD today | Plan |
 |---|---|---|---|
-| CPU limit (`cpu.max`) | CFS bandwidth | rctl `pcpu`, enforced by freezing processes once a second (multi-second stalls) | MVP: document as best-effort. Kernel **K2**: real per-jail bandwidth controller in ULE. |
+| CPU limit (`cpu.max`) | CFS bandwidth | rctl `pcpu`: 1 Hz on/off duty cycle. **Measured:** 500m → 50.3% ✅, 200m → 40% (2× overshoot). | ✅ **Implemented** (kubelet → CRI-O → ocijail `pcpu:deny`, [research/06](../research/06-resource-limits.md)). Accurate ≥ ~500m. Kernel **K2** for small limits. |
 | CPU request (`cpu.weight`) | CFS shares | **Nothing** (no group scheduling) | **K3-B**: ULE priority bias per jail (cheap). K3-A: fair-share scheduler (research). |
-| Memory limit | `memory.max` + OOM | `swapuse` = hard cap on anon memory (ENOMEM). `memoryuse` = lazy 1 Hz reclaim. | MVP: `swapuse` as the hard cap. **K5**: per-jail OOM kill + `oom_score_adj`. **K4**: page-owner accounting (moonshot). |
+| Memory limit | `memory.max` + OOM | **Measured:** `memoryuse:deny` doesn't enforce (no swap → nothing to reclaim). `swapuse:deny` charges at mmap time, so **Go dies at startup** (heap arena map). `memoryuse:sigkill` kills on RSS > limit ✅. | ✅ **Implemented** as `memoryuse:sigkill` (exit 137; 1 Hz check, so fast allocators overshoot). Reason shows `Error`, not `OOMKilled`. **K5**: per-jail OOM event + `oom_score_adj`. **K4**: page-owner accounting (moonshot). |
 | Memory protection (min/low/high) | yes | none | K4 (moonshot). Reserve kube-reserved and cap ZFS ARC (`vfs.zfs.arc_max`). |
 | pids | `pids.max` | `maxproc`/`nthr` | Works ✅ |
 | cpuset / NUMA (CPU and memory managers) | cpuset cgroup | `cpuset(2)` + `domainset` per jail | Works ✅ (better than Linux) |

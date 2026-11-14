@@ -65,7 +65,7 @@ arm64 crictl.
 | 6 | cloud-init stage skipped | nuageinit crashes on unquoted `": "` in `runcmd` | quote items (see §1) |
 
 **Confirmed gaps (as predicted in research/02 and research/03):**
-- **Resource limits are silently dropped.** The web pods have `limits: {memory: 64Mi, cpu: 200m}`, yet `rctl` shows **no rules**.
-- **Per-container accounting is missing.** `rctl -u jail:<container jail>` reports `memoryuse=0 pcpu=0`, so per-pod stats are empty. Needs investigation together with K0/K1.
+- ~~**Resource limits are silently dropped.**~~ **Fixed 2026-11-14:** limits now become rctl rules (see [research/06](../research/06-resource-limits.md)).
+- ~~**Per-container accounting is missing.**~~ This was a measurement error: rctl's `jail:` subject is the jail *name*, and `rctl -u jail:<jid>` silently reports an empty entry. Accounting by name works and is hierarchical.
 - **node→ClusterIP times out.** pf `rdr` doesn't apply to host-originated traffic on 15.x (works on 16-CURRENT).
 - containers/common logs `getCPUInfo for OS freebsd not implemented` on every buildah/podman call: harmless, easy upstream fix.

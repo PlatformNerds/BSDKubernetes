@@ -1,0 +1,178 @@
+From 686e21950fe05b3bcc63b088b22d138bd2a232b6 Mon Sep 17 00:00:00 2001
+From: BSDKubernetes <bsdk8s@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 20:36:20 -0700
+Subject: [PATCH] kubelet: pass container resource limits to the runtime on
+ FreeBSD
+
+generateFreeBSDContainerResources fills config.Linux.Resources (CRI has
+no FreeBSD resources message): memory limit, CPU quota/period (honouring
+--cpu-cfs-quota and --cpu-cfs-quota-period) and CPU shares. CRI-O turns
+these into OCI linux.resources and ocijail into rctl(8) rules on the
+container jail (memoryuse:sigkill, pcpu:deny). Previously limits were
+silently dropped.
+
+Verified on FreeBSD 15.1 arm64: a pod with limits {memory: 64Mi,
+cpu: 200m} gets memoryuse:sigkill=67108864 and pcpu:deny=20 on its
+container jail, and a container allocating 200MB is killed (exit 137).
+---
+ .../kuberuntime_container_freebsd.go          | 58 +++++++++++++++
+ .../kuberuntime_container_freebsd_test.go     | 74 +++++++++++++++++++
+ 2 files changed, 132 insertions(+)
+ create mode 100644 pkg/kubelet/kuberuntime/kuberuntime_container_freebsd_test.go
+
+diff --git a/pkg/kubelet/kuberuntime/kuberuntime_container_freebsd.go b/pkg/kubelet/kuberuntime/kuberuntime_container_freebsd.go
+index 04bccf37598..54670e507e1 100644
+--- a/pkg/kubelet/kuberuntime/kuberuntime_container_freebsd.go
++++ b/pkg/kubelet/kuberuntime/kuberuntime_container_freebsd.go
+@@ -37,10 +37,68 @@ func (m *kubeGenericRuntimeManager) applyPlatformSpecificContainerConfig(ctx con
+ 	}
+ 	config.Linux = &runtimeapi.LinuxContainerConfig{
+ 		SecurityContext: sc,
++		Resources:       m.generateFreeBSDContainerResources(container),
+ 	}
+ 	return nil
+ }
+ 
++// FreeBSD has no cgroups and CRI has no FreeBSD resource message, so resource
++// limits travel in the CRI LinuxContainerResources message: CRI-O turns it
++// into OCI linux.resources and the OCI runtime (ocijail) turns that into
++// rctl(8) rules on the container's jail:
++//
++//	limits.memory -> memory_limit_in_bytes -> swapuse:deny + memoryuse:deny
++//	limits.cpu    -> cpu_quota/cpu_period  -> pcpu:deny (percent of one CPU)
++//	requests.cpu  -> cpu_shares            -> no FreeBSD equivalent (ignored)
++const (
++	freebsdQuotaPeriod    = 100000 // usec, same default as CFS
++	freebsdMinQuotaPeriod = 1000
++	freebsdMinShares      = 2
++	freebsdMaxShares      = 262144
++	freebsdSharesPerCPU   = 1024
++)
++
++func (m *kubeGenericRuntimeManager) generateFreeBSDContainerResources(container *v1.Container) *runtimeapi.LinuxContainerResources {
++	res := &runtimeapi.LinuxContainerResources{}
++
++	if mem := container.Resources.Limits.Memory(); !mem.IsZero() {
++		res.MemoryLimitInBytes = mem.Value()
++	}
++
++	if req := container.Resources.Requests.Cpu(); !req.IsZero() {
++		res.CpuShares = freebsdMilliCPUToShares(req.MilliValue())
++	}
++
++	if lim := container.Resources.Limits.Cpu(); !lim.IsZero() && m.cpuCFSQuota {
++		period := int64(freebsdQuotaPeriod)
++		if p := m.cpuCFSQuotaPeriod.Duration.Microseconds(); p > 0 {
++			period = p
++		}
++		res.CpuPeriod = period
++		res.CpuQuota = freebsdMilliCPUToQuota(lim.MilliValue(), period)
++	}
++	return res
++}
++
++func freebsdMilliCPUToShares(milliCPU int64) int64 {
++	shares := milliCPU * freebsdSharesPerCPU / 1000
++	if shares < freebsdMinShares {
++		return freebsdMinShares
++	}
++	if shares > freebsdMaxShares {
++		return freebsdMaxShares
++	}
++	return shares
++}
++
++func freebsdMilliCPUToQuota(milliCPU, period int64) int64 {
++	quota := milliCPU * period / 1000
++	if quota < freebsdMinQuotaPeriod {
++		quota = freebsdMinQuotaPeriod
++	}
++	return quota
++}
++
+ // generateContainerResources generates platform specific container resources config for runtime
+ func (m *kubeGenericRuntimeManager) generateContainerResources(_ context.Context, pod *v1.Pod, container *v1.Container) *runtimeapi.ContainerResources {
+ 	return nil
+diff --git a/pkg/kubelet/kuberuntime/kuberuntime_container_freebsd_test.go b/pkg/kubelet/kuberuntime/kuberuntime_container_freebsd_test.go
+new file mode 100644
+index 00000000000..7b770346de0
+--- /dev/null
++++ b/pkg/kubelet/kuberuntime/kuberuntime_container_freebsd_test.go
+@@ -0,0 +1,74 @@
++//go:build freebsd
++
++/*
++Copyright 2026 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package kuberuntime
++
++import (
++	"testing"
++	"time"
++
++	v1 "k8s.io/api/core/v1"
++	"k8s.io/apimachinery/pkg/api/resource"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
++)
++
++func TestGenerateFreeBSDContainerResources(t *testing.T) {
++	q := resource.MustParse
++	for _, tc := range []struct {
++		name     string
++		cfsQuota bool
++		res      v1.ResourceRequirements
++		want     *runtimeapi.LinuxContainerResources
++	}{
++		{name: "none", cfsQuota: true, want: &runtimeapi.LinuxContainerResources{}},
++		{
++			name: "limits and requests", cfsQuota: true,
++			res: v1.ResourceRequirements{
++				Limits:   v1.ResourceList{v1.ResourceMemory: q("64Mi"), v1.ResourceCPU: q("200m")},
++				Requests: v1.ResourceList{v1.ResourceCPU: q("100m")},
++			},
++			want: &runtimeapi.LinuxContainerResources{MemoryLimitInBytes: 64 << 20, CpuShares: 102, CpuPeriod: 100000, CpuQuota: 20000},
++		},
++		{
++			name: "cfs quota disabled drops cpu limit only", cfsQuota: false,
++			res: v1.ResourceRequirements{Limits: v1.ResourceList{v1.ResourceMemory: q("1Gi"), v1.ResourceCPU: q("2")}},
++			// no request set: requests are defaulted from limits by the API server, not here
++			want: &runtimeapi.LinuxContainerResources{MemoryLimitInBytes: 1 << 30},
++		},
++		{
++			name: "tiny cpu limit clamps quota", cfsQuota: true,
++			res:  v1.ResourceRequirements{Limits: v1.ResourceList{v1.ResourceCPU: q("1m")}},
++			want: &runtimeapi.LinuxContainerResources{CpuPeriod: 100000, CpuQuota: 1000},
++		},
++		{
++			name: "tiny request clamps shares", cfsQuota: true,
++			res:  v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: q("1m")}},
++			want: &runtimeapi.LinuxContainerResources{CpuShares: 2},
++		},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			m := &kubeGenericRuntimeManager{cpuCFSQuota: tc.cfsQuota, cpuCFSQuotaPeriod: metav1.Duration{Duration: 100 * time.Millisecond}}
++			got := m.generateFreeBSDContainerResources(&v1.Container{Resources: tc.res})
++			if got.MemoryLimitInBytes != tc.want.MemoryLimitInBytes || got.CpuShares != tc.want.CpuShares ||
++				got.CpuPeriod != tc.want.CpuPeriod || got.CpuQuota != tc.want.CpuQuota {
++				t.Errorf("got %+v, want %+v", got, tc.want)
++			}
++		})
++	}
++}
+-- 
+2.54.0 (Apple Git-157)
+

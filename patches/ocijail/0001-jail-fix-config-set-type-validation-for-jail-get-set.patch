@@ -1,0 +1,56 @@
+From 6df77cd7159873b8827011643606bd724648dd20 Mon Sep 17 00:00:00 2001
+From: BSDKubernetes <bsdk8s@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 20:29:09 -0700
+Subject: [PATCH 1/2] jail: fix config::set type validation for jail::get/set
+ callers
+
+config::set asserted types that only match the create path. jail::get()
+and jail::set() on an existing jail pass:
+  - "jid" as the object's int jid_ (asserted uint32_t)
+  - "allow.*" as uint32_t via get<bool> (asserted monostate)
+  - "children.cur"/"children.max" as uint32_t (fell through to the
+    std::string assertion)
+In any build without NDEBUG this aborted every container with a parent
+jail (org.freebsd.parentJail, i.e. every CRI-O pod container), e.g.
+'Assertion failed: (std::holds_alternative<uint32_t>(val))'. Release
+builds strip asserts and get_iovec already handles these types, so the
+bug was latent.
+---
+ ocijail/jail.cpp | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/ocijail/jail.cpp b/ocijail/jail.cpp
+index 09a042f..0560d78 100644
+--- a/ocijail/jail.cpp
++++ b/ocijail/jail.cpp
+@@ -14,7 +14,14 @@ namespace ocijail {
+ 
+ void jail::config::set(const std::string& key, const value& val) {
+     // Validate parameter types
+-    if (key == "jid" || key == "devfs_ruleset" || key == "enforce_statfs") {
++    if (key == "jid") {
++        // jail ids are ints (jail_get(2)/jail_set(2)); jail::get/set pass
++        // the object's int jid_, which tripped the uint32_t assertion in
++        // builds without NDEBUG for every container with a parent jail.
++        assert(std::holds_alternative<int32_t>(val) ||
++               std::holds_alternative<uint32_t>(val));
++    } else if (key == "devfs_ruleset" || key == "enforce_statfs" ||
++               key == "children.cur" || key == "children.max") {
+         assert(std::holds_alternative<uint32_t>(val));
+     } else if (key == "ip4" || key == "ip6" || key == "sysvmsg" ||
+                key == "sysvsem" || key == "sysvshm") {
+@@ -25,7 +32,10 @@ void jail::config::set(const std::string& key, const value& val) {
+         assert(std::holds_alternative<ns>(val) &&
+                std::get<ns>(val) != DISABLED);
+     } else if (key == "persist" || key.starts_with("allow.")) {
+-        assert(std::holds_alternative<std::monostate>(val));
++        // monostate when creating ("set this flag"); uint32_t when read or
++        // updated through jail::get<bool>/jail::set on an existing jail.
++        assert(std::holds_alternative<std::monostate>(val) ||
++               std::holds_alternative<uint32_t>(val));
+     } else {
+         assert(std::holds_alternative<std::string>(val));
+     }
+-- 
+2.54.0 (Apple Git-157)
+

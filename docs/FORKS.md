@@ -12,7 +12,7 @@ GitHub can't make a fork of a public repo private, so these are **private mirror
 |---|---|---|---|
 | [PlatformNerds/kubernetes](https://github.com/PlatformNerds/kubernetes) | `dfr/kubernetes` `master`, `freebsd-*` + upstream `master` as `upstream-master`, tags v1.36.1, v1.31.0-alpha.0 | **`bsdk8s-v1.36.1`**: dfr kubelet + kube-proxy(pf) + kubeadm merged + our cgo-free/rctl fix | ✅ all k8s binaries cross-compile for FreeBSD amd64/arm64 |
 | [PlatformNerds/cri-o](https://github.com/PlatformNerds/cri-o) | `cri-o/cri-o` `main` + all `dfr/cri-o` branches under `dfr/*` | **`bsdk8s-1.37`** (= `dfr/freebsd-wip-1.37.0`, ~1.4 kLOC FreeBSD WIP) | ✅ `crio` cross-compiles for FreeBSD |
-| [PlatformNerds/ocijail](https://github.com/PlatformNerds/ocijail) | `dfr/ocijail` (all branches + tags) | `main` | C++/Bazel; build on FreeBSD |
+| [PlatformNerds/ocijail](https://github.com/PlatformNerds/ocijail) | `dfr/ocijail` (all branches + tags) | **`bsdk8s-main`**: resource limits via rctl + jail type-assert fix | ✅ built and running in the dev VM (demo builds it from source) |
 | [PlatformNerds/cni-plugins](https://github.com/PlatformNerds/cni-plugins) | `dfr/plugins` (all branches + tags) | **`freebsd`** | the branch behind FreeBSD's `net/containernetworking-plugins` port |
 | [PlatformNerds/kubernetes-demo](https://github.com/PlatformNerds/kubernetes-demo) | `dfr/kubernetes-demo` `main` | **`bsdk8s`**: builds CRI-O and k8s from our forks (`BSDK8S_GIT_BASE`, `CRIO_BRANCH`, `K8S_BRANCH` override) | single-node FreeBSD cluster bootstrap |
 

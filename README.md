@@ -19,6 +19,7 @@ as **Linux containers** where the Linuxulator can handle them, and inside **bhyv
 | [research/03-networking.md](research/03-networking.md) | CNI on VNET, pf-based kube-proxy, NetworkPolicy, eBPF/Cilium alternatives |
 | [research/04-linux-compat-bhyve.md](research/04-linux-compat-bhyve.md) | Linuxulator gap analysis; bhyve as a Kata-style microVM runtime |
 | [research/05-storage-security-controlplane.md](research/05-storage-security-controlplane.md) | ZFS snapshotters, CSI, security mapping, control plane, ecosystem |
+| [research/06-resource-limits.md](research/06-resource-limits.md) | **Implemented:** pod CPU/memory limits → rctl. Measured rctl semantics (`memoryuse:sigkill`, `pcpu` accuracy) |
 | [research/UPSTREAM-PINS.md](research/UPSTREAM-PINS.md) | Exact upstream commits the research was done against |
 | [patches/kubernetes/v1.36.1/](patches/kubernetes/v1.36.1/) | Doug Rabson's FreeBSD patch series for kubelet, kube-proxy and kubeadm (Apache-2.0, credit: dfr) |
 

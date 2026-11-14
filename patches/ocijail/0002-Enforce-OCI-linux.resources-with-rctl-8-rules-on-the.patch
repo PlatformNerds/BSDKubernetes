@@ -1,0 +1,350 @@
+From 17fd892b69825804f26454b81bfc55c3053044d1 Mon Sep 17 00:00:00 2001
+From: BSDKubernetes <bsdk8s@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 20:34:37 -0700
+Subject: [PATCH 2/2] Enforce OCI linux.resources with rctl(8) rules on the
+ container jail
+
+FreeBSD has no cgroups, but CRI-O (and other engines) already express
+container limits as OCI linux.resources. Translate them into rctl rules
+on the container's jail at create time and remove them on delete (rctl
+rules are keyed by jail name and outlive the jail):
+
+  memory.limit         -> memoryuse:sigkill=<bytes>
+  cpu.quota/cpu.period -> pcpu:deny=ceil(100*quota/period)
+  pids.limit           -> maxproc:deny=<n>
+  cpu.shares           -> ignored with a warning (no equivalent)
+
+memoryuse:sigkill kills on RSS above the limit, the closest match to
+memory.max + OOM kill. swapuse:deny was rejected: it charges writable
+anonymous mappings at mmap time, so Go programs die at startup with
+'out of memory allocating heap arena map' under a 64Mi limit.
+memoryuse:deny only triggers reclaim and is a no-op without swap.
+
+If RACCT is disabled (kern.racct.enable=0) the container still starts and
+a warning is logged. Includes a dependency-free unit test (rctl_test).
+---
+ ocijail/BUILD         |  9 +++++
+ ocijail/create.cpp    | 30 ++++++++++++---
+ ocijail/delete.cpp    |  4 ++
+ ocijail/rctl.cpp      | 90 +++++++++++++++++++++++++++++++++++++++++++
+ ocijail/rctl.h        | 50 ++++++++++++++++++++++++
+ ocijail/rctl_test.cpp | 45 ++++++++++++++++++++++
+ 6 files changed, 223 insertions(+), 5 deletions(-)
+ create mode 100644 ocijail/rctl.cpp
+ create mode 100644 ocijail/rctl.h
+ create mode 100644 ocijail/rctl_test.cpp
+
+diff --git a/ocijail/BUILD b/ocijail/BUILD
+index dd4b73c..6009ccf 100644
+--- a/ocijail/BUILD
++++ b/ocijail/BUILD
+@@ -29,6 +29,8 @@ cc_binary(
+         "mount.h",
+         "process.cpp",
+         "process.h",
++        "rctl.cpp",
++        "rctl.h",
+         "start.cpp",
+         "start.h",
+         "state.cpp",
+@@ -42,3 +44,10 @@ cc_binary(
+     ],
+     visibility = ["//visibility:public"],
+ )
++
++cc_test(
++    name = "rctl_test",
++    copts = ["-std=c++20"],
++    srcs = ["rctl_test.cpp", "rctl.cpp", "rctl.h"],
++    deps = ["@nlohmann_json//:json"],
++)
+diff --git a/ocijail/create.cpp b/ocijail/create.cpp
+index b642c63..19a3005 100644
+--- a/ocijail/create.cpp
++++ b/ocijail/create.cpp
+@@ -14,6 +14,7 @@
+ #include "ocijail/create.h"
+ #include "ocijail/hook.h"
+ #include "ocijail/jail.h"
++#include "ocijail/rctl.h"
+ #include "ocijail/mount.h"
+ #include "ocijail/process.h"
+ #include "ocijail/tty.h"
+@@ -303,11 +304,8 @@ void create::run() {
+ 
+     // Create a jail config from the OCI config
+     jail::config jconf;
+-    if (parent_jail) {
+-        jconf.set("name", *parent_jail + "." + id_);
+-    } else {
+-        jconf.set("name", id_);
+-    }
++    const std::string jail_name = parent_jail ? *parent_jail + "." + id_ : id_;
++    jconf.set("name", jail_name);
+     jconf.set("persist");
+     jconf.set("enforce_statfs", 1u);
+     jconf.set("allow.raw_sockets");
+@@ -411,6 +409,7 @@ void create::run() {
+     if (parent_jail) {
+         state["parent_jail"] = *parent_jail;
+     }
++    state["jail_name"] = jail_name;
+ 
+     // Create the state here in case we have a readonly root
+     auto lk = state.create();
+@@ -465,6 +464,27 @@ void create::run() {
+ 
+     auto j = jail::create(jconf);
+ 
++    // Resource limits: translate OCI linux.resources into rctl rules on this
++    // jail. Rules are keyed by jail name and removed again in delete.
++    if (config.contains("linux") && config["linux"].contains("resources")) {
++        auto t = rctl::from_oci_resources(config["linux"]["resources"]);
++        for (const auto& ign : t.ignored) {
++            app_.log() << "warning: resource " << ign
++                       << " is not supported on FreeBSD, ignoring";
++        }
++        try {
++            if (!rctl::apply(jail_name, t.rules) && !t.rules.empty()) {
++                app_.log() << "warning: RACCT/RCTL disabled "
++                              "(kern.racct.enable=0), resource limits not "
++                              "enforced for " << jail_name;
++            }
++        } catch (...) {
++            rctl::remove(jail_name);
++            j.remove();
++            throw;
++        }
++    }
++
+     // We record the container state including the bundle config. We
+     // need to create the start fifo before forking - this will be
+     // used to pause the container until start is called.
+diff --git a/ocijail/delete.cpp b/ocijail/delete.cpp
+index 406f13d..2c83570 100644
+--- a/ocijail/delete.cpp
++++ b/ocijail/delete.cpp
+@@ -9,6 +9,7 @@
+ #include "hook.h"
+ #include "jail.h"
+ #include "mount.h"
++#include "ocijail/rctl.h"
+ 
+ namespace fs = std::filesystem;
+ 
+@@ -71,6 +72,9 @@ void delete_::run() {
+ 
+     auto j = jail::find(int(state["jid"]));
+     j.remove();
++    if (auto& jail_name = state["jail_name"]; jail_name.is_string()) {
++        rctl::remove(jail_name.get<std::string>());
++    }
+ 
+     bool root_readonly = false;
+     if (state.contains("root_readonly")) {
+diff --git a/ocijail/rctl.cpp b/ocijail/rctl.cpp
+new file mode 100644
+index 0000000..d975c53
+--- /dev/null
++++ b/ocijail/rctl.cpp
+@@ -0,0 +1,90 @@
++#include "ocijail/rctl.h"
++
++#include <sys/types.h>
++#include <sys/rctl.h>
++
++#include <cerrno>
++#include <cstdint>
++#include <system_error>
++
++using nlohmann::json;
++
++namespace ocijail::rctl {
++
++namespace {
++
++// Returns the value of an integer field if present, non-null and > 0.
++std::optional<std::int64_t> positive(const json& obj, const char* key) {
++    if (!obj.is_object() || !obj.contains(key) || !obj[key].is_number_integer()) {
++        return std::nullopt;
++    }
++    auto v = obj[key].get<std::int64_t>();
++    if (v <= 0) {
++        return std::nullopt;
++    }
++    return v;
++}
++
++}  // namespace
++
++translation from_oci_resources(const json& resources) {
++    translation t;
++    if (!resources.is_object()) {
++        return t;
++    }
++
++    if (resources.contains("memory")) {
++        if (auto limit = positive(resources["memory"], "limit")) {
++            t.rules.push_back("memoryuse:sigkill=" + std::to_string(*limit));
++        }
++    }
++
++    if (resources.contains("cpu")) {
++        const auto& cpu = resources["cpu"];
++        auto quota = positive(cpu, "quota");
++        auto period = positive(cpu, "period");
++        if (quota && period) {
++            // percent of one CPU, rounded up, at least 1
++            auto pct = (*quota * 100 + *period - 1) / *period;
++            t.rules.push_back("pcpu:deny=" + std::to_string(pct < 1 ? 1 : pct));
++        }
++        if (positive(cpu, "shares")) {
++            t.ignored.push_back("cpu.shares");
++        }
++    }
++
++    if (resources.contains("pids")) {
++        if (auto limit = positive(resources["pids"], "limit")) {
++            t.rules.push_back("maxproc:deny=" + std::to_string(*limit));
++        }
++    }
++
++    return t;
++}
++
++bool apply(const std::string& jail_name, const std::vector<std::string>& rules) {
++    for (const auto& r : rules) {
++        auto rule = "jail:" + jail_name + ":" + r;
++        if (::rctl_add_rule(rule.c_str(), rule.size() + 1, nullptr, 0) < 0) {
++            if (errno == ENOSYS) {
++                return false;  // RACCT disabled (kern.racct.enable=0)
++            }
++            throw std::system_error(
++                errno, std::system_category(), "rctl_add_rule " + rule);
++        }
++    }
++    return true;
++}
++
++void remove(const std::string& jail_name) {
++    auto filter = "jail:" + jail_name;
++    if (::rctl_remove_rule(filter.c_str(), filter.size() + 1, nullptr, 0) < 0) {
++        if (errno == ENOSYS || errno == ESRCH) {
++            return;
++        }
++        throw std::system_error(
++            errno, std::system_category(), "rctl_remove_rule " + filter);
++    }
++}
++
++}  // namespace ocijail::rctl
+diff --git a/ocijail/rctl.h b/ocijail/rctl.h
+new file mode 100644
+index 0000000..44cf1ee
+--- /dev/null
++++ b/ocijail/rctl.h
+@@ -0,0 +1,50 @@
++#pragma once
++
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "nlohmann/json.hpp"
++
++namespace ocijail::rctl {
++
++// Translate the OCI "linux.resources" object (as generated by CRI-O, podman
++// and containerd from CRI/CLI resource settings) into FreeBSD rctl(8) rule
++// fragments of the form "<resource>:<action>=<amount>". Pure function, no
++// syscalls, so it can be unit tested.
++//
++//   memory.limit          -> memoryuse:sigkill: processes of the jail are
++//                            killed when its resident memory exceeds the
++//                            limit (closest match to Linux memory.max + OOM
++//                            kill). Checked by racctd once per second, so a
++//                            fast allocator can overshoot briefly.
++//                            Deliberately NOT swapuse:deny: it charges
++//                            writable anonymous mappings at mmap time, so Go
++//                            (heap arena map), the JVM and other reserving
++//                            allocators fail at startup with modest limits;
++//                            and NOT memoryuse:deny: it only triggers
++//                            reclaim and does nothing on hosts without swap.
++//   cpu.quota/cpu.period  -> pcpu:deny=ceil(100*quota/period) (percent of one
++//                            CPU, enforced by racct by suspending the jail's
++//                            processes: coarse, ~1s granularity)
++//   pids.limit            -> maxproc:deny
++//
++// cpu.shares has no FreeBSD equivalent (no proportional/group scheduling) and
++// is reported in `ignored`.
++struct translation {
++    std::vector<std::string> rules;
++    std::vector<std::string> ignored;
++};
++translation from_oci_resources(const nlohmann::json& resources);
++
++// Add "jail:<jail_name>:<rule>" for each rule. Returns false (and adds
++// nothing) if RACCT/RCTL is unavailable (kern.racct.enable=0 -> ENOSYS);
++// throws on any other error.
++bool apply(const std::string& jail_name, const std::vector<std::string>& rules);
++
++// Remove every rule whose subject is jail:<jail_name>. rctl rules are keyed
++// by jail *name* and outlive the jail, so this must run on delete. Missing
++// RACCT or "no matching rule" are not errors.
++void remove(const std::string& jail_name);
++
++}  // namespace ocijail::rctl
+diff --git a/ocijail/rctl_test.cpp b/ocijail/rctl_test.cpp
+new file mode 100644
+index 0000000..176360d
+--- /dev/null
++++ b/ocijail/rctl_test.cpp
+@@ -0,0 +1,45 @@
++// Unit tests for rctl::from_oci_resources (pure translation, no syscalls).
++#include <cassert>
++#include <cstdlib>
++#include <iostream>
++
++#include "ocijail/rctl.h"
++
++using nlohmann::json;
++using ocijail::rctl::from_oci_resources;
++
++static void expect(const json& res, std::vector<std::string> rules,
++                   std::vector<std::string> ignored = {}) {
++    auto t = from_oci_resources(res);
++    if (t.rules != rules || t.ignored != ignored) {
++        std::cerr << "FAIL for " << res.dump() << "\n  got rules:";
++        for (auto& r : t.rules) std::cerr << " " << r;
++        std::cerr << "\n";
++        std::exit(1);
++    }
++}
++
++int main() {
++    // nothing / not an object / empty
++    expect(json(), {});
++    expect(json::object(), {});
++    // kubelet: limits {memory: 64Mi, cpu: 200m}, requests -> shares
++    expect(json::parse(R"({"memory":{"limit":67108864},
++                           "cpu":{"quota":20000,"period":100000,"shares":204}})"),
++           {"memoryuse:sigkill=67108864", "pcpu:deny=20"},
++           {"cpu.shares"});
++    // >1 CPU and rounding up: 1.5 CPU, 333m
++    expect(json::parse(R"({"cpu":{"quota":150000,"period":100000}})"), {"pcpu:deny=150"});
++    expect(json::parse(R"({"cpu":{"quota":33300,"period":100000}})"), {"pcpu:deny=34"});
++    // tiny quota still at least 1%
++    expect(json::parse(R"({"cpu":{"quota":1,"period":100000}})"), {"pcpu:deny=1"});
++    // unlimited markers are ignored: quota -1, limit 0, missing period
++    expect(json::parse(R"({"cpu":{"quota":-1,"period":100000},"memory":{"limit":0}})"), {});
++    expect(json::parse(R"({"cpu":{"quota":50000}})"), {});
++    // pids
++    expect(json::parse(R"({"pids":{"limit":4096}})"), {"maxproc:deny=4096"});
++    // wrong types are ignored rather than crashing
++    expect(json::parse(R"({"memory":{"limit":"64Mi"},"pids":{"limit":null}})"), {});
++    std::cout << "rctl_test: all passed\n";
++    return 0;
++}
+-- 
+2.54.0 (Apple Git-157)
+

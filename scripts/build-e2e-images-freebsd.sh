@@ -8,11 +8,12 @@
 # Run as root on a FreeBSD host (buildah + pkg). Images land in the local containers storage
 # shared with CRI-O; e2e pods use IfNotPresent so nothing is pulled.
 #
-#   sudo scripts/build-e2e-images-freebsd.sh <k8s-src> <agnhost-binary>
+#   sudo scripts/build-e2e-images-freebsd.sh <k8s-src> <agnhost-binary> [<nnp-binary>]
 #     <k8s-src>         kubernetes source tree (for test/images/* assets)
 #     <agnhost-binary>  FreeBSD build of test/images/agnhost for this host's arch
+#     <nnp-binary>      FreeBSD build of test/images/nonewprivs (optional)
 set -eu
-src=$(cd "$1" && pwd); agnhost=$2
+src=$(cd "$1" && pwd); agnhost=$2; nnp=${3:-}
 img=$src/test/images
 reg=registry.k8s.io/e2e-test-images
 rel=$(freebsd-version -u | sed 's/-p[0-9]*$//')
@@ -24,7 +25,7 @@ work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
 # test/images/*/VERSION (those are the versions the next image build would publish).
 manifest=$src/test/utils/image/manifest.go
 mtag() { sed -n "s/.*configs\[$1\] = Config{[^,]*, \"[^\"]*\", \"\([^\"]*\)\"}.*/\1/p" "$manifest"; }
-for n in Agnhost AgnhostPrev Kitten Nautilus BusyBox Nginx NginxNew Pause; do
+for n in Agnhost AgnhostPrev Kitten Nautilus BusyBox Nginx NginxNew Pause GlibcDnsTesting NonRoot Nonewprivs; do
   [ -n "$(mtag $n)" ] || { echo "no tag for $n in $manifest"; exit 1; }
 done
 
@@ -52,10 +53,20 @@ pkgs() {
 # bbfill: link busybox applets for commands the FreeBSD runtime base lacks (head, which, wget,
 # nslookup, ...). Upstream images are Alpine, where busybox provides them; tests' shell snippets
 # rely on them. Existing FreeBSD binaries are kept.
+# (-L too: links into the image are absolute, so -e would resolve them on the build host)
+has() { [ -e "$1" ] || [ -L "$1" ]; }
 bbfill() {
   for a in $(chroot "$m" /usr/local/bin/busybox --list); do
-    [ -e "$m/bin/$a" ] || [ -e "$m/usr/bin/$a" ] || [ -e "$m/sbin/$a" ] || [ -e "$m/usr/sbin/$a" ] || \
-      [ -e "$m/usr/local/bin/$a" ] || ln -s /usr/local/bin/busybox "$m/bin/$a"
+    has "$m/bin/$a" || has "$m/usr/bin/$a" || has "$m/sbin/$a" || has "$m/usr/sbin/$a" || \
+      has "$m/usr/local/bin/$a" || ln -s /usr/local/bin/busybox "$m/bin/$a"
+  done
+}
+# hostbin <path...>: copy FreeBSD base-system binaries and their shared libraries from the build
+# host into the image (the host runs the same release as the base image).
+hostbin() {
+  for b in "$@"; do
+    install -m 755 "$b" "$m$b"
+    for l in $(ldd -f '%p\n' "$b"); do [ -e "$m$l" ] || install -m 444 "$l" "$m$l"; done
   done
 }
 # commit <name:tag> [extra tags...]: label, commit, tag
@@ -71,7 +82,8 @@ commit() {
 
 # --- agnhost: test/images/agnhost/Dockerfile (alpine + network tools + /agnhost) -------------
 new "$base"
-pkgs curl bash bind-tools iperf iperf3 netcat busybox
+pkgs curl bash bind-tools iperf iperf3 busybox
+hostbin /usr/bin/nc /usr/bin/getent   # e2e runs `nc -v -t -w 2` (OpenBSD nc, like netcat-openbsd)
 bbfill
 install -m 755 "$agnhost" "$m/agnhost"
 ln -sf agnhost "$m/agnhost-2"
@@ -96,10 +108,38 @@ done
 # --- busybox: FreeBSD runtime base + busybox applets (wget, nslookup, ... missing from base) --
 new "$base"
 pkgs busybox
+# Upstream's busybox image *is* busybox: make its applets win over FreeBSD's (tests compare e.g.
+# busybox sh error text "can't create"), then fill the rest.
+for a in $(chroot "$m" /usr/local/bin/busybox --list); do
+  for d in bin usr/bin sbin usr/sbin; do if has "$m/$d/$a"; then ln -sf /usr/local/bin/busybox "$m/$d/$a"; fi; done
+done
 bbfill
 buildah config --cmd sh "$c"
 commit "$reg/busybox:$(mtag BusyBox)"
 echo "built busybox"
+
+# --- nonroot: busybox + USER 1234 -----------------------------------------------------------
+new "$reg/busybox:$(mtag BusyBox)"
+buildah config --user 1234 "$c"
+commit "$reg/nonroot:$(mtag NonRoot)"
+echo "built nonroot"
+
+# --- glibc-dns-testing (formerly jessie-dnsutils): dig/host/nslookup + getent + nc ----------
+new "$base"
+pkgs bind-tools busybox
+hostbin /usr/bin/getent /usr/bin/nc
+bbfill
+commit "$reg/glibc-dns-testing:$(mtag GlibcDnsTesting)"
+echo "built glibc-dns-testing"
+
+# --- nonewprivs: setuid nnp helper on busybox --------------------------------------------------
+if [ -n "$nnp" ]; then
+  new "$reg/busybox:$(mtag BusyBox)"
+  install -m 4755 "$nnp" "$m/usr/local/bin/nnp"
+  buildah config --cmd nnp "$c"
+  commit "$reg/nonewprivs:$(mtag Nonewprivs)"
+  echo "built nonewprivs"
+fi
 
 # --- nginx (both versions conformance uses) --------------------------------------------------
 new "$base"

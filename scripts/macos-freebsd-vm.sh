@@ -2,16 +2,27 @@
 # FreeBSD 15.1 arm64 dev VM on Apple Silicon (QEMU + HVF), provisioned via cloud-init (nuageinit).
 #   scripts/macos-freebsd-vm.sh create   # download image, make disk + seed, first boot
 #   scripts/macos-freebsd-vm.sh start|stop|ssh [cmd...]|console
-# Env: VM_DIR (~/bsdk8s/vm) VM_CPUS (8) VM_MEM (12G) VM_DISK (80G) SSH_PORT (2222) API_PORT (6443)
+#   NODE=2 scripts/macos-freebsd-vm.sh create   # more nodes for a multi-node cluster
+# Env: NODE (1) VM_DIR (~/bsdk8s/vm, ~/bsdk8s/vm-<NODE> for NODE>1) VM_CPUS (8) VM_MEM (12G)
+#      VM_DISK (80G) SSH_PORT (2221+NODE) API_PORT (6443, node 1 only)
+#
+# Every node has a second NIC (vtnet1), 192.168.100.<NODE>/24: the cluster network.
+# vtnet0 is per-VM user-mode NAT (internet, ssh). The cluster link is point-to-point UDP over
+# loopback between node 1 and node 2 (QEMU "dgram" netdev). A shared multicast "socket"
+# network would allow more nodes, but on macOS it delivers nothing (multicast goes out en0 and is
+# subject to the Local Network privacy permission). For >2 nodes use a virtual switch (vde).
 set -eu
-VM_DIR=${VM_DIR:-$HOME/bsdk8s/vm}
+NODE=${NODE:-1}
+if [ "$NODE" = 1 ]; then VM_DIR=${VM_DIR:-$HOME/bsdk8s/vm}; else VM_DIR=${VM_DIR:-$HOME/bsdk8s/vm-$NODE}; fi
 VM_CPUS=${VM_CPUS:-8}; VM_MEM=${VM_MEM:-12G}; VM_DISK=${VM_DISK:-80G}
-SSH_PORT=${SSH_PORT:-2222}; API_PORT=${API_PORT:-6443}
+SSH_PORT=${SSH_PORT:-$((2221 + NODE))}; API_PORT=${API_PORT:-6443}
+PEER=$((3 - NODE))   # two-node link: 1 <-> 2
+HOSTNAME_VM=bsdk8s; [ "$NODE" = 1 ] || HOSTNAME_VM=bsdk8s-$NODE
 REL=15.1-RELEASE
 IMG=FreeBSD-$REL-arm64-aarch64-BASIC-CLOUDINIT-zfs.qcow2
 URL=https://download.freebsd.org/releases/VM-IMAGES/$REL/aarch64/Latest
 FW=$(brew --prefix qemu)/share/qemu/edk2-aarch64-code.fd
-KEY=$VM_DIR/id_ed25519
+KEY=${KEY:-$HOME/bsdk8s/vm/id_ed25519}   # one key for all nodes
 mkdir -p "$VM_DIR"; cd "$VM_DIR"
 
 ssh_vm() { ssh -q -i "$KEY" -p "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
@@ -19,14 +30,18 @@ ssh_vm() { ssh -q -i "$KEY" -p "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKn
 
 start() {
   [ -f vm.pid ] && kill -0 "$(cat vm.pid)" 2>/dev/null && { echo "already running"; return; }
-  qemu-system-aarch64 -name bsdk8s -M virt,highmem=on -accel hvf -cpu host \
+  apifwd=""; [ "$NODE" = 1 ] && apifwd=",hostfwd=tcp:127.0.0.1:$API_PORT-:6443"
+  qemu-system-aarch64 -name "$HOSTNAME_VM" -M virt,highmem=on -accel hvf -cpu host \
     -smp "$VM_CPUS" -m "$VM_MEM" \
     -drive if=pflash,format=raw,readonly=on,file="$FW" \
     -drive if=pflash,format=raw,file=vars.fd \
     -drive if=virtio,format=qcow2,file=disk.qcow2,cache=writeback,discard=unmap \
     -drive if=virtio,format=raw,readonly=on,file=seed.iso \
-    -netdev user,id=n0,hostfwd=tcp:127.0.0.1:$SSH_PORT-:22,hostfwd=tcp:127.0.0.1:$API_PORT-:6443 \
-    -device virtio-net-pci,netdev=n0 -device virtio-rng-pci \
+    -netdev user,id=n0,hostfwd=tcp:127.0.0.1:$SSH_PORT-:22$apifwd \
+    -device virtio-net-pci,netdev=n0,mac=52:54:00:bd:00:$(printf %02x "$NODE") \
+    -netdev dgram,id=n1,local.type=inet,local.host=127.0.0.1,local.port=$((20000 + NODE)),remote.type=inet,remote.host=127.0.0.1,remote.port=$((20000 + PEER)) \
+    -device virtio-net-pci,netdev=n1,mac=52:54:00:bd:01:$(printf %02x "$NODE") \
+    -device virtio-rng-pci \
     -display none -serial file:console.log -monitor none \
     -daemonize -pidfile vm.pid
   printf "booting"; i=0
@@ -43,7 +58,7 @@ create() {
   [ -f disk.qcow2 ] || { cp "$IMG" disk.qcow2 && qemu-img resize -q disk.qcow2 "$VM_DISK"; }
   [ -f vars.fd ] || { dd if=/dev/zero of=vars.fd bs=1m count=64 2>/dev/null; }
   rm -rf seed seed.iso; mkdir seed
-  printf 'instance-id: bsdk8s-1\nlocal-hostname: bsdk8s\n' > seed/meta-data
+  printf 'instance-id: bsdk8s-%s\nlocal-hostname: %s\n' "$NODE" "$HOSTNAME_VM" > seed/meta-data
   cat > seed/user-data <<EOF
 #cloud-config
 users:
@@ -59,6 +74,7 @@ runcmd:
   - "pkg install -y sudo"
   - "echo '%wheel ALL=(ALL:ALL) NOPASSWD: ALL' > /usr/local/etc/sudoers.d/wheel"
   - "grep -q kern.racct.enable /boot/loader.conf || echo 'kern.racct.enable=1' >> /boot/loader.conf"
+  - "sysrc ifconfig_vtnet1='inet 192.168.100.$NODE/24' && service netif start vtnet1"
 EOF
   hdiutil makehybrid -quiet -iso -joliet -default-volume-name cidata -o seed.iso seed
   start

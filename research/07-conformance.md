@@ -11,7 +11,8 @@ Raw results: [`conformance/`](../conformance/) (gzipped JUnit + failure lists).*
 |---|---|---|---|---|
 | run 1 | 381 / 446 | 85.4% | 356 / 400 = 89.0% | 1h34m |
 | run 2 | 415 / 446 | 93.0% | 388 / 400 = 97.0% | 57m |
-| **run 3** | **423 / 446** | **94.8%** | **392 / 400 = 98.0%** | 48m |
+| run 3 | 423 / 446 | 94.8% | 392 / 400 = 98.0% | 48m |
+| **run 4 (2 nodes)** | **422 / 446** | **94.6%** | **393 / 400 = 98.2%** | 52m |
 
 Run 2 fixed 34 tests and regressed none. Run 3 (after the kube-proxy session-affinity fix and ocijail file mounts below devfs) fixed 8 more, again with no regressions. The only remaining non-`[LinuxOnly]` failures are in-place pod resize (6) and the two-node requirement (2).
 
@@ -39,6 +40,26 @@ runs. The equivalent number for FreeBSD is the second column. Both are shown so 
    does not redirect host-originated traffic to Service ClusterIPs. So every admission webhook, CRD conversion webhook
    and aggregated API call timed out (21 tests in run 1; the apiserver log had 256× `context deadline exceeded`).
    This resolves those Services to endpoints instead. It's in the demo's kubeadm config.
+
+## Run 4: two FreeBSD nodes (2026-11-14)
+
+The first multi-node run: control plane `bsdk8s` (192.168.100.1) + worker `bsdk8s-2` (192.168.100.2), host-gw routing
+(`bsd-hostgw`), kube-proxy pf on both nodes as a DaemonSet pod (allow.pf kernel on both).
+
+- **Fixed (2):** the two tests that require two nodes (DaemonSet rollback, "at least two untainted nodes").
+- **New failures (3), each triaged:**
+  1. **`allowPrivilegeEscalation: false` is not enforced (security gap).** On node 2 the setuid `nnp` helper reached
+     `Effective uid: 0`. Run 3's "pass" on node 1 was accidental: setuid didn't take effect there at all, and the
+     `...when true` tests that would expose that aren't in the conformance set. Fix: ocijail should call
+     `procctl(PROC_NO_NEW_PRIVS_CTL)` (FreeBSD ≥ 14) when the OCI `process.noNewPrivileges` is set. Also find out why
+     setuid had no effect on node 1.
+  2. **NodePort + session affinity across nodes.** `192.168.100.1:30756` was unreachable from a pod on node 2.
+     Most likely asymmetric routing: node 1 rdr's to an endpoint on node 2, which replies directly to the client on
+     node 2 without un-NAT. The pf proxier deliberately omits NodePort masquerading (its natRule is commented out).
+     Affinity pins the client to the broken path, while round-robin hides it. Fix: SNAT NodePort traffic forwarded to
+     remote endpoints.
+  3. **Garbage collector:** the API call timed out (`context deadline exceeded`) under load. Likely flaky; re-run to
+     confirm.
 
 ## Remaining failures (run 2: 31)
 

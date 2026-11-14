@@ -54,7 +54,7 @@ runs. The equivalent number for FreeBSD is the second column. Both are shown so 
 | Tests | Cause | Notes |
 |---|---|---|
 | 7 × EmptyDir tmpfs | volume *is* tmpfs on the host, but it's bind-mounted (nullfs) into the jail, and `statfs` inside reports `nullfs` | FreeBSD semantics. Could mount tmpfs directly in the jail. |
-| **4 × Service session affinity** | `Affinity should hold but didn't` | **Real bug in kube-proxy pf mode (sticky-address)**, hidden in run 1 by the nc issue. Investigate first. |
+| ~~4 × Service session affinity~~ | `Affinity should hold but didn't`: the pf proxier never emitted `sticky-address` | **Fixed** (`PlatformNerds/kubernetes` `648a05cca2b`): all 4 now pass, plus both affinity-timeout tests |
 | 2 × Secrets / projected with fsGroup + defaultMode as non-root | fsGroup ownership/permissions on FreeBSD | investigate |
 | 1 × HostPort same port different hostIP/protocol | CNI portmap (pf) | investigate |
 | 1 × Aggregator sample-apiserver | Linux-only sample image | needs a FreeBSD sample-apiserver image |
@@ -65,7 +65,7 @@ runs. The equivalent number for FreeBSD is the second column. Both are shown so 
 
 ## Next
 
-1. Session affinity in kube-proxy pf mode (4 tests; correctness bug).
+1. ~~Session affinity in kube-proxy pf mode~~: fixed, 4 tests now pass (→ 419/446 expected on the next full run).
 2. Termination message under `/dev` (4).
 3. In-place resize (6).
 4. Second node (2, plus multi-node coverage that this single-node run can't exercise).

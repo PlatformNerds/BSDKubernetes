@@ -10,7 +10,7 @@ Effort and timeline figures are estimates. Anything tagged **[verified]** was ch
 **Native Kubernetes on FreeBSD is feasible, and part of it already works.**
 
 Doug Rabson (FreeBSD committer, author of ocijail and the Podman/Buildah port) maintains `dfr/kubernetes-demo`. It brings up a **single-node, FreeBSD-only cluster on Kubernetes v1.36.1** using:
-- CRI-O (which has upstream FreeBSD support)
+- CRI-O (partly upstream; the pod-level FreeBSD work is on dfr's `freebsd-wip-1.37.0` branch)
 - ocijail as the OCI runtime
 - a patched kubelet (~2.2 kLOC)
 - a pf-based kube-proxy (~1 kLOC)
@@ -61,7 +61,7 @@ Every one of these has a workable answer below. Some answers involve **dropping 
 ┌───────────────────────────────────── FreeBSD worker node ─┴───────────────────────────────────────────────┐
 │ kubelet (FreeBSD build: rctl stats, jail container-manager, nullfs mounter)                               │
 │   │ CRI                                                                                                   │
-│ CRI-O (upstream FreeBSD support)  ──RuntimeClass──►  ┌───────────────┬────────────────────┬─────────────┐ │
+│ CRI-O (FreeBSD WIP, our fork)     ──RuntimeClass──►  ┌───────────────┬────────────────────┬─────────────┐ │
 │                                                      │ jail (default)│ linux-jail         │ bhyve       │ │
 │                                                      │ ocijail       │ ocijail+Linuxulator│ kata-bhyve  │ │
 │                                                      │ FreeBSD images│ allow-listed Linux │ any Linux   │ │
@@ -83,7 +83,7 @@ Every one of these has a workable answer below. Some answers involve **dropping 
 |---|---|---|---|
 | Upstream kubelet compiles but runs only stubs (cAdvisor exits at startup; no container manager or mounter) | High | **Rebase dfr's `freebsd-kubelet` series** (FreeBSD cadvisor from racct, container manager, mount-utils, subpath, emptyDir). Already in `patches/`. | Done for v1.36.1. Ongoing rebases. |
 | kubelet FreeBSD build needed cgo, so no cross-compile | Low | **Fixed [verified]**: `patches/.../bsdk8s/0001`. Also fixes 5 bugs in rctl racct parsing. | Done |
-| containerd CRI: netns is a stub on FreeBSD, so every non-hostNetwork pod fails | High | **Use CRI-O for the MVP** (upstream FreeBSD pod support, proven by dfr's demo). Revisit containerd + a shim for ocijail later. | 0 for MVP |
+| containerd CRI: netns is a stub on FreeBSD, so every non-hostNetwork pod fails | High | **Use CRI-O for the MVP**, proven by dfr's demo. Note: the pod-level FreeBSD bits (stats, devices, RunAsUser, sandbox validation, ~1.4 kLOC) live on `dfr/cri-o` `freebsd-wip-1.37.0`, **not upstream yet**. We carry them in `PlatformNerds/cri-o` `bsdk8s-1.37` (cross-compiles ✅) and upstream them. Revisit containerd + a shim for ocijail later. | MVP: carry the WIP; upstreaming ~1–2 months |
 | runj is a self-described unaudited PoC (no Stats/Update, no parent jails) | Med | Standardise on **ocijail** (supports pods via parent-jail annotation). | – |
 | `spec.os.name` only allows linux/windows | Med | Phase 1: leave `spec.os` empty and schedule with `kubernetes.io/os=freebsd` label, taint and RuntimeClass `scheduling`. Phase 3: KEP. | KEP: months of process |
 | OCI runtime-spec `freebsd` section has no resources object | Med | Propose a `linux.resources`-style `freebsd.resources` (rctl rules + cpuset) to OCI. Until then, pass limits through CRI-O annotations → ocijail → rctl. | 2–4 wks code + spec process |
@@ -241,9 +241,18 @@ Honest-beta kernel set = **K0, K1, K5, K7, K10, K13** ≈ 4–6 kLOC ≈ **1 per
 - **Fallback that still delivers value:** FreeBSD as the **hypervisor + ZFS storage layer** under Linux Kubernetes (bhyve-hosted Linux nodes, democratic-csi on FreeBSD/ZFS).
 
 ## 10. Repos (PlatformNerds org)
+
+**Strategy: fork first, upstream later.** Workflow, branch conventions and sync are in [FORKS.md](FORKS.md).
+The fork branches (`bsdk8s-*`) are the source of truth for code. `patches/` is an exported snapshot so CI can build without credentials.
+
 | Repo | Purpose | Status |
 |---|---|---|
 | `BSDKubernetes` | Plan, research, patch series, build scripts, CI | **created** |
+| `kubernetes` (private fork) | kubelet / kube-proxy pf / kubeadm, branch `bsdk8s-v1.36.1` | **created** ✅ builds |
+| `cri-o` (private fork) | CRI-O FreeBSD WIP, branch `bsdk8s-1.37` | **created** ✅ builds |
+| `ocijail` (private fork) | OCI runtime on jails; add rctl resources, containerd shim later | **created** |
+| `cni-plugins` (private fork) | dfr's FreeBSD CNI plugins, branch `freebsd` | **created** |
+| `kubernetes-demo` (private fork) | single-node bootstrap from our forks, branch `bsdk8s` | **created** |
 | `bsdk8s-kernel` | FreeBSD src branches for K-series patches (fork of freebsd-src) | create when K0 work starts |
 | `kube-proxy-pf` | Out-of-tree pf proxier + service-map experiments | create in Phase 1 |
 | `bsd-cni` | FreeBSD CNI plugins (VNET bridge, flannel port, pf portmap/policy) | Phase 1 |
@@ -255,8 +264,8 @@ Honest-beta kernel set = **K0, K1, K5, K7, K10, K13** ≈ 4–6 kLOC ≈ **1 per
 These are created on demand, not empty up front, so the org doesn't fill with dead repos.
 
 ## 11. Immediate next actions (this week)
-1. Email or open a discussion with dfr: share `patches/.../bsdk8s/0001` (cgo-free kubelet + 5 rctl parsing fixes) as a PR to `dfr/kubernetes`.
-2. Get a FreeBSD 15 host. Run `dfr/kubernetes-demo/build-cluster.sh`. Record what breaks.
+1. Get a FreeBSD 15 host (RACCT enabled). Run `PlatformNerds/kubernetes-demo` branch `bsdk8s` → `build-cluster.sh`. Record what breaks as issues in the forks.
+2. Once that runs end to end, offer `bsdk8s-v1.36.1`'s cgo-free kubelet + rctl fix to `dfr/kubernetes` (first upstreaming candidate, see FORKS.md).
 3. Write the K0 ATF test to confirm or refute the rctl relink bug (`kern_rctl.c:1992`). Submit to Phabricator/GitHub if confirmed.
 4. Stand up nightly cross-compile CI against Kubernetes `master` (catches the next `possibleCPUs`-style breakage within a day).
 5. Join a FreeBSD worker to a Linux kubeadm cluster. Run the e2e conformance suite. Publish the pass rate.

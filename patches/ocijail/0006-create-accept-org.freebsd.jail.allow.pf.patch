@@ -1,0 +1,28 @@
+From 459d19fa145836b007f031751b1fcd9df1c7b320 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 22:36:23 -0700
+Subject: [PATCH 6/8] create: accept org.freebsd.jail.allow.pf
+
+allow.pf is a proposed jail permission (FreeBSD kernel change in
+PlatformNerds/freebsd-src bsdk8s/allow-pf) that lets a non-VNET jail
+manage the host pf, e.g. for kube-proxy in pf mode running as a
+host-network pod. On kernels without it, jail_set rejects the parameter.
+---
+ ocijail/create.cpp | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/ocijail/create.cpp b/ocijail/create.cpp
+index 696dec8..40efd05 100644
+--- a/ocijail/create.cpp
++++ b/ocijail/create.cpp
+@@ -279,6 +279,7 @@ void create::run() {
+             "allow.mount.fdescfs", "allow.mount.nullfs",
+             "allow.mount.procfs",  "allow.mount.tmpfs",
+             "allow.mount.zfs",     "allow.nfsd",
++            "allow.pf",
+             "allow.quotas",        "allow.raw_sockets",
+             "allow.read_msgbuf",   "allow.reserved_ports",
+             "allow.routing",       "allow.set_hostname",
+-- 
+2.54.0 (Apple Git-157)
+

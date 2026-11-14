@@ -1,7 +1,7 @@
 From d64e7983f8a15fc48e58a8b8140c6a5051aec865 Mon Sep 17 00:00:00 2001
 From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
 Date: Fri, 13 Nov 2026 22:10:07 -0700
-Subject: [PATCH 3/5] rctl: clear stale rules at create, tolerate EPERM; add
+Subject: [PATCH 3/8] rctl: clear stale rules at create, tolerate EPERM; add
  tests
 
 rctl rules are keyed by jail name and outlive the jail, so remove any

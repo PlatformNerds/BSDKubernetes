@@ -1,0 +1,168 @@
+From 79fcb392a80d8064be648a3cfbe4ce28a3f5177e Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 09:50:48 -0700
+Subject: [PATCH 7/8] mount: support file mounts below a devfs mount
+
+Kubernetes lets a pod set terminationMessagePath to any path, and the
+conformance tests use /dev/termination-custom-log. The runtime has to
+bind-mount the host file there, but devfs cannot hold the regular file
+used as a mount point, so create failed with 'No such file or
+directory' (Linux runtimes mount a tmpfs on /dev, so this works there).
+
+Mount such files under /.ocijail-devfiles in the container root instead
+and, once the devfs is mounted, create a symlink in it pointing at them
+(devfs allows symlinks). The rewrite is a pure function of the mount
+list, so delete unmounts the same destinations.
+
+Test: test_devfs_file_mount writes through /dev/termination-custom-log
+in a container with its own devfs and checks the host file.
+---
+ ocijail/mount.cpp | 74 +++++++++++++++++++++++++++++++++++++++++++++--
+ test/run_test.py  | 27 +++++++++++++++++
+ 2 files changed, 99 insertions(+), 2 deletions(-)
+
+diff --git a/ocijail/mount.cpp b/ocijail/mount.cpp
+index 28283d7..4313bef 100644
+--- a/ocijail/mount.cpp
++++ b/ocijail/mount.cpp
+@@ -505,11 +505,69 @@ static void unmount_volume(main_app& app,
+     }
+ }
+ 
++// File mounts below a devfs mount (e.g. a Kubernetes terminationMessagePath of
++// /dev/termination-custom-log) cannot work directly: devfs cannot hold the
++// regular file we need as a mount point. Mount such files under
++// /.ocijail-devfiles in the container root instead and, once everything is
++// mounted, point a symlink in the devfs at them (devfs allows symlinks).
++// The rewrite is a pure function of the mount list so that create and delete
++// agree on the destinations.
++static const fs::path devfiles_dir{"/.ocijail-devfiles"};
++
++static bool is_file_bind_mount(const json& mount) {
++    std::string type = mount.contains("type") ? mount["type"] : "nullfs";
++    return (type == "nullfs" || type == "bind") && mount.contains("source") &&
++           fs::is_regular_file(mount["source"].get<std::string>());
++}
++
++static json redirect_devfs_file_mounts(
++    const json& mounts,
++    std::vector<std::pair<fs::path, fs::path>>* links = nullptr) {
++    if (!mounts.is_array()) {
++        return mounts;
++    }
++    std::vector<fs::path> devfs_dirs;
++    for (auto& m : mounts) {
++        if (m.contains("type") && m["type"] == "devfs" &&
++            m.contains("destination")) {
++            devfs_dirs.emplace_back(m["destination"].get<std::string>());
++        }
++    }
++    json res = mounts;
++    for (auto& m : res) {
++        if (!m.contains("destination") || !is_file_bind_mount(m)) {
++            continue;
++        }
++        fs::path dest{m["destination"].get<std::string>()};
++        for (auto& dev : devfs_dirs) {
++            auto rel = dest.lexically_relative(dev);
++            if (rel.empty() || *rel.begin() == "..") {
++                continue;
++            }
++            std::string flat = dest.relative_path().string();
++            for (auto& c : flat) {
++                if (c == '/') {
++                    c = '_';
++                }
++            }
++            auto redirected = devfiles_dir / flat;
++            m["destination"] = redirected.string();
++            if (links) {
++                links->emplace_back(dest, redirected);
++            }
++            break;
++        }
++    }
++    return res;
++}
++
+ void mount_volumes(main_app& app,
+                    runtime_state& state,
+                    const fs::path& root_path,
+                    bool prepare_only,
+-                   const json& mounts) {
++                   const json& config_mounts) {
++    std::vector<std::pair<fs::path, fs::path>> devfs_links;
++    const json mounts = redirect_devfs_file_mounts(config_mounts, &devfs_links);
+     bool file_mount_supported = true;
+     std::size_t mounted = 0;
+ 
+@@ -530,6 +588,17 @@ void mount_volumes(main_app& app,
+             state["file_mount_supported"] = file_mount_supported;
+             mounted++;
+         }
++        // Now that the devfs is mounted, link the redirected file mounts
++        // into it.
++        if (!prepare_only) {
++            for (auto& [dest, target] : devfs_links) {
++                auto link = root_path / dest.relative_path();
++                if (fs::is_symlink(link)) {
++                    fs::remove(link);
++                }
++                fs::create_symlink(target, link);
++            }
++        }
+     } catch (const std::exception& e) {
+         // Attempt to clean up whatever we managed to mount
+         try {
+@@ -543,8 +612,9 @@ void mount_volumes(main_app& app,
+ void unmount_volumes(main_app& app,
+                      runtime_state& state,
+                      const fs::path& root_path,
+-                     const json& mounts,
++                     const json& config_mounts,
+                      std::optional<std::size_t> mounted) {
++    const json mounts = redirect_devfs_file_mounts(config_mounts);
+     bool file_mount_supported = true;
+     if (state.contains("file_mount_supported")) {
+         file_mount_supported = state["file_mount_supported"];
+diff --git a/test/run_test.py b/test/run_test.py
+index 6a11a4d..e56dc1f 100644
+--- a/test/run_test.py
++++ b/test/run_test.py
+@@ -264,6 +264,33 @@ class test_run(unittest.TestCase):
+             with open(os.path.join(root_dir, "file"), "r") as f:
+                 self.assertEqual(f.read(), "Hello World\n")
+ 
++    def test_devfs_file_mount(self):
++        # A file bind-mounted below a devfs mount, like Kubernetes'
++        # terminationMessagePath: /dev/termination-custom-log. devfs cannot
++        # hold the regular file a mount point needs, so ocijail mounts it
++        # elsewhere and links it into /dev; writes must reach the host file.
++        with tempfile.TemporaryDirectory() as root_dir, \
++             tempfile.NamedTemporaryFile(mode="r") as msg:
++            shutil.copytree("/rescue", os.path.join(root_dir, "rescue"))
++            os.mkdir(os.path.join(root_dir, "dev"))
++            c = self.config()
++            c["root"]["path"] = root_dir
++            c["mounts"] = [
++                {"destination": "/dev", "type": "devfs", "source": "devfs"},
++                {"destination": "/dev/termination-custom-log",
++                 "type": "nullfs", "source": msg.name},
++            ]
++            c["process"]["args"] = [
++                "sh", "-c", "echo -n DONE > /dev/termination-custom-log"]
++            c["process"]["env"] = ["PATH=/rescue"]
++            ret, _, _ = self.run_with_config(c)
++            self.assertEqual(ret, 0)
++            self.assertEqual(msg.read(), "DONE")
++            self.delete()
++            # nothing left behind in the container root
++            self.assertFalse(
++                os.path.exists(os.path.join(root_dir, ".ocijail-devfiles")))
++
+     def test_process_user_umask(self):
+         c = self.config()
+         # If process.user.umask is set, this should be the value of umask inside
+-- 
+2.54.0 (Apple Git-157)
+

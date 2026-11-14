@@ -4,7 +4,7 @@
 (kubectl, Helm, controllers, operators, GitOps) works against them. Pods run as **jails** by default,
 as **Linux containers** where the Linuxulator can handle them, and inside **bhyve microVMs** where it can't.
 
-> Status: research and planning (Nov 2026). Nothing here is production software.
+> Status (Nov 2026): a single-node FreeBSD-native cluster passes **93.0% of Kubernetes conformance (97.0% excluding `[LinuxOnly]`)**. Experimental, not production software.
 
 ## Start here
 
@@ -20,6 +20,7 @@ as **Linux containers** where the Linuxulator can handle them, and inside **bhyv
 | [research/04-linux-compat-bhyve.md](research/04-linux-compat-bhyve.md) | Linuxulator gap analysis; bhyve as a Kata-style microVM runtime |
 | [research/05-storage-security-controlplane.md](research/05-storage-security-controlplane.md) | ZFS snapshotters, CSI, security mapping, control plane, ecosystem |
 | [research/06-resource-limits.md](research/06-resource-limits.md) | **Implemented:** pod CPU/memory limits → rctl. Measured rctl semantics (`memoryuse:sigkill`, `pcpu` accuracy) |
+| [research/07-conformance.md](research/07-conformance.md) | **Conformance: 415/446 (93.0%), 97.0% excluding `[LinuxOnly]`** on a single FreeBSD arm64 node; remaining gaps ranked |
 | [research/UPSTREAM-PINS.md](research/UPSTREAM-PINS.md) | Exact upstream commits the research was done against |
 | [patches/kubernetes/v1.36.1/](patches/kubernetes/v1.36.1/) | Doug Rabson's FreeBSD patch series for kubelet, kube-proxy and kubeadm (Apache-2.0, credit: dfr) |
 

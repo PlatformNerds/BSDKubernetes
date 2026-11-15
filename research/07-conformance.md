@@ -12,7 +12,8 @@ Raw results: [`conformance/`](../conformance/) (gzipped JUnit + failure lists).*
 | run 1 | 381 / 446 | 85.4% | 356 / 400 = 89.0% | 1h34m |
 | run 2 | 415 / 446 | 93.0% | 388 / 400 = 97.0% | 57m |
 | run 3 | 423 / 446 | 94.8% | 392 / 400 = 98.0% | 48m |
-| **run 4 (2 nodes)** | **422 / 446** | **94.6%** | **393 / 400 = 98.2%** | 52m |
+| run 4 (2 nodes) | 422 / 446 | 94.6% | 393 / 400 = 98.2% | 52m |
+| run 5 (2 nodes, 35-min clock skew) | 420 / 446 | 94.2% | 389 / 400 = 97.3% | 71m |
 
 Run 2 fixed 34 tests and regressed none. Run 3 (after the kube-proxy session-affinity fix and ocijail file mounts below devfs) fixed 8 more, again with no regressions. The only remaining non-`[LinuxOnly]` failures are in-place pod resize (6) and the two-node requirement (2).
 
@@ -40,6 +41,19 @@ runs. The equivalent number for FreeBSD is the second column. Both are shown so 
    does not redirect host-originated traffic to Service ClusterIPs. So every admission webhook, CRD conversion webhook
    and aggregated API call timed out (21 tests in run 1; the apiserver log had 256× `context deadline exceeded`).
    This resolves those Services to endpoints instead. It's in the demo's kubeadm config.
+
+## Run 5: invalidated by clock skew (2026-11-15)
+
+This was the first run after no_new_privs, NodePort SNAT, UDP state cleanup, in-place resize and host→ClusterIP.
+- **Fixed since run 4 (3):** all three triaged run-4 failures: `allowPrivilegeEscalation: false`, NodePort session
+  affinity across nodes, and the garbage-collector test (a flake, as suspected).
+- **New (5):** OIDC discovery, Namespace pod removal, Deployment rollover, and two Job tests. All are
+  time-dependent, and the cause was **clock skew, not code**:
+  - The VMs ran no NTP, and node 1's clock was 35 minutes behind node 2's. The OIDC validator on node 2 rejected a
+    token node 1 had just issued as expired.
+  - With ntpd enabled (now in the VM script, docs/MAC-DEV-VM.md), the five tests plus one more matching the same
+    filter pass in isolation: 6/6 in 63 s, where run 5 hit 15-minute timeouts.
+- Run 6 repeats the full suite on synced clocks.
 
 ## Run 4: two FreeBSD nodes (2026-11-14)
 

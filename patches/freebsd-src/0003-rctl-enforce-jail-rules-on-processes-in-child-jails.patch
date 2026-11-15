@@ -1,0 +1,126 @@
+From 9dd306f664059ed9b0ef2247f9f7583a270ea810 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 13:48:55 -0700
+Subject: [PATCH 3/4] rctl: enforce jail rules on processes in child jails
+
+racct accounts a process's usage to its jail and to every ancestor jail
+(racct_add_cred()), and rctl_rule_add() links a new jail rule to the
+processes of that jail and of all jails below it. Two places still treated
+a jail rule as applying to its own jail only, so a limit on a parent jail
+was never enforced on its children:
+
+- rctl_proc_ucred_changed() relinked only the rules of the process's own
+  jail. Every process entering a child jail (jail_attach(2), jail -c)
+  lost the ancestors' rules.
+- rctl_proc_rule_to_racct() compared a jail rule against the usage of the
+  process's own jail, not the rule's: for a process in a child jail that
+  is a fraction of what the rule limits.
+
+Relink rules from the process's jail and all its ancestors, and compare a
+jail rule against its own jail's (hierarchical) usage. Rules with other
+subjects and "per jail" (e.g. user:1000:maxproc:deny=10/jail) keep
+meaning the jail the process is in.
+
+This is what limiting a group of jails needs, e.g. a Kubernetes pod (a
+jail) and its containers (child jails). Tested on 15.1 arm64 with a parent
+jail holding two child jails:
+- maxproc:deny=<current usage> on the parent: a fork in a child fails with
+  EAGAIN; without the rule it succeeds.
+- memoryuse:sigkill=<usage + 200 MB> on the parent: a process in a child
+  touching 300 MB is killed, 100 MB is not; without the rule both run.
+Before the change both limits were ignored, and "rctl -l process:<pid>"
+showed no parent rule for processes in the children.
+---
+ sys/kern/kern_rctl.c | 48 +++++++++++++++++++++++++++++++++-----------
+ 1 file changed, 36 insertions(+), 12 deletions(-)
+
+diff --git a/sys/kern/kern_rctl.c b/sys/kern/kern_rctl.c
+index 682ba86d2..1b4bc3a97 100644
+--- a/sys/kern/kern_rctl.c
++++ b/sys/kern/kern_rctl.c
+@@ -343,6 +343,18 @@ rctl_proc_rule_to_racct(const struct proc *p, const struct rctl_rule *rule)
+ 	case RCTL_SUBJECT_TYPE_LOGINCLASS:
+ 		return (cred->cr_loginclass->lc_racct);
+ 	case RCTL_SUBJECT_TYPE_JAIL:
++		/*
++		 * A rule on a jail limits that jail, whose usage includes
++		 * every jail below it (racct_add_cred()), and it is linked to
++		 * the processes of those jails too.  Compare against the
++		 * rule's jail, not the process's own: that one may be a child
++		 * holding a fraction of the usage.  Other subjects with
++		 * "per jail" (e.g. user:1000:maxproc:deny=10/jail) still mean
++		 * the jail the process is in.
++		 */
++		if (rule->rr_subject_type == RCTL_SUBJECT_TYPE_JAIL &&
++		    rule->rr_subject.rs_prison_racct != NULL)
++			return (rule->rr_subject.rs_prison_racct->prr_racct);
+ 		return (cred->cr_prison->pr_prison_racct->prr_racct);
+ 	default:
+ 		panic("%s: unknown per %d", __func__, rule->rr_per);
+@@ -1958,7 +1970,7 @@ rctl_proc_ucred_changed(struct proc *p, struct ucred *newcred)
+ 	struct rctl_rule_link *link, *newlink;
+ 	struct uidinfo *newuip;
+ 	struct loginclass *newlc;
+-	struct prison_racct *newprr;
++	struct prison *pr;
+ 	int rulecnt, i;
+ 
+ 	if (!racct_enable)
+@@ -1968,7 +1980,6 @@ rctl_proc_ucred_changed(struct proc *p, struct ucred *newcred)
+ 
+ 	newuip = newcred->cr_ruidinfo;
+ 	newlc = newcred->cr_loginclass;
+-	newprr = newcred->cr_prison->pr_prison_racct;
+ 
+ 	LIST_INIT(&newrules);
+ 
+@@ -1988,8 +1999,18 @@ rctl_proc_ucred_changed(struct proc *p, struct ucred *newcred)
+ 		rulecnt++;
+ 	LIST_FOREACH(link, &newlc->lc_racct->r_rule_links, rrl_next)
+ 		rulecnt++;
+-	LIST_FOREACH(link, &newprr->prr_racct->r_rule_links, rrl_next)
+-		rulecnt++;
++	/*
++	 * Jail rules apply to processes in the jail and in all jails below
++	 * it, as in rctl_rule_add() (and racct_add_cred() accounts usage to
++	 * every ancestor jail).  Counting only the process's own jail here
++	 * dropped the ancestors' rules whenever a process entered a child
++	 * jail (jail_attach(2)), so a limit on a parent jail was never
++	 * enforced on processes started in its children.
++	 */
++	for (pr = newcred->cr_prison; pr != NULL; pr = pr->pr_parent)
++		LIST_FOREACH(link, &pr->pr_prison_racct->prr_racct->r_rule_links,
++		    rrl_next)
++			rulecnt++;
+ 	RACCT_UNLOCK();
+ 
+ 	/*
+@@ -2042,14 +2063,17 @@ rctl_proc_ucred_changed(struct proc *p, struct ucred *newcred)
+ 		rulecnt--;
+ 	}
+ 
+-	LIST_FOREACH(link, &newprr->prr_racct->r_rule_links, rrl_next) {
+-		if (newlink == NULL)
+-			goto goaround;
+-		rctl_rule_acquire(link->rrl_rule);
+-		newlink->rrl_rule = link->rrl_rule;
+-		newlink->rrl_exceeded = link->rrl_exceeded;
+-		newlink = LIST_NEXT(newlink, rrl_next);
+-		rulecnt--;
++	for (pr = newcred->cr_prison; pr != NULL; pr = pr->pr_parent) {
++		LIST_FOREACH(link, &pr->pr_prison_racct->prr_racct->r_rule_links,
++		    rrl_next) {
++			if (newlink == NULL)
++				goto goaround;
++			rctl_rule_acquire(link->rrl_rule);
++			newlink->rrl_rule = link->rrl_rule;
++			newlink->rrl_exceeded = link->rrl_exceeded;
++			newlink = LIST_NEXT(newlink, rrl_next);
++			rulecnt--;
++		}
+ 	}
+ 
+ 	if (rulecnt == 0) {
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,133 @@
+From 8b516a8ca2812aa25a267787b7a19319565528e4 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 13:53:38 -0700
+Subject: [PATCH 13/14] kubelet: send pod-level limits with the sandbox on
+ FreeBSD
+
+FreeBSD has no pod cgroup for the kubelet to configure. Send the pod's
+limits in the sandbox config instead (LinuxPodSandboxConfig.Resources) so
+the runtime can put them on the pod jail as rctl rules. They are computed
+like the Linux pod cgroup's (cm.ResourceConfigForPod): a memory limit only
+if every container declares one, likewise the CPU quota, overhead
+included, pod-level resources honoured. Test.
+---
+ .../kuberuntime_container_freebsd_test.go     | 41 +++++++++++++++++
+ .../kuberuntime_sandbox_freebsd.go            | 46 +++++++++++++++++++
+ .../kuberuntime_sandbox_unsupported.go        |  2 +-
+ 3 files changed, 88 insertions(+), 1 deletion(-)
+ create mode 100644 pkg/kubelet/kuberuntime/kuberuntime_sandbox_freebsd.go
+
+diff --git a/pkg/kubelet/kuberuntime/kuberuntime_container_freebsd_test.go b/pkg/kubelet/kuberuntime/kuberuntime_container_freebsd_test.go
+index 86c056ffa9d..e0b3b7c778f 100644
+--- a/pkg/kubelet/kuberuntime/kuberuntime_container_freebsd_test.go
++++ b/pkg/kubelet/kuberuntime/kuberuntime_container_freebsd_test.go
+@@ -125,3 +125,44 @@ func TestFreeBSDContainerResourcesRoundTrip(t *testing.T) {
+ 		t.Errorf("nil/empty status should convert to nil")
+ 	}
+ }
++
++// Pod-level limits sent with the sandbox (the runtime turns them into rctl
++// rules on the pod jail): the sum of the containers' limits only when every
++// container declares one, plus overhead.
++func TestFreeBSDApplySandboxResources(t *testing.T) {
++	m := &kubeGenericRuntimeManager{cpuCFSQuota: true, cpuCFSQuotaPeriod: metav1.Duration{Duration: 100 * time.Millisecond}}
++	ctr := func(cpu, mem string) v1.Container {
++		l := v1.ResourceList{}
++		if cpu != "" {
++			l[v1.ResourceCPU] = resource.MustParse(cpu)
++		}
++		if mem != "" {
++			l[v1.ResourceMemory] = resource.MustParse(mem)
++		}
++		return v1.Container{Name: "c" + cpu + mem, Resources: v1.ResourceRequirements{Limits: l, Requests: l}}
++	}
++	for _, tc := range []struct {
++		name               string
++		pod                v1.PodSpec
++		wantMem, wantQuota int64
++	}{
++		{"all limited", v1.PodSpec{Containers: []v1.Container{ctr("200m", "128Mi"), ctr("300m", "64Mi")}}, 192 << 20, 50000},
++		{"one container without memory limit", v1.PodSpec{Containers: []v1.Container{ctr("200m", "128Mi"), ctr("300m", "")}}, 0, 50000},
++		{"with overhead", v1.PodSpec{Containers: []v1.Container{ctr("200m", "128Mi")},
++			Overhead: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m"), v1.ResourceMemory: resource.MustParse("32Mi")}}, 160 << 20, 30000},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			cfg := &runtimeapi.PodSandboxConfig{Linux: &runtimeapi.LinuxPodSandboxConfig{}}
++			if err := m.applySandboxResources(t.Context(), &v1.Pod{Spec: tc.pod}, cfg); err != nil {
++				t.Fatal(err)
++			}
++			r := cfg.Linux.Resources
++			if r == nil {
++				t.Fatal("no resources")
++			}
++			if r.MemoryLimitInBytes != tc.wantMem || r.CpuQuota != tc.wantQuota {
++				t.Errorf("memory %d quota %d, want %d %d", r.MemoryLimitInBytes, r.CpuQuota, tc.wantMem, tc.wantQuota)
++			}
++		})
++	}
++}
+diff --git a/pkg/kubelet/kuberuntime/kuberuntime_sandbox_freebsd.go b/pkg/kubelet/kuberuntime/kuberuntime_sandbox_freebsd.go
+new file mode 100644
+index 00000000000..1bae19bbaac
+--- /dev/null
++++ b/pkg/kubelet/kuberuntime/kuberuntime_sandbox_freebsd.go
+@@ -0,0 +1,46 @@
++//go:build freebsd
++
++/*
++Copyright 2026 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package kuberuntime
++
++import (
++	"context"
++	"time"
++
++	v1 "k8s.io/api/core/v1"
++	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
++	kubeletconfig "k8s.io/kubernetes/pkg/kubelet/apis/config"
++	"k8s.io/kubernetes/pkg/kubelet/cm"
++)
++
++// applySandboxResources sends the pod-level limits with the sandbox. FreeBSD
++// has no pod cgroup for the kubelet to configure: the runtime puts these
++// limits on the pod jail (the parent of the container jails) as rctl rules,
++// which then limit the pod as a whole. They are computed exactly like the
++// Linux pod cgroup's (cm.ResourceConfigForPod): a memory limit only if every
++// container declares one, likewise the CPU quota, pod overhead included
++// (so Overhead isn't sent separately), and pod-level resources honoured.
++func (m *kubeGenericRuntimeManager) applySandboxResources(ctx context.Context, pod *v1.Pod, config *runtimeapi.PodSandboxConfig) error {
++	if config.Linux == nil {
++		return nil
++	}
++	period := uint64(m.cpuCFSQuotaPeriod.Duration / time.Microsecond)
++	rc := cm.ResourceConfigForPod(pod, m.cpuCFSQuota, period, false, kubeletconfig.NoneMemoryReservationPolicy)
++	config.Linux.Resources = convertResourceConfigToLinuxContainerResources(rc)
++	return nil
++}
+diff --git a/pkg/kubelet/kuberuntime/kuberuntime_sandbox_unsupported.go b/pkg/kubelet/kuberuntime/kuberuntime_sandbox_unsupported.go
+index a269c808ab2..349d14db3ad 100644
+--- a/pkg/kubelet/kuberuntime/kuberuntime_sandbox_unsupported.go
++++ b/pkg/kubelet/kuberuntime/kuberuntime_sandbox_unsupported.go
+@@ -1,4 +1,4 @@
+-//go:build !linux && !windows
++//go:build !linux && !windows && !freebsd
+ 
+ /*
+ Copyright 2021 The Kubernetes Authors.
+-- 
+2.54.0 (Apple Git-157)
+

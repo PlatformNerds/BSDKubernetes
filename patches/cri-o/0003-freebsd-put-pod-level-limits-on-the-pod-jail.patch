@@ -1,0 +1,158 @@
+From 63a76d5d04039612ee3c78036c041185ac328f54 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 13:51:17 -0700
+Subject: [PATCH] freebsd: put pod-level limits on the pod jail
+
+FreeBSD has no pod cgroup. The infra container's jail is the pod jail, the
+parent of the container jails, so the pod-level limits the kubelet sends
+with the sandbox (memory limit, CPU quota; overhead included) go on the
+infra container's linux.resources, and ocijail turns them into rctl rules
+on the pod jail.
+
+Only applied when the kernel enforces jail rules on child jails
+(kern.features.rctl_jail_hierarchy). Otherwise a rule on the pod jail
+counts the containers' usage but applies only to the infra container, and
+memoryuse:sigkill would kill it when the containers used too much.
+---
+ server/sandbox_resources_freebsd.go      | 51 ++++++++++++++++++++++
+ server/sandbox_resources_freebsd_test.go | 55 ++++++++++++++++++++++++
+ server/sandbox_run_freebsd.go            |  3 ++
+ 3 files changed, 109 insertions(+)
+ create mode 100644 server/sandbox_resources_freebsd.go
+ create mode 100644 server/sandbox_resources_freebsd_test.go
+
+diff --git a/server/sandbox_resources_freebsd.go b/server/sandbox_resources_freebsd.go
+new file mode 100644
+index 000000000..8878deb28
+--- /dev/null
++++ b/server/sandbox_resources_freebsd.go
+@@ -0,0 +1,51 @@
++package server
++
++import (
++	"context"
++	"sync"
++
++	"github.com/opencontainers/runtime-tools/generate"
++	"golang.org/x/sys/unix"
++	types "k8s.io/cri-api/pkg/apis/runtime/v1"
++
++	"github.com/cri-o/cri-o/internal/log"
++)
++
++// podLevelLimitsSupported reports whether rctl enforces a jail's rules on its
++// child jails (kern.features.rctl_jail_hierarchy). Without that, a rule on
++// the pod jail would count the containers' usage but only apply to the pod
++// jail's own process (the infra container), so memoryuse:sigkill would kill
++// the infra container when the containers used too much.
++var podLevelLimitsSupported = sync.OnceValue(func() bool {
++	v, err := unix.SysctlUint32("kern.features.rctl_jail_hierarchy")
++	return err == nil && v == 1
++})
++
++// applyPodLevelLimits puts the pod's limits on the infra container's spec.
++//
++// On FreeBSD there are no pod cgroups: the infra container's jail is the pod
++// jail, the parent of every container jail in the pod, and the OCI runtime
++// (ocijail) turns linux.resources into rctl(8) rules on it. Since rctl
++// accounts child jails to their parent (and, with the FreeBSD fix "rctl:
++// enforce jail rules on processes in child jails", enforces parent rules on
++// them), these limit the pod as a whole, like the pod cgroup on Linux.
++//
++// The kubelet computes them like the pod cgroup's: memory only if every
++// container declares a memory limit, CPU quota only if every container
++// declares a CPU limit, and pod overhead is already included.
++func applyPodLevelLimits(ctx context.Context, g *generate.Generator, resources *types.LinuxContainerResources, supported bool) {
++	if resources == nil || (resources.GetMemoryLimitInBytes() <= 0 && resources.GetCpuQuota() <= 0) {
++		return
++	}
++	if !supported {
++		log.Infof(ctx, "Not enforcing pod-level limits: the kernel doesn't apply jail rctl rules to child jails (kern.features.rctl_jail_hierarchy)")
++		return
++	}
++	if mem := resources.GetMemoryLimitInBytes(); mem > 0 {
++		g.SetLinuxResourcesMemoryLimit(mem)
++	}
++	if quota, period := resources.GetCpuQuota(), resources.GetCpuPeriod(); quota > 0 && period > 0 {
++		g.SetLinuxResourcesCPUQuota(quota)
++		g.SetLinuxResourcesCPUPeriod(uint64(period))
++	}
++}
+diff --git a/server/sandbox_resources_freebsd_test.go b/server/sandbox_resources_freebsd_test.go
+new file mode 100644
+index 000000000..751fcbca0
+--- /dev/null
++++ b/server/sandbox_resources_freebsd_test.go
+@@ -0,0 +1,55 @@
++package server
++
++import (
++	"testing"
++
++	"github.com/opencontainers/runtime-tools/generate"
++	types "k8s.io/cri-api/pkg/apis/runtime/v1"
++)
++
++func TestApplyPodLevelLimits(t *testing.T) {
++	for _, tc := range []struct {
++		name      string
++		res       *types.LinuxContainerResources
++		wantMem   int64
++		wantQuota int64
++	}{
++		{"none", nil, 0, 0},
++		{"memory and cpu", &types.LinuxContainerResources{MemoryLimitInBytes: 256 << 20, CpuQuota: 50000, CpuPeriod: 100000}, 256 << 20, 50000},
++		{"memory only (some container without a cpu limit)", &types.LinuxContainerResources{MemoryLimitInBytes: 128 << 20, CpuShares: 512}, 128 << 20, 0},
++		{"quota without period ignored", &types.LinuxContainerResources{CpuQuota: 50000}, 0, 0},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			g, err := generate.New("freebsd")
++			if err != nil {
++				t.Fatal(err)
++			}
++			applyPodLevelLimits(t.Context(), &g, tc.res, true)
++			var mem, quota int64
++			if r := g.Config.Linux; r != nil && r.Resources != nil {
++				if r.Resources.Memory != nil && r.Resources.Memory.Limit != nil {
++					mem = *r.Resources.Memory.Limit
++				}
++				if r.Resources.CPU != nil && r.Resources.CPU.Quota != nil {
++					quota = *r.Resources.CPU.Quota
++				}
++			}
++			if mem != tc.wantMem || quota != tc.wantQuota {
++				t.Errorf("memory %d quota %d, want %d %d", mem, quota, tc.wantMem, tc.wantQuota)
++			}
++		})
++	}
++}
++
++// Without hierarchical enforcement in the kernel, pod-level limits are not
++// applied at all (they would hit the infra container instead of the pod).
++func TestApplyPodLevelLimitsUnsupported(t *testing.T) {
++	g, err := generate.New("freebsd")
++	if err != nil {
++		t.Fatal(err)
++	}
++	applyPodLevelLimits(t.Context(), &g, &types.LinuxContainerResources{MemoryLimitInBytes: 256 << 20}, false)
++	if r := g.Config.Linux; r != nil && r.Resources != nil && r.Resources.Memory != nil && r.Resources.Memory.Limit != nil {
++		t.Errorf("memory limit %d applied without kernel support", *r.Resources.Memory.Limit)
++	}
++}
+diff --git a/server/sandbox_run_freebsd.go b/server/sandbox_run_freebsd.go
+index 6126a51dd..75fdd0e8d 100644
+--- a/server/sandbox_run_freebsd.go
++++ b/server/sandbox_run_freebsd.go
+@@ -416,6 +416,9 @@ func (s *Server) runPodSandbox(ctx context.Context, req *types.RunPodSandboxRequ
+ 
+ 	g.SetLinuxResourcesCPUShares(PodInfraCPUshares)
+ 
++	// Pod-level limits go on the infra container: its jail is the pod jail.
++	applyPodLevelLimits(ctx, g, resources, podLevelLimitsSupported())
++
+ 	// When infra-ctr-cpuset specified, set the infra container CPU set
+ 	if s.config.InfraCtrCPUSet != "" {
+ 		log.Debugf(ctx, "Set the infra container cpuset to %q", s.config.InfraCtrCPUSet)
+-- 
+2.54.0 (Apple Git-157)
+

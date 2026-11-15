@@ -1,0 +1,158 @@
+From bf6ee033294f6ee7349fd9f87af56d0ebf0e75be Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 13:58:17 -0700
+Subject: [PATCH 14/14] kubelet: admit pod-level resources on FreeBSD when the
+ kernel enforces them
+
+Pod-level limits are rctl rules on the pod jail, which only bind the
+containers (child jails) on kernels with kern.features.rctl_jail_hierarchy.
+Admit pods with pod-level resources there (with the PodLevelResources
+gate), and reject them with a clear reason otherwise instead of running
+them unlimited. Test.
+---
+ pkg/kubelet/lifecycle/features_freebsd.go     | 63 +++++++++++++++++++
+ .../lifecycle/features_freebsd_test.go        | 51 +++++++++++++++
+ pkg/kubelet/lifecycle/features_unsupported.go |  2 +-
+ 3 files changed, 115 insertions(+), 1 deletion(-)
+ create mode 100644 pkg/kubelet/lifecycle/features_freebsd.go
+ create mode 100644 pkg/kubelet/lifecycle/features_freebsd_test.go
+
+diff --git a/pkg/kubelet/lifecycle/features_freebsd.go b/pkg/kubelet/lifecycle/features_freebsd.go
+new file mode 100644
+index 00000000000..dd99b0c462a
+--- /dev/null
++++ b/pkg/kubelet/lifecycle/features_freebsd.go
+@@ -0,0 +1,63 @@
++//go:build freebsd
++
++/*
++Copyright 2026 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package lifecycle
++
++import (
++	"sync"
++
++	"golang.org/x/sys/unix"
++	v1 "k8s.io/api/core/v1"
++	utilfeature "k8s.io/apiserver/pkg/util/feature"
++	"k8s.io/component-helpers/resource"
++	"k8s.io/kubernetes/pkg/features"
++)
++
++// rctlJailHierarchy reports whether rctl rules on a jail are enforced on its
++// child jails (kern.features.rctl_jail_hierarchy). Pod-level limits are rctl
++// rules on the pod jail, the parent of the container jails; without this the
++// runtime doesn't apply them, so pods asking for them aren't admitted.
++var rctlJailHierarchy = sync.OnceValue(func() bool {
++	v, err := unix.SysctlUint32("kern.features.rctl_jail_hierarchy")
++	return err == nil && v == 1
++})
++
++func isPodLevelResourcesSupported(pod *v1.Pod) PodAdmitResult {
++	return podLevelResourcesAdmit(pod, utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources), rctlJailHierarchy())
++}
++
++func podLevelResourcesAdmit(pod *v1.Pod, gateEnabled, kernelSupport bool) PodAdmitResult {
++	if !resource.IsPodLevelResourcesSet(pod) {
++		return PodAdmitResult{Admit: true}
++	}
++	if !gateEnabled {
++		return PodAdmitResult{
++			Admit:   false,
++			Reason:  PodLevelResourcesNotAdmittedReason,
++			Message: "PodLevelResources feature gate is disabled",
++		}
++	}
++	if !kernelSupport {
++		return PodAdmitResult{
++			Admit:   false,
++			Reason:  PodLevelResourcesNotAdmittedReason,
++			Message: "pod-level resources need a kernel that enforces jail rctl rules on child jails (kern.features.rctl_jail_hierarchy)",
++		}
++	}
++	return PodAdmitResult{Admit: true}
++}
+diff --git a/pkg/kubelet/lifecycle/features_freebsd_test.go b/pkg/kubelet/lifecycle/features_freebsd_test.go
+new file mode 100644
+index 00000000000..7f16ccf7863
+--- /dev/null
++++ b/pkg/kubelet/lifecycle/features_freebsd_test.go
+@@ -0,0 +1,51 @@
++//go:build freebsd
++
++/*
++Copyright 2026 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package lifecycle
++
++import (
++	"testing"
++
++	v1 "k8s.io/api/core/v1"
++	apiresource "k8s.io/apimachinery/pkg/api/resource"
++)
++
++func TestFreeBSDPodLevelResourcesAdmit(t *testing.T) {
++	plain := &v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{{Name: "c"}}}}
++	podLevel := &v1.Pod{Spec: v1.PodSpec{
++		Resources:  &v1.ResourceRequirements{Limits: v1.ResourceList{v1.ResourceMemory: apiresource.MustParse("200Mi")}},
++		Containers: []v1.Container{{Name: "c"}},
++	}}
++	for _, tc := range []struct {
++		name         string
++		pod          *v1.Pod
++		gate, kernel bool
++		want         bool
++	}{
++		{"no pod-level resources, old kernel", plain, true, false, true},
++		{"pod-level resources, kernel support", podLevel, true, true, true},
++		{"pod-level resources, old kernel", podLevel, true, false, false},
++		{"pod-level resources, gate off", podLevel, false, true, false},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			if got := podLevelResourcesAdmit(tc.pod, tc.gate, tc.kernel); got.Admit != tc.want {
++				t.Errorf("admit = %v (%s), want %v", got.Admit, got.Message, tc.want)
++			}
++		})
++	}
++}
+diff --git a/pkg/kubelet/lifecycle/features_unsupported.go b/pkg/kubelet/lifecycle/features_unsupported.go
+index a286606e9c4..8bbd53f2849 100644
+--- a/pkg/kubelet/lifecycle/features_unsupported.go
++++ b/pkg/kubelet/lifecycle/features_unsupported.go
+@@ -1,4 +1,4 @@
+-//go:build !linux && !windows
++//go:build !linux && !windows && !freebsd
+ 
+ /*
+ Copyright 2025 The Kubernetes Authors.
+-- 
+2.54.0 (Apple Git-157)
+

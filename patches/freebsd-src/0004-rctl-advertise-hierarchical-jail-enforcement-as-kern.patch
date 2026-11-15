@@ -1,0 +1,37 @@
+From 8ace44a3cd8d093191e13cb273886b196dc3afa6 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 13:50:44 -0700
+Subject: [PATCH 4/4] rctl: advertise hierarchical jail enforcement as
+ kern.features.rctl_jail_hierarchy
+
+Userland putting limits on a parent jail (a container runtime limiting a
+Kubernetes pod) must know whether they are enforced on child jails:
+without the previous change a parent rule only applied to the parent's own
+processes while counting the children's usage, so e.g. memoryuse:sigkill
+killed the parent's processes when the children used too much.
+---
+ sys/kern/kern_rctl.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/sys/kern/kern_rctl.c b/sys/kern/kern_rctl.c
+index 1b4bc3a97..4e4c5b007 100644
+--- a/sys/kern/kern_rctl.c
++++ b/sys/kern/kern_rctl.c
+@@ -63,6 +63,14 @@
+ #endif
+ 
+ FEATURE(rctl, "Resource Limits");
++/*
++ * Jail rules are enforced on processes in child jails too.  Lets userland
++ * (e.g. container runtimes putting a pod's limits on a parent jail) tell
++ * this apart from kernels where such a rule only applies to processes in the
++ * jail itself while counting its children's usage: there, a memoryuse:sigkill
++ * rule on the parent would kill the parent jail's own processes.
++ */
++FEATURE(rctl_jail_hierarchy, "Resource limits on a jail apply to its child jails");
+ 
+ #define	HRF_DEFAULT		0
+ #define	HRF_DONT_INHERIT	1
+-- 
+2.54.0 (Apple Git-157)
+

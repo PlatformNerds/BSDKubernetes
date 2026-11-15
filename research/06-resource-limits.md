@@ -147,6 +147,58 @@ The demo also reserves headroom: `systemReserved` 1Gi, `evictionHard` 500Mi, ARC
 the wrong ranking. Fix ideas: charge a pod's emptyDir tmpfs usage to it in the CRI-O/kubelet stats, or rctl
 accounting for tmpfs (kernel).
 
+## Pod-level limits (implemented and verified 2026-11-16)
+
+A pod is a jail (the pause/infra container's), and its containers are child jails, so pod limits are rctl rules
+on the pod jail. That needed one kernel fix and four small changes.
+
+**Kernel: rctl didn't enforce jail rules on child jails (plan item K0)** (`PlatformNerds/freebsd-src`
+`bsdk8s/rctl-hier-relink`, `-15.1`; patches `freebsd-src/0003-0004`). Accounting was already hierarchical: the pod
+jail's `memoryuse` equals its containers' sum. Enforcement had two bugs:
+
+1. `rctl_proc_ucred_changed()` relinked only the process's own jail's rules, so every process entering a child
+   jail (`jail_attach`) dropped the parent's rules. `rctl_rule_add()` already walked up the hierarchy.
+2. `rctl_proc_rule_to_racct()` compared a jail rule against the usage of the process's own jail instead of the
+   rule's jail.
+
+Plus `kern.features.rctl_jail_hierarchy`, so userland can tell fixed kernels apart.
+
+Measured on stock 15.1 vs the patched kernel, parent jail with two child jails:
+
+| Test | Stock 15.1 | Patched |
+|---|---|---|
+| `maxproc:deny=<usage>` on parent, fork in a child | fork succeeds | `sh: Cannot fork: Resource temporarily unavailable` |
+| `memoryuse:sigkill=<usage+200 MB>` on parent, 300 MB in a child | runs | killed (100 MB is fine) |
+| `rctl -l process:<pid>` in a child | no parent rule | parent rules listed |
+
+**Why the kernel check matters:** without the fix, a pod-jail rule counts the containers' usage but applies only
+to the infra container. So `memoryuse:sigkill` would kill the *infra container* when the containers use too much.
+Hence the gating:
+- **CRI-O** applies pod limits only when `kern.features.rctl_jail_hierarchy=1` (`cri-o/0003`, `63a76d5d0`).
+- **The kubelet** rejects pods with pod-level resources on other kernels (`PodLevelResourcesNotSupported: pod-level
+  resources need a kernel that enforces jail rctl rules on child jails`) instead of running them unlimited.
+
+**Kubernetes side** (`bsdk8s/0013-0015`):
+- The kubelet sends the pod's limits with the sandbox, computed like the Linux pod cgroup's
+  (`cm.ResourceConfigForPod`): memory only if every container has a limit, likewise CPU, overhead included, pod-level
+  `spec.resources` honoured.
+- CRI-O puts them on the infra container's `linux.resources`; ocijail turns those into rctl rules on the pod jail.
+
+**Verified on both nodes** (both now boot `kernel.bsdk8s` = 15.1 + allow.pf + pf sticky fix + rctl hierarchy):
+
+| Pod | Pod jail rules | Result |
+|---|---|---|
+| 2 containers × 128Mi / 200m+300m | `memoryuse:sigkill=256Mi`, `pcpu:deny=50` (containers keep their own) | derived from the container sum |
+| `spec.resources.limits: {memory: 200Mi, cpu: 500m}`, containers without limits | `memoryuse:sigkill=200Mi`, `pcpu:deny=50`; containers none | `a` alone 300 MB → **killed**; `a` 40 MB + `b` 40 MB at once → both ok; `a` 80 MB + `b` 80 MB at once (~247 MB > 200) → **`a` killed**, `b` ok; no restarts |
+| same pod on node 1 *before* its kernel upgrade | none | **rejected** at admission with the kernel-feature reason |
+
+**Not done:**
+- **Pod-level resize.** Kubernetes sends `UpdatePodSandboxResources`, but our pod container manager reports the
+  allocated values, so the kubelet never sees a pod-level change. CRI-O would also have to run `ocijail update` on
+  the infra container.
+- **Which process dies.** When the pod limit trips, the process that crossed it is killed (racctd's per-process
+  sample), not the largest one, as a Linux OOM kill would pick.
+
 ## Upstream candidates (fork-first, then upstream; see docs/FORKS.md)
 
 1. ocijail `jail: fix config::set type validation`: **opened as [dfr/ocijail#39](https://github.com/dfr/ocijail/pull/39)** (2026-11-14).
@@ -156,8 +208,7 @@ accounting for tmpfs (kernel).
 ## Next steps
 
 - `OOMKilled` reason: add a `memoryuse:devctl` rule plus CRI-O FreeBSD exit-reason mapping, or kernel K5.
-- Pod-level limits on the sandbox (parent) jail: the sum of container limits plus overhead. This would also enable
-  pod-level resize, via a real `GetPodCgroupConfig`/`SetPodCgroupConfig` on rctl.
+- ~~Pod-level limits on the sandbox (parent) jail~~: done (above). Pod-level resize still open.
 - CPU stats: racct `cputime` has 1-second resolution, so `usageNanoCores` (metrics-server, HPA) is coarse.
 - ~~`UpdateContainerResources` (in-place resize) → `ocijail update` → rctl rule swap.~~ Done (above).
 - cpuset (CPU manager static policy) → `cpuset -j`.

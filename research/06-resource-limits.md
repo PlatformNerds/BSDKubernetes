@@ -178,7 +178,7 @@ Hence the gating:
 - **The kubelet** rejects pods with pod-level resources on other kernels (`PodLevelResourcesNotSupported: pod-level
   resources need a kernel that enforces jail rctl rules on child jails`) instead of running them unlimited.
 
-**Kubernetes side** (`bsdk8s/0013-0015`):
+**Kubernetes side** (`bsdk8s/0013-0014`):
 - The kubelet sends the pod's limits with the sandbox, computed like the Linux pod cgroup's
   (`cm.ResourceConfigForPod`): memory only if every container has a limit, likewise CPU, overhead included, pod-level
   `spec.resources` honoured.

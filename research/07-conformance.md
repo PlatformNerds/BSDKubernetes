@@ -15,6 +15,7 @@ Raw results: [`conformance/`](../conformance/) (gzipped JUnit + failure lists).*
 | run 4 (2 nodes) | 422 / 446 | 94.6% | 393 / 400 = 98.2% | 52m |
 | run 5 (2 nodes, 35-min clock skew) | 420 / 446 | 94.2% | 389 / 400 = 97.3% | 71m |
 | **run 6 (2 nodes)** | **425 / 446** | **95.3%** | **394 / 400 = 98.5%** | 50m |
+| run 7 (2 nodes, regression check) | 425 / 446 | 95.3% | 394 / 400 = 98.5% | 52m |
 
 Run 2 fixed 34 tests and regressed none. Run 3 (after the kube-proxy session-affinity fix and ocijail file mounts below devfs) fixed 8 more, again with no regressions. The only remaining non-`[LinuxOnly]` failures are in-place pod resize (6) and the two-node requirement (2).
 
@@ -42,6 +43,17 @@ runs. The equivalent number for FreeBSD is the second column. Both are shown so 
    does not redirect host-originated traffic to Service ClusterIPs. So every admission webhook, CRD conversion webhook
    and aggregated API call timed out (21 tests in run 1; the apiserver log had 256× `context deadline exceeded`).
    This resolves those Services to endpoints instead. It's in the demo's kubeadm config.
+
+## Run 7: regression check, same 21 failures as run 6 (2026-11-16)
+
+This run checked everything since run 6:
+- both nodes on `kernel.bsdk8s` (rctl hierarchy fix);
+- pod-level limits and in-place pod-level resize;
+- the node memory accounting fixes;
+- the CRI-O boot-relative PID start time.
+
+The failure set is **identical** to run 6's (`conformance/run7-failures.json`). Node 1 never dropped below 5.2 GB
+free and never reported memory pressure.
 
 ## Run 6: 425/446, 98.5% excluding `[LinuxOnly]` (2026-11-15)
 

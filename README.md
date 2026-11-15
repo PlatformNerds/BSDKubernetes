@@ -20,7 +20,7 @@ as **Linux containers** where the Linuxulator can handle them, and inside **bhyv
 | [research/04-linux-compat-bhyve.md](research/04-linux-compat-bhyve.md) | Linuxulator gap analysis; bhyve as a Kata-style microVM runtime |
 | [research/05-storage-security-controlplane.md](research/05-storage-security-controlplane.md) | ZFS snapshotters, CSI, security mapping, control plane, ecosystem |
 | [research/06-resource-limits.md](research/06-resource-limits.md) | **Implemented:** pod CPU/memory limits → rctl. Measured rctl semantics (`memoryuse:sigkill`, `pcpu` accuracy) |
-| [research/07-conformance.md](research/07-conformance.md) | **Conformance: 423/446 (94.8%) on one node; 2-node run 422/446, 98.2% excluding `[LinuxOnly]`**; remaining gaps ranked |
+| [research/07-conformance.md](research/07-conformance.md) | **Conformance (2 nodes): 425/446 (95.3%), 394/400 = 98.5% excluding `[LinuxOnly]`; only the 6 cgroup-reading resize tests left outside `[LinuxOnly]`**; remaining gaps ranked |
 | [research/08-allow-pf.md](research/08-allow-pf.md) | **Kernel K14 `allow.pf` implemented:** kube-proxy runs as a normal pod (kernel + ocijail + CRI-O) |
 | [research/UPSTREAM-PINS.md](research/UPSTREAM-PINS.md) | Exact upstream commits the research was done against |
 | [patches/kubernetes/v1.36.1/](patches/kubernetes/v1.36.1/) | Doug Rabson's FreeBSD patch series for kubelet, kube-proxy and kubeadm (Apache-2.0, credit: dfr) |

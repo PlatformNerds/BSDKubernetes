@@ -14,6 +14,7 @@ Raw results: [`conformance/`](../conformance/) (gzipped JUnit + failure lists).*
 | run 3 | 423 / 446 | 94.8% | 392 / 400 = 98.0% | 48m |
 | run 4 (2 nodes) | 422 / 446 | 94.6% | 393 / 400 = 98.2% | 52m |
 | run 5 (2 nodes, 35-min clock skew) | 420 / 446 | 94.2% | 389 / 400 = 97.3% | 71m |
+| **run 6 (2 nodes)** | **425 / 446** | **95.3%** | **394 / 400 = 98.5%** | 50m |
 
 Run 2 fixed 34 tests and regressed none. Run 3 (after the kube-proxy session-affinity fix and ocijail file mounts below devfs) fixed 8 more, again with no regressions. The only remaining non-`[LinuxOnly]` failures are in-place pod resize (6) and the two-node requirement (2).
 
@@ -41,6 +42,30 @@ runs. The equivalent number for FreeBSD is the second column. Both are shown so 
    does not redirect host-originated traffic to Service ClusterIPs. So every admission webhook, CRD conversion webhook
    and aggregated API call timed out (21 tests in run 1; the apiserver log had 256× `context deadline exceeded`).
    This resolves those Services to endpoints instead. It's in the demo's kubeadm config.
+
+## Run 6: 425/446, 98.5% excluding `[LinuxOnly]` (2026-11-15)
+
+The first clean two-node run with every fix since run 4.
+- **Every non-`[LinuxOnly]` failure left is one of the 6 in-place resize tests.** In-place resize itself is
+  implemented (research/06); the tests verify by reading `/sys/fs/cgroup` inside the container.
+- **The other 15 failures are all `[LinuxOnly]`**, the same set as before: 7 EmptyDir tmpfs, 2 fsGroup secrets,
+  plus HostPort, ImageVolume, sample-apiserver, read-only rootfs wording, sysctls, and the privileged dummy-device
+  test.
+
+**Before run 6 completed, one attempt hung node 1** about 45 minutes in:
+- The kubelet stopped heartbeating and sshd stopped sending its banner, while the API server kept answering.
+- Neither the console nor syslog had a panic or OOM message; logs stop mid pod-network setup.
+- The VM was hard-reset.
+
+The suspected cause was memory exhaustion that the kubelet couldn't see. Its FreeBSD node working set was racct
+process RSS, which misses ARC, tmpfs and wired memory: 790 MB reported vs 2.2 GB in use on an idle node. So
+memory eviction could never fire. That was fixed (`PlatformNerds/kubernetes` `23c18881738`), along with headroom
+in the demo: `systemReserved` 1Gi, `evictionHard` 500Mi, ARC capped at 25%, and a kubelet restart on exit.
+
+**Honest status:** run 6 logged node 1's memory every minute (`conformance/run6-node1-memory.log`). Free memory
+never dropped below 6.3 GB and the node never reported memory pressure. So run 6 neither reproduced the hang nor
+exercised eviction, and **the hang's root cause is unconfirmed**. Next time it happens, get the kernel state before
+resetting: a QEMU monitor socket or a serial console with a login, then `procstat -kk -a` and `vmstat -z`.
 
 ## Run 5: invalidated by clock skew (2026-11-15)
 

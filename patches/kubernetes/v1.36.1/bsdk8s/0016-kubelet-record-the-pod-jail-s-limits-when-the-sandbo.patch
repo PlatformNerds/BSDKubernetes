@@ -1,0 +1,176 @@
+From 8ec6fd87a5ab7625e53a419a56b1c6d4e8051ce3 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 15:23:42 -0700
+Subject: [PATCH 16/16] kubelet: record the pod jail's limits when the sandbox
+ is created, not on every sync
+
+generatePodSandboxConfig (and so applySandboxResources) runs on every pod
+sync, from the pod's desired resources. Recording the 'applied' pod-level
+config there made it equal the desired one just before the resize compared
+them, so the kubelet never sent UpdatePodSandboxResources: the pod jail
+kept its old limits (seen live: pod resized 200Mi -> 500Mi, containers
+updated, pod jail still 200Mi). Record it from the config the runtime
+created the sandbox with (new sandboxCreated hook, a no-op on other
+platforms). Regression test.
+---
+ pkg/kubelet/cm/container_manager_freebsd.go   |  4 +++
+ .../kuberuntime_container_freebsd_test.go     | 30 +++++++++++++++++++
+ .../kuberuntime/kuberuntime_sandbox.go        |  1 +
+ .../kuberuntime_sandbox_freebsd.go            | 30 +++++++++++++++++--
+ .../kuberuntime/kuberuntime_sandbox_linux.go  |  3 ++
+ .../kuberuntime_sandbox_unsupported.go        |  3 ++
+ .../kuberuntime_sandbox_windows.go            |  3 ++
+ 7 files changed, 72 insertions(+), 2 deletions(-)
+
+diff --git a/pkg/kubelet/cm/container_manager_freebsd.go b/pkg/kubelet/cm/container_manager_freebsd.go
+index 0be4de181f7..8c7254f99c9 100644
+--- a/pkg/kubelet/cm/container_manager_freebsd.go
++++ b/pkg/kubelet/cm/container_manager_freebsd.go
+@@ -392,3 +392,7 @@ func (cm *containerManagerImpl) UnprepareDynamicResources(ctx context.Context, p
+ func (cm *containerManagerImpl) PodMightNeedToUnprepareResources(UID types.UID) bool {
+ 	return false
+ }
++
++// FreeBSDPodContainerManagerForTest gives tests in other packages the FreeBSD
++// pod container manager.
++type FreeBSDPodContainerManagerForTest = podContainerManagerFreeBSD
+diff --git a/pkg/kubelet/kuberuntime/kuberuntime_container_freebsd_test.go b/pkg/kubelet/kuberuntime/kuberuntime_container_freebsd_test.go
+index e0b3b7c778f..76a8c2e2e08 100644
+--- a/pkg/kubelet/kuberuntime/kuberuntime_container_freebsd_test.go
++++ b/pkg/kubelet/kuberuntime/kuberuntime_container_freebsd_test.go
+@@ -19,6 +19,7 @@ limitations under the License.
+ package kuberuntime
+ 
+ import (
++	"math"
+ 	"testing"
+ 	"time"
+ 
+@@ -26,6 +27,7 @@ import (
+ 	"k8s.io/apimachinery/pkg/api/resource"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
++	"k8s.io/kubernetes/pkg/kubelet/cm"
+ )
+ 
+ func TestGenerateFreeBSDContainerResources(t *testing.T) {
+@@ -166,3 +168,31 @@ func TestFreeBSDApplySandboxResources(t *testing.T) {
+ 		})
+ 	}
+ }
++
++// The sandbox config is generated on every pod sync from the desired
++// resources: only a created sandbox may set what the pod container manager
++// reports as applied, or in-place pod-level resize never sees a change.
++func TestFreeBSDSandboxCreatedRecordsAppliedLimits(t *testing.T) {
++	m := &kubeGenericRuntimeManager{cpuCFSQuota: true, cpuCFSQuotaPeriod: metav1.Duration{Duration: 100 * time.Millisecond}}
++	pod := &v1.Pod{ObjectMeta: metav1.ObjectMeta{UID: "pod-rec"}, Spec: v1.PodSpec{Containers: []v1.Container{{Name: "c",
++		Resources: v1.ResourceRequirements{Limits: v1.ResourceList{v1.ResourceMemory: resource.MustParse("128Mi")}}}}}}
++	applied := func() int64 {
++		cfg, err := (&cm.FreeBSDPodContainerManagerForTest{}).GetPodCgroupConfig(pod, v1.ResourceMemory)
++		if err != nil {
++			t.Fatal(err)
++		}
++		return *cfg.Memory
++	}
++	cfg := &runtimeapi.PodSandboxConfig{Linux: &runtimeapi.LinuxPodSandboxConfig{}}
++	if err := m.applySandboxResources(t.Context(), pod, cfg); err != nil {
++		t.Fatal(err)
++	}
++	if got := applied(); got != math.MaxInt64 {
++		t.Errorf("generating the sandbox config recorded %d as applied", got)
++	}
++	m.sandboxCreated(pod, cfg)
++	if got := applied(); got != 128<<20 {
++		t.Errorf("applied after sandbox creation = %d, want %d", got, 128<<20)
++	}
++	cm.RecordPodLevelConfig(pod.UID, nil)
++}
+diff --git a/pkg/kubelet/kuberuntime/kuberuntime_sandbox.go b/pkg/kubelet/kuberuntime/kuberuntime_sandbox.go
+index 843838cae2f..b676926e237 100644
+--- a/pkg/kubelet/kuberuntime/kuberuntime_sandbox.go
++++ b/pkg/kubelet/kuberuntime/kuberuntime_sandbox.go
+@@ -71,6 +71,7 @@ func (m *kubeGenericRuntimeManager) createPodSandbox(ctx context.Context, pod *v
+ 		return "", message, err
+ 	}
+ 
++	m.sandboxCreated(pod, podSandboxConfig)
+ 	return podSandBoxID, "", nil
+ }
+ 
+diff --git a/pkg/kubelet/kuberuntime/kuberuntime_sandbox_freebsd.go b/pkg/kubelet/kuberuntime/kuberuntime_sandbox_freebsd.go
+index 23ca6a6e20f..506b81f1a71 100644
+--- a/pkg/kubelet/kuberuntime/kuberuntime_sandbox_freebsd.go
++++ b/pkg/kubelet/kuberuntime/kuberuntime_sandbox_freebsd.go
+@@ -42,7 +42,33 @@ func (m *kubeGenericRuntimeManager) applySandboxResources(ctx context.Context, p
+ 	period := uint64(m.cpuCFSQuotaPeriod.Duration / time.Microsecond)
+ 	rc := cm.ResourceConfigForPod(pod, m.cpuCFSQuota, period, false, kubeletconfig.NoneMemoryReservationPolicy)
+ 	config.Linux.Resources = convertResourceConfigToLinuxContainerResources(rc)
+-	// What the pod jail starts with, for in-place resize (GetPodCgroupConfig).
+-	cm.RecordPodLevelConfig(pod.UID, rc)
+ 	return nil
+ }
++
++// sandboxCreated records the pod-level limits the pod jail was created with,
++// for in-place resize (the pod container manager's GetPodCgroupConfig).
++// Only here: the sandbox config is also generated on every pod sync, from
++// the pod's desired resources.
++func (m *kubeGenericRuntimeManager) sandboxCreated(pod *v1.Pod, config *runtimeapi.PodSandboxConfig) {
++	r := config.GetLinux().GetResources()
++	if r == nil {
++		cm.RecordPodLevelConfig(pod.UID, nil)
++		return
++	}
++	rc := &cm.ResourceConfig{}
++	if r.MemoryLimitInBytes > 0 {
++		rc.Memory = &r.MemoryLimitInBytes
++	}
++	if r.CpuQuota != 0 {
++		rc.CPUQuota = &r.CpuQuota
++	}
++	if r.CpuPeriod > 0 {
++		period := uint64(r.CpuPeriod)
++		rc.CPUPeriod = &period
++	}
++	if r.CpuShares > 0 {
++		shares := uint64(r.CpuShares)
++		rc.CPUShares = &shares
++	}
++	cm.RecordPodLevelConfig(pod.UID, rc)
++}
+diff --git a/pkg/kubelet/kuberuntime/kuberuntime_sandbox_linux.go b/pkg/kubelet/kuberuntime/kuberuntime_sandbox_linux.go
+index a3ae9c13374..d9417d3660a 100644
+--- a/pkg/kubelet/kuberuntime/kuberuntime_sandbox_linux.go
++++ b/pkg/kubelet/kuberuntime/kuberuntime_sandbox_linux.go
+@@ -76,3 +76,6 @@ func (m *kubeGenericRuntimeManager) applySandboxResources(ctx context.Context, p
+ 
+ 	return nil
+ }
++
++// sandboxCreated is called once the runtime created a pod's sandbox.
++func (m *kubeGenericRuntimeManager) sandboxCreated(_ *v1.Pod, _ *runtimeapi.PodSandboxConfig) {}
+diff --git a/pkg/kubelet/kuberuntime/kuberuntime_sandbox_unsupported.go b/pkg/kubelet/kuberuntime/kuberuntime_sandbox_unsupported.go
+index 349d14db3ad..8c9a2996a1b 100644
+--- a/pkg/kubelet/kuberuntime/kuberuntime_sandbox_unsupported.go
++++ b/pkg/kubelet/kuberuntime/kuberuntime_sandbox_unsupported.go
+@@ -28,3 +28,6 @@ import (
+ func (m *kubeGenericRuntimeManager) applySandboxResources(ctx context.Context, pod *v1.Pod, config *runtimeapi.PodSandboxConfig) error {
+ 	return nil
+ }
++
++// sandboxCreated is called once the runtime created a pod's sandbox.
++func (m *kubeGenericRuntimeManager) sandboxCreated(_ *v1.Pod, _ *runtimeapi.PodSandboxConfig) {}
+diff --git a/pkg/kubelet/kuberuntime/kuberuntime_sandbox_windows.go b/pkg/kubelet/kuberuntime/kuberuntime_sandbox_windows.go
+index a3000fe6758..bb25097a1e8 100644
+--- a/pkg/kubelet/kuberuntime/kuberuntime_sandbox_windows.go
++++ b/pkg/kubelet/kuberuntime/kuberuntime_sandbox_windows.go
+@@ -28,3 +28,6 @@ import (
+ func (m *kubeGenericRuntimeManager) applySandboxResources(ctx context.Context, pod *v1.Pod, config *runtimeapi.PodSandboxConfig) error {
+ 	return nil
+ }
++
++// sandboxCreated is called once the runtime created a pod's sandbox.
++func (m *kubeGenericRuntimeManager) sandboxCreated(_ *v1.Pod, _ *runtimeapi.PodSandboxConfig) {}
+-- 
+2.54.0 (Apple Git-157)
+

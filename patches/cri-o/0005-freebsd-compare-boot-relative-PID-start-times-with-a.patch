@@ -1,0 +1,141 @@
+From 06eb500709ae57adb64266e57ba3f34924515391 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 15:09:26 -0700
+Subject: [PATCH 5/6] freebsd: compare boot-relative PID start times with a 10
+ ms tolerance
+
+kern.boottime is derived from the current time and moves by microseconds
+while ntpd slews the clock, so the boot-relative start time jitters and an
+exact comparison would be flaky (the test caught it: boot time changed
+between every pair of reads). A reused PID can't start within 10 ms of the
+original process. Test for jitter and for a real difference.
+---
+ internal/oci/container_freebsd.go      | 55 ++++++++++++++++----------
+ internal/oci/container_freebsd_test.go | 15 +++++++
+ 2 files changed, 50 insertions(+), 20 deletions(-)
+
+diff --git a/internal/oci/container_freebsd.go b/internal/oci/container_freebsd.go
+index f064ddcfa..907acb1e0 100644
+--- a/internal/oci/container_freebsd.go
++++ b/internal/oci/container_freebsd.go
+@@ -9,6 +9,7 @@ import "C"
+ import (
+ 	"fmt"
+ 	"strings"
++	"time"
+ 	"unsafe"
+ 
+ 	specs "github.com/opencontainers/runtime-spec/specs-go"
+@@ -29,6 +30,12 @@ func getPidStartTime(pid int) (string, error) {
+ 	return getPidStatDataFromSysctl(pid)
+ }
+ 
++// startTimeTolerance absorbs the jitter of boot-relative start times:
++// kern.boottime is derived from the current time and moves by microseconds
++// while ntpd slews the clock. A reused PID can't start within this of the
++// original process, which had to exit and the PID space wrap around first.
++const startTimeTolerance = 10 * time.Millisecond
++
+ // startTimesMatch reports whether a process start time saved for a
+ // container's PID matches the PID's current one (no PID reuse).
+ func startTimesMatch(saved, current string, pid int) bool {
+@@ -36,7 +43,13 @@ func startTimesMatch(saved, current string, pid int) bool {
+ 		return true
+ 	}
+ 	if strings.HasPrefix(saved, bootRelativePrefix) {
+-		return false
++		s, err1 := parseBootRelative(saved)
++		c, err2 := parseBootRelative(current)
++		if err1 != nil || err2 != nil {
++			return false
++		}
++		d := s - c
++		return d > -startTimeTolerance && d < startTimeTolerance
+ 	}
+ 	// Saved by an older CRI-O as wall-clock time: compare like it did.
+ 	abs, _, err := kinfoStartTime(pid)
+@@ -64,27 +77,29 @@ func getPidStatData(pid int) (string, string, error) { //nolint:gocritic // Igno
+ // a reused one ("PID wrap may have occurred") and refused exec and other
+ // operations on it. Linux uses the start time in ticks since boot, which
+ // clock steps don't change; ki_start - kern.boottime is the equivalent.
++//
++// The result jitters by microseconds (kern.boottime moves while ntpd slews
++// the clock), so compare with startTimesMatch, not for equality.
+ func getPidStatDataFromSysctl(pid int) (string, error) {
+-	for range 3 {
+-		before, err := unix.SysctlTimeval("kern.boottime")
+-		if err != nil {
+-			return "", err
+-		}
+-		start, _, err := kinfoStartTime(pid)
+-		if err != nil {
+-			return "", err
+-		}
+-		after, err := unix.SysctlTimeval("kern.boottime")
+-		if err != nil {
+-			return "", err
+-		}
+-		if before != after {
+-			continue // the clock was stepped meanwhile
+-		}
+-		rel := unix.NsecToTimeval(start.Nano() - after.Nano())
+-		return fmt.Sprintf("%s%d,%06d", bootRelativePrefix, rel.Sec, rel.Usec), nil
++	start, _, err := kinfoStartTime(pid)
++	if err != nil {
++		return "", err
++	}
++	boot, err := unix.SysctlTimeval("kern.boottime")
++	if err != nil {
++		return "", err
++	}
++	rel := unix.NsecToTimeval(start.Nano() - boot.Nano())
++	return fmt.Sprintf("%s%d,%06d", bootRelativePrefix, rel.Sec, rel.Usec), nil
++}
++
++// parseBootRelative parses a start time from getPidStatDataFromSysctl.
++func parseBootRelative(s string) (time.Duration, error) {
++	var sec, usec int64
++	if _, err := fmt.Sscanf(strings.TrimPrefix(s, bootRelativePrefix), "%d,%d", &sec, &usec); err != nil {
++		return 0, err
+ 	}
+-	return "", fmt.Errorf("boot time kept changing while reading the start time of PID %d", pid)
++	return time.Duration(sec)*time.Second + time.Duration(usec)*time.Microsecond, nil
+ }
+ 
+ // kinfoStartTime returns the process's ki_start (wall-clock) from kinfo_proc.
+diff --git a/internal/oci/container_freebsd_test.go b/internal/oci/container_freebsd_test.go
+index 65761d500..105f1ac55 100644
+--- a/internal/oci/container_freebsd_test.go
++++ b/internal/oci/container_freebsd_test.go
+@@ -7,6 +7,7 @@ import (
+ 	"os"
+ 	"strings"
+ 	"testing"
++	"time"
+ )
+ 
+ func TestFreeBSDPidStartTime(t *testing.T) {
+@@ -37,6 +38,20 @@ func TestFreeBSDPidStartTime(t *testing.T) {
+ 	if startTimesMatch(bootRelativePrefix+"1,000000", again, pid) {
+ 		t.Errorf("a different start time matched")
+ 	}
++	// microsecond jitter (boot time moving while ntpd slews) still matches,
++	// 50 ms apart doesn't
++	d, err := parseBootRelative(st)
++	if err != nil {
++		t.Fatal(err)
++	}
++	near := fmt.Sprintf("%s%d,%06d", bootRelativePrefix, (d+3*time.Microsecond)/time.Second, ((d+3*time.Microsecond)%time.Second)/time.Microsecond)
++	far := fmt.Sprintf("%s%d,%06d", bootRelativePrefix, (d+50*time.Millisecond)/time.Second, ((d+50*time.Millisecond)%time.Second)/time.Microsecond)
++	if !startTimesMatch(near, st, pid) {
++		t.Errorf("%q and %q should match (3 us apart)", near, st)
++	}
++	if startTimesMatch(far, st, pid) {
++		t.Errorf("%q and %q should not match (50 ms apart)", far, st)
++	}
+ 	if startTimesMatch("1,0", again, pid) {
+ 		t.Errorf("a different legacy start time matched")
+ 	}
+-- 
+2.54.0 (Apple Git-157)
+

@@ -175,7 +175,7 @@ Details, file lists and LOC are in `research/02` §5. The upstream-friendly item
 
 | ID | Change | LOC | Upstream odds | Phase |
 |---|---|---|---|---|
-| **K0** ✅ | **rctl hierarchical enforcement: FIXED & VERIFIED** ([research/06](../research/06-resource-limits.md) §Pod-level limits): parent-jail rules now bind child jails (relink in `rctl_proc_ucred_changed`, compare against the rule's jail), plus `kern.features.rctl_jail_hierarchy`. Enables pod-level limits. ATF test still to write. | ~60 | High | **1** |
+| **K0** ✅ | **rctl hierarchical enforcement: FIXED & VERIFIED** ([research/06](../research/06-resource-limits.md) §Pod-level limits): parent-jail rules now bind child jails (relink in `rctl_proc_ucred_changed`, compare against the rule's jail), plus `kern.features.rctl_jail_hierarchy`. Enables pod-level limits and pod-level resize. ATF test `tests/sys/kern/rctl_jail_hierarchy.sh`: 3/3 with the fix, 0/3 without. | ~60 | High | **1** |
 | K5 | per-jail OOM kill + `oom_score_adj` (procctl) + jail OOM knote | 500–900 | High | 2 |
 | K7 | hugepage (largepage) racct | 100–200 | High | 2 |
 | K10 | read-only cgroupfs in linsysfs/linprocfs | 1–1.8k | High | 2 |

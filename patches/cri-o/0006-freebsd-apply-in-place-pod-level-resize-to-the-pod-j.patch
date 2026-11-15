@@ -1,0 +1,115 @@
+From cdb31619d99c331942625d647cc33fb5b3b5c11f Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 15:17:53 -0700
+Subject: [PATCH 6/6] freebsd: apply in-place pod-level resize to the pod jail
+
+UpdatePodSandboxResources only notified NRI. On FreeBSD the pod-level
+limits are rctl rules on the pod jail, the infra container's jail, so apply
+the new memory limit and CPU quota with the runtime's update of the infra
+container (ocijail update replaces the jail's rules) and record them in its
+spec. Only on kernels with kern.features.rctl_jail_hierarchy; a no-op on
+other platforms, where the kubelet updates the pod cgroup itself.
+---
+ server/sandbox_resources_freebsd.go | 36 +++++++++++++++++++++++++++++
+ server/sandbox_resources_other.go   | 17 ++++++++++++++
+ server/sandbox_update_resources.go  |  4 ++++
+ 3 files changed, 57 insertions(+)
+ create mode 100644 server/sandbox_resources_other.go
+
+diff --git a/server/sandbox_resources_freebsd.go b/server/sandbox_resources_freebsd.go
+index 8878deb28..59e72a8ad 100644
+--- a/server/sandbox_resources_freebsd.go
++++ b/server/sandbox_resources_freebsd.go
+@@ -2,12 +2,15 @@ package server
+ 
+ import (
+ 	"context"
++	"fmt"
+ 	"sync"
+ 
++	rspec "github.com/opencontainers/runtime-spec/specs-go"
+ 	"github.com/opencontainers/runtime-tools/generate"
+ 	"golang.org/x/sys/unix"
+ 	types "k8s.io/cri-api/pkg/apis/runtime/v1"
+ 
++	"github.com/cri-o/cri-o/internal/lib/sandbox"
+ 	"github.com/cri-o/cri-o/internal/log"
+ )
+ 
+@@ -49,3 +52,36 @@ func applyPodLevelLimits(ctx context.Context, g *generate.Generator, resources *
+ 		g.SetLinuxResourcesCPUPeriod(uint64(period))
+ 	}
+ }
++
++// updatePodLevelLimits applies an in-place resize of the pod's limits
++// (UpdatePodSandboxResources) to the pod jail: the infra container's jail, so
++// through the runtime's update of the infra container (ocijail update
++// replaces the jail's rctl rules). Only the limits the pod jail carries
++// (memory, CPU quota) are sent; values the kubelet leaves at 0 keep theirs.
++func (s *Server) updatePodLevelLimits(ctx context.Context, sb *sandbox.Sandbox, resources *types.LinuxContainerResources) error {
++	if resources == nil || (resources.GetMemoryLimitInBytes() <= 0 && resources.GetCpuQuota() <= 0) {
++		return nil
++	}
++	if !podLevelLimitsSupported() {
++		log.Infof(ctx, "Not updating pod-level limits of %s: the kernel doesn't apply jail rctl rules to child jails", sb.ID())
++		return nil
++	}
++	infra := sb.InfraContainer()
++	if infra == nil {
++		return fmt.Errorf("pod sandbox %s has no infra container to carry its limits", sb.ID())
++	}
++	update := &rspec.LinuxResources{CPU: &rspec.LinuxCPU{}, Memory: &rspec.LinuxMemory{}}
++	if mem := resources.GetMemoryLimitInBytes(); mem > 0 {
++		update.Memory.Limit = &mem
++	}
++	if quota, period := resources.GetCpuQuota(), resources.GetCpuPeriod(); quota > 0 && period > 0 {
++		p := uint64(period)
++		update.CPU.Quota = &quota
++		update.CPU.Period = &p
++	}
++	if err := s.ContainerServer.Runtime().UpdateContainer(ctx, infra, update); err != nil {
++		return fmt.Errorf("updating pod-level limits of %s: %w", sb.ID(), err)
++	}
++	s.UpdateContainerLinuxResources(infra, update)
++	return nil
++}
+diff --git a/server/sandbox_resources_other.go b/server/sandbox_resources_other.go
+new file mode 100644
+index 000000000..5cdc035a1
+--- /dev/null
++++ b/server/sandbox_resources_other.go
+@@ -0,0 +1,17 @@
++//go:build !freebsd
++
++package server
++
++import (
++	"context"
++
++	types "k8s.io/cri-api/pkg/apis/runtime/v1"
++
++	"github.com/cri-o/cri-o/internal/lib/sandbox"
++)
++
++// updatePodLevelLimits: elsewhere the kubelet applies pod-level limits to
++// the pod cgroup itself; the runtime is only notified (NRI).
++func (s *Server) updatePodLevelLimits(_ context.Context, _ *sandbox.Sandbox, _ *types.LinuxContainerResources) error {
++	return nil
++}
+diff --git a/server/sandbox_update_resources.go b/server/sandbox_update_resources.go
+index 31c09226d..0add1c024 100644
+--- a/server/sandbox_update_resources.go
++++ b/server/sandbox_update_resources.go
+@@ -25,5 +25,9 @@ func (s *Server) UpdatePodSandboxResources(ctx context.Context, req *types.Updat
+ 		return nil, err
+ 	}
+ 
++	if err := s.updatePodLevelLimits(ctx, sb, req.GetResources()); err != nil {
++		return nil, err
++	}
++
+ 	return &types.UpdatePodSandboxResourcesResponse{}, nil
+ }
+-- 
+2.54.0 (Apple Git-157)
+

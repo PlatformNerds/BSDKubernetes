@@ -192,10 +192,41 @@ Hence the gating:
 | `spec.resources.limits: {memory: 200Mi, cpu: 500m}`, containers without limits | `memoryuse:sigkill=200Mi`, `pcpu:deny=50`; containers none | `a` alone 300 MB → **killed**; `a` 40 MB + `b` 40 MB at once → both ok; `a` 80 MB + `b` 80 MB at once (~247 MB > 200) → **`a` killed**, `b` ok; no restarts |
 | same pod on node 1 *before* its kernel upgrade | none | **rejected** at admission with the kernel-feature reason |
 
-**Not done:**
-- **Pod-level resize.** Kubernetes sends `UpdatePodSandboxResources`, but our pod container manager reports the
-  allocated values, so the kubelet never sees a pod-level change. CRI-O would also have to run `ocijail update` on
-  the infra container.
+**Kernel test:** an ATF test (`tests/sys/kern/rctl_jail_hierarchy.sh`, patch `freebsd-src/0005`) covers the
+feature flag, maxproc and memoryuse on a parent jail with a child. It passes 3/3 on the fixed kernel and 0/3 on
+the previous one (`kernel.allowpf`), so it catches the bug.
+
+### Pod-level in-place resize (implemented and verified 2026-11-16)
+
+`kubectl patch pod --subresource resize` on `spec.resources`, and container resizes that change the pod's summed
+limit, now update the pod jail (`bsdk8s/0015-0016`, `cri-o/0004-0006`):
+- **kubelet:**
+  - Pod-level resize is allowed with `kern.features.rctl_jail_hierarchy`.
+  - The pod container manager reports the limits *applied* to the pod jail: recorded when the sandbox is created
+    and on each accepted update, or reported as unlimited when unknown, so the kubelet re-sends them.
+- **CRI-O:** `UpdatePodSandboxResources` runs `ocijail update` on the infra container (the pod jail).
+
+| Test (node 2) | Pod jail before → after | Result |
+|---|---|---|
+| `spec.resources` 200Mi/500m → 400Mi/1 | `memoryuse:sigkill` 200Mi → 400Mi, `pcpu:deny` 50 → 100 | 300 MB in a container: killed before, runs after |
+| container `a` 128Mi → 384Mi (pod limit = sum) | 256Mi → 512Mi | 300 MB in `a` runs |
+| `spec.resources` memory 400Mi → 250Mi (usage 85 MB) | 400Mi → 250Mi | applied |
+| `spec.resources` memory → 20Mi | unchanged | refused: "attempting to set pod memory limit (20971520) below current usage (89939968)" |
+
+No container restarted.
+
+**Two bugs found on the way, both fixed:**
+- **Stale pod-jail limit after a container resize.** Until this change, a container resize never updated the pod
+  jail's summed limit, so growing a container past the creation-time sum got it killed by the stale pod limit
+  (live since pod-level limits shipped earlier the same day).
+- **Pod-level update never sent.** The first version recorded the "applied" config in `applySandboxResources`,
+  which runs on *every* pod sync from the desired resources, so the kubelet never saw a pod-level change. It's now
+  recorded only once the runtime created the sandbox, with a regression test.
+
+**Limits:**
+- The applied-config record is in kubelet memory. After a kubelet restart the first resize re-sends the pod's
+  limits (idempotent), but its update ordering is conservative.
+- Removing a pod-level limit isn't supported, as upstream (#128675).
 - **Which process dies.** When the pod limit trips, the process that crossed it is killed (racctd's per-process
   sample), not the largest one, as a Linux OOM kill would pick.
 

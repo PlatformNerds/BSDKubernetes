@@ -1,0 +1,120 @@
+From 8b9eae4c14bb041f6def33109ed19f50a0d57289 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 21:46:45 -0700
+Subject: [PATCH 8/9] podresize admission: allow in-place resize on FreeBSD
+ nodes
+
+The admission plugin rejected resizes of pods on any node whose
+kubernetes.io/os isn't linux. FreeBSD kubelets now support container-level
+in-place resize (rctl limits on the container jail, changed through CRI
+UpdateContainerResources -> ocijail update), so accept freebsd too.
+Windows is still rejected.
+---
+ plugin/pkg/admission/podresize/admission.go   | 14 +++++-----
+ .../pkg/admission/podresize/admission_test.go | 26 +++++++++++++++++--
+ test/integration/pods/pods_test.go            |  2 +-
+ 3 files changed, 33 insertions(+), 9 deletions(-)
+
+diff --git a/plugin/pkg/admission/podresize/admission.go b/plugin/pkg/admission/podresize/admission.go
+index c9f4a0de042..ba289f4cdfb 100644
+--- a/plugin/pkg/admission/podresize/admission.go
++++ b/plugin/pkg/admission/podresize/admission.go
+@@ -146,8 +146,8 @@ func (p *Plugin) validatePodResize(pod *core.Pod, a admission.Attributes) error
+ 		return admission.NewForbidden(a, fmt.Errorf("failed to get node %q: %w", pod.Spec.NodeName, err))
+ 	}
+ 
+-	// If the node is not a linux node, reject the update.
+-	if err := validateLinuxNode(node); err != nil {
++	// If the node's OS doesn't support in-place resize, reject the update.
++	if err := validateResizeSupportedNode(node); err != nil {
+ 		return resizeValidationError(a, err, ReasonUnsupportedPlatform)
+ 	}
+ 
+@@ -169,14 +169,16 @@ func validateNodeAllocatable(pod *core.Pod, node *corev1.Node) error {
+ 	return validateRequestsWithinAllocatable(podV1, node.Status.Allocatable)
+ }
+ 
+-// Returns nil if the node is a linux node, err otherwise.
+-func validateLinuxNode(node *corev1.Node) error {
++// Returns nil if the node's OS supports in-place pod resize, err otherwise.
++// Linux resizes cgroups; FreeBSD changes the rctl(8) limits on the
++// container's jail (container-level resize only).
++func validateResizeSupportedNode(node *corev1.Node) error {
+ 	// This label should always be populated.
+ 	val, ok := node.Labels[corev1.LabelOSStable]
+-	if !ok || val == "linux" {
++	if !ok || val == "linux" || val == "freebsd" {
+ 		return nil
+ 	}
+-	return fmt.Errorf("pod resize is only supported on linux nodes, node %q is %q", node.Name, val)
++	return fmt.Errorf("pod resize is only supported on linux and freebsd nodes, node %q is %q", node.Name, val)
+ }
+ 
+ func resizeValidationError(a admission.Attributes, err error, reason metav1.CauseType) error {
+diff --git a/plugin/pkg/admission/podresize/admission_test.go b/plugin/pkg/admission/podresize/admission_test.go
+index 4d357ba0ef7..dc02a75f820 100644
+--- a/plugin/pkg/admission/podresize/admission_test.go
++++ b/plugin/pkg/admission/podresize/admission_test.go
+@@ -64,6 +64,10 @@ func TestResizeAdmission(t *testing.T) {
+ 		},
+ 	}
+ 
++	freebsdNode := linuxNode.DeepCopy()
++	freebsdNode.Name = "freebsd-node"
++	freebsdNode.Labels[corev1.LabelOSStable] = "freebsd"
++
+ 	testPod := &core.Pod{
+ 		ObjectMeta: metav1.ObjectMeta{
+ 			Name:       "test-pod",
+@@ -225,7 +229,25 @@ func TestResizeAdmission(t *testing.T) {
+ 				return p
+ 			},
+ 			expectErr:   true,
+-			errContains: "pod resize is only supported on linux nodes",
++			errContains: "pod resize is only supported on linux and freebsd nodes",
++		},
++		{
++			name:        "Allow resize on FreeBSD node",
++			subresource: "resize",
++			nodeName:    "freebsd-node",
++			oldPod: func() *core.Pod {
++				p := testPod.DeepCopy()
++				p.Spec.NodeName = "freebsd-node"
++				return p
++			}(),
++			newPod: func() *core.Pod {
++				p := testPod.DeepCopy()
++				p.Spec.NodeName = "freebsd-node"
++				p.Generation = 2
++				p.Spec.Containers[0].Resources.Requests[core.ResourceCPU] = resource.MustParse("2")
++				return p
++			},
++			expectErr: false,
+ 		},
+ 		{
+ 			name:        "Reject if node not found",
+@@ -249,7 +271,7 @@ func TestResizeAdmission(t *testing.T) {
+ 
+ 	for _, tc := range testCases {
+ 		t.Run(tc.name, func(t *testing.T) {
+-			client := fake.NewClientset(linuxNode, windowsNode)
++			client := fake.NewClientset(linuxNode, windowsNode, freebsdNode)
+ 			informerFactory := informers.NewSharedInformerFactory(client, 0)
+ 
+ 			plugin, err := NewPlugin()
+diff --git a/test/integration/pods/pods_test.go b/test/integration/pods/pods_test.go
+index 77cdd76f23e..f058dc3d266 100644
+--- a/test/integration/pods/pods_test.go
++++ b/test/integration/pods/pods_test.go
+@@ -1716,7 +1716,7 @@ func TestPodResizeValidation(t *testing.T) {
+ 			name:            "fail resize on non-linux node",
+ 			targetNode:      "windows-node",
+ 			resizeCPU:       "1",
+-			expectError:     "pod resize is only supported on linux nodes",
++			expectError:     "pod resize is only supported on linux and freebsd nodes",
+ 			expectCauseType: "UnsupportedPlatform",
+ 		},
+ 	}
+-- 
+2.54.0 (Apple Git-157)
+

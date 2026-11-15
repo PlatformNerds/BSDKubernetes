@@ -90,7 +90,7 @@ The first multi-node run: control plane `bsdk8s` (192.168.100.1) + worker `bsdk8
 
 | # | Tests | Cause | Fix |
 |---|---|---|---|
-| 1 | 6 × Pod InPlace Resize | in-place resize not implemented: no CRI `UpdateContainerResources` → ocijail path, kubelet returns nil resources | add `ocijail update` (swap rctl rules; builds on research/06) + kubelet `generateContainerResources` |
+| 1 | 6 × Pod InPlace Resize | ~~in-place resize not implemented~~ **Implemented** (research/06 §In-place pod resize, verified on both nodes). The tests still fail: they check the result by reading `/sys/fs/cgroup` in the container. Windows skips them. | needs a FreeBSD verification path in the e2e test (upstream) |
 | 2 | ~~4 × Container Runtime "termination message"~~ **fixed** | test sets `terminationMessagePath: /dev/termination-custom-log`. The jail's `/dev` is devfs, which can't hold a regular file, so the bind mount failed (`No such file or directory`). Linux runtimes use a tmpfs `/dev`. | **ocijail**: mount such files under `/.ocijail-devfiles` and symlink them into the devfs, unhiding the symlink because CRI-O's devfs ruleset 4 hides everything else (`PlatformNerds/ocijail` `devfs-file-mounts`, in `bsdk8s-main`). All 5 termination-message tests pass. |
 | 3 | 2 (DaemonSet rollback, "at least two untainted nodes") | single-node cluster | second FreeBSD node |
 
@@ -112,5 +112,5 @@ The first multi-node run: control plane `bsdk8s` (192.168.100.1) + worker `bsdk8
 
 1. ~~Session affinity in kube-proxy pf mode~~: fixed, 4 tests now pass (→ 419/446 expected on the next full run).
 2. ~~Termination message under `/dev`~~: fixed (5/5 pass).
-3. In-place resize (6).
+3. In-place resize: implemented (research/06). The 6 tests stay red until the e2e checks have a FreeBSD path.
 4. Second node (2, plus multi-node coverage that this single-node run can't exercise).

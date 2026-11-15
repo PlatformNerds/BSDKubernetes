@@ -1,0 +1,62 @@
+From 7d3d82b46733de8ecf79436f4c5c95a498ad1e92 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 21:51:37 -0700
+Subject: [PATCH] freebsd: report memory usage as resident memory (memoryuse)
+ in stats
+
+Container stats only set WorkingSetBytes, so the kubelet found no memory
+usage and refused every in-place resize that lowers a memory limit
+('cannot decrease memory limits: missing container memory usage'). Report
+racct memoryuse as UsageBytes and RssBytes too: it is the resident memory
+the container's limit (rctl memoryuse:sigkill) is enforced on.
+
+Pod sandbox stats reported vmemoryuse (virtual size) as UsageBytes; use
+memoryuse as well, since virtual size (e.g. Go's heap arena reservation)
+makes any limit look exceeded.
+---
+ internal/config/jail/stats.go                    | 7 +++++--
+ internal/lib/statsserver/stats_server_freebsd.go | 6 ++++++
+ 2 files changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/internal/config/jail/stats.go b/internal/config/jail/stats.go
+index 1530d76a9..42c16420f 100644
+--- a/internal/config/jail/stats.go
++++ b/internal/config/jail/stats.go
+@@ -133,8 +133,11 @@ func PopulateSandboxStats(jailName string, sandboxStats *types.PodSandboxStats)
+ 		RssBytes:        &types.UInt64Value{Value: memory.RssBytes},
+ 		PageFaults:      &types.UInt64Value{},
+ 		MajorPageFaults: &types.UInt64Value{},
+-		UsageBytes:      &types.UInt64Value{Value: memory.MaxUsage},
+-		AvailableBytes:  &types.UInt64Value{},
++		// memoryuse (resident), not vmemoryuse: limits are enforced on
++		// resident memory, and virtual size (e.g. Go's heap arena
++		// reservation) would make every limit look exceeded.
++		UsageBytes:     &types.UInt64Value{Value: memory.WorkingSetBytes},
++		AvailableBytes: &types.UInt64Value{},
+ 	}
+ 	if val, ok := entries["maxproc"]; ok {
+ 		stats.Process = &types.ProcessUsage{
+diff --git a/internal/lib/statsserver/stats_server_freebsd.go b/internal/lib/statsserver/stats_server_freebsd.go
+index 4f5547608..402e7cece 100644
+--- a/internal/lib/statsserver/stats_server_freebsd.go
++++ b/internal/lib/statsserver/stats_server_freebsd.go
+@@ -323,10 +323,16 @@ func criCPUStats(cpuStats *stats.CpuStats, systemNano int64) *types.CpuUsage {
+ 	}
+ }
+ 
++// criMemStats: Usage.Usage is the jail's racct memoryuse (resident memory),
++// which is also what the container's memory limit (rctl memoryuse:sigkill)
++// enforces, so it is the usage to compare limits with. The kubelet reads
++// UsageBytes, e.g. to refuse an in-place resize below current usage.
+ func criMemStats(memStats *stats.MemoryStats, systemNano int64) *types.MemoryUsage {
+ 	return &types.MemoryUsage{
+ 		Timestamp:       systemNano,
+ 		WorkingSetBytes: &types.UInt64Value{Value: memStats.Usage.Usage},
++		UsageBytes:      &types.UInt64Value{Value: memStats.Usage.Usage},
++		RssBytes:        &types.UInt64Value{Value: memStats.Usage.Usage},
+ 	}
+ }
+ 
+-- 
+2.54.0 (Apple Git-157)
+

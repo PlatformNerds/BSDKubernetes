@@ -69,6 +69,56 @@ Caveats of `memoryuse:sigkill`:
 - **ocijail + CLI11 ≥ 2.4:** `ocijail --version` fails with "A subcommand is required". Upstream pins 2.3.2 via Bazel, but distro builds against current CLI11 break.
 - **containers/common:** logs `getCPUInfo for OS freebsd not implemented` on every call.
 
+## In-place pod resize (implemented 2026-11-15)
+
+`kubectl patch pod --subresource resize` now changes a running FreeBSD container's limits without a restart, on
+both nodes. The path: kubelet → CRI `UpdateContainerResources` → CRI-O (unchanged: it already ran
+`<runtime> update --resources -`) → **`ocijail update`** → the jail's rctl rules are replaced.
+
+Measured, two-node cluster (`agnhost pause` pod, `resizePolicy: NotRequired`):
+
+| Step | Pod status `resources` | rctl on the container jail | Restarts |
+|---|---|---|---|
+| created | cpu 100m/200m, mem 64Mi/128Mi | `pcpu:deny=20`, `memoryuse:sigkill=128Mi` | 0 |
+| resize up | cpu 300m/600m, mem 96Mi/256Mi | `pcpu:deny=60`, `memoryuse:sigkill=256Mi` | 0 |
+| limit 8Mi (usage 46 MB) | unchanged; `PodResizeInProgress` error *"attempting to set container "c" memory limit (8388608) below current usage (46243840)"* | unchanged | 0 |
+| resize down | cpu 50m/100m, mem 32Mi/80Mi | `pcpu:deny=10`, `memoryuse:sigkill=80Mi` | 0 |
+| cpu limit 100m → 500m under a busy loop | cpu limit 500m | `pcpu:deny=50` | 0 |
+
+The busy loop used 30% of a CPU at 100m (the small-limit overshoot measured above) and 50% at 500m. racct
+`cputime` counts whole seconds, so these readings are ±5%.
+
+What it took (each layer refused it before):
+
+1. **ocijail `update --resources`** (`PlatformNerds/ocijail` `update-resources`, patch `ocijail/0010`):
+   - The update is merged into the stored `linux.resources` (runc semantics: absent or null fields keep their value).
+   - Managed rules are replaced by removing each resource:action first. rctl keeps duplicate rules side by side and
+     the lowest wins, so just adding a rule can't raise a limit.
+   - A memory limit below the jail's current `memoryuse` is refused, like Linux's EBUSY. This is best effort:
+     racctd samples once per second.
+2. **kube-apiserver**: the `podresize` admission plugin allowed only Linux nodes. It now allows `freebsd` too
+   (patch `bsdk8s/0008`). **This is a control-plane change:** a cluster needs a patched apiserver to resize pods
+   on FreeBSD nodes.
+3. **kubelet** (patches `bsdk8s/0007`, `0009`):
+   - Allocation now allows resize on FreeBSD (container-level only).
+   - `cm/helpers_freebsd.go` carries the portable parts of `helpers_linux.go` (`ResourceConfigForPod`, shares and
+     quota conversions). The stubs returned nil, and the resize failed with "unable to get resource
+     configuration".
+   - A FreeBSD pod container manager reports the allocated pod config. That has to be non-nil: a nil value
+     **crashed the kubelet**.
+   - `generateContainerResources` and `toKubeContainerResources` are no longer stubs, so the kubelet can see the
+     resize finish.
+4. **CRI-O stats** (patch `cri-o/0002`): container memory stats now report `memoryuse` as `usageBytes`. Without
+   it, every memory decrease was refused with "missing container memory usage". Pod stats now report `memoryuse`
+   instead of `vmemoryuse` (virtual size).
+
+**Not done:**
+- **Pod-level resize** stays unsupported, as do pod-level limits; that's the next item below.
+- **Upstream e2e:** the `[sig-node] Pod InPlace Resize` conformance tests verify by reading
+  `/sys/fs/cgroup/...` inside the container, so they still fail on FreeBSD. Windows skips them for the same
+  reason. Making them count would need a FreeBSD verification path in the e2e framework (e.g. `rctl` from the
+  node), an upstream test change.
+
 ## Upstream candidates (fork-first, then upstream; see docs/FORKS.md)
 
 1. ocijail `jail: fix config::set type validation`: **opened as [dfr/ocijail#39](https://github.com/dfr/ocijail/pull/39)** (2026-11-14).
@@ -78,7 +128,9 @@ Caveats of `memoryuse:sigkill`:
 ## Next steps
 
 - `OOMKilled` reason: add a `memoryuse:devctl` rule plus CRI-O FreeBSD exit-reason mapping, or kernel K5.
-- Pod-level limits on the sandbox (parent) jail: the sum of container limits plus overhead.
-- `UpdateContainerResources` (in-place resize) → `ocijail update` → rctl rule swap.
+- Pod-level limits on the sandbox (parent) jail: the sum of container limits plus overhead. This would also enable
+  pod-level resize, via a real `GetPodCgroupConfig`/`SetPodCgroupConfig` on rctl.
+- CPU stats: racct `cputime` has 1-second resolution, so `usageNanoCores` (metrics-server, HPA) is coarse.
+- ~~`UpdateContainerResources` (in-place resize) → `ocijail update` → rctl rule swap.~~ Done (above).
 - cpuset (CPU manager static policy) → `cpuset -j`.
 - Kernel K2 (accurate CPU limits below 500m) and K3 (CPU requests).

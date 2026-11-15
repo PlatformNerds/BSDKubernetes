@@ -1,0 +1,464 @@
+From 60d1b7c892b8dedd88826be065c82f8935c37ea9 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 21:37:25 -0700
+Subject: [PATCH] Add update --resources: change a container's rctl limits in
+ place
+
+CRI-O implements the CRI UpdateContainerResources call (Kubernetes in-place
+pod resize) by running '<runtime> update --resources - <id>' with OCI
+linux.resources on stdin, as runc does; ocijail had no update command.
+
+The update is merged into the container's stored linux.resources (fields
+absent or null keep their value, as with runc), translated with
+rctl::from_oci_resources, and the jail's managed rules are replaced: rctl
+keeps rules with the same subject, resource and action side by side and
+the lowest wins, so each managed resource:action is removed before the new
+rule is added. Like Linux refusing a memory.max below usage (EBUSY), a
+memory limit below the jail's current memoryuse is refused rather than
+letting memoryuse:sigkill kill the container (best effort: racctd samples
+memoryuse once per second).
+
+Tests: merge_oci_resources unit tests; test_update_resources (memory-only
+and cpu-only updates, persistence, refusal below usage, stopped container).
+---
+ ocijail/BUILD         |   2 +
+ ocijail/main.cpp      |   2 +
+ ocijail/rctl.cpp      |  77 ++++++++++++++++++++++++++++++
+ ocijail/rctl.h        |  24 ++++++++++
+ ocijail/rctl_test.cpp |  20 ++++++++
+ ocijail/update.cpp    | 106 ++++++++++++++++++++++++++++++++++++++++++
+ ocijail/update.h      |  25 ++++++++++
+ test/run_test.py      |  56 ++++++++++++++++++++++
+ 8 files changed, 312 insertions(+)
+ create mode 100644 ocijail/update.cpp
+ create mode 100644 ocijail/update.h
+
+diff --git a/ocijail/BUILD b/ocijail/BUILD
+index 6009ccf..f233e62 100644
+--- a/ocijail/BUILD
++++ b/ocijail/BUILD
+@@ -37,6 +37,8 @@ cc_binary(
+         "state.h",
+         "tty.cpp",
+         "tty.h",
++        "update.cpp",
++        "update.h",
+     ],
+     deps = [
+         "@cliutils_cli11//:cli11",
+diff --git a/ocijail/main.cpp b/ocijail/main.cpp
+index 84dad42..a5b152e 100644
+--- a/ocijail/main.cpp
++++ b/ocijail/main.cpp
+@@ -14,6 +14,7 @@
+ #include "ocijail/main.h"
+ #include "ocijail/start.h"
+ #include "ocijail/state.h"
++#include "ocijail/update.h"
+ 
+ using namespace ocijail;
+ using nlohmann::json;
+@@ -31,6 +32,7 @@ int main(int argc, char** argv) {
+     state::init(app);
+     list::init(app);
+     features::init(app);
++    update::init(app);
+ 
+     try {
+         app.parse(argc, argv);
+diff --git a/ocijail/rctl.cpp b/ocijail/rctl.cpp
+index a0b1dc2..0d0cc89 100644
+--- a/ocijail/rctl.cpp
++++ b/ocijail/rctl.cpp
+@@ -5,7 +5,9 @@
+ 
+ #include <cerrno>
+ #include <cstdint>
++#include <string_view>
+ #include <system_error>
++#include <vector>
+ 
+ using nlohmann::json;
+ 
+@@ -62,6 +64,81 @@ translation from_oci_resources(const json& resources) {
+     return t;
+ }
+ 
++json merge_oci_resources(const json& base, const json& update) {
++    json merged = base.is_object() ? base : json::object();
++    if (!update.is_object()) {
++        return merged;
++    }
++    for (auto& [key, value] : update.items()) {
++        if (value.is_null()) {
++            continue;
++        }
++        if (value.is_object() && merged.contains(key) && merged[key].is_object()) {
++            merged[key] = merge_oci_resources(merged[key], value);
++        } else if (value.is_object()) {
++            merged[key] = merge_oci_resources(json::object(), value);
++        } else {
++            merged[key] = value;
++        }
++    }
++    return merged;
++}
++
++const std::vector<std::string> managed_keys = {
++    "memoryuse:sigkill", "pcpu:deny", "maxproc:deny"};
++
++bool replace(const std::string& jail_name, const std::vector<std::string>& rules) {
++    for (const auto& key : managed_keys) {
++        auto filter = "jail:" + jail_name + ":" + key;
++        if (::rctl_remove_rule(filter.c_str(), filter.size() + 1, nullptr, 0) < 0) {
++            if (errno == ENOSYS || errno == EPERM) {
++                return false;
++            }
++            if (errno != ESRCH) {
++                throw std::system_error(
++                    errno, std::system_category(), "rctl_remove_rule " + filter);
++            }
++        }
++    }
++    return apply(jail_name, rules);
++}
++
++std::optional<std::int64_t> usage(const std::string& jail_name,
++                                  const std::string& resource) {
++    auto filter = "jail:" + jail_name;
++    std::vector<char> buf(4096);
++    for (;;) {
++        if (::rctl_get_racct(filter.c_str(), filter.size() + 1, buf.data(),
++                             buf.size()) == 0) {
++            break;
++        }
++        if (errno == ERANGE && buf.size() < (1 << 20)) {
++            buf.resize(buf.size() * 4);
++            continue;
++        }
++        return std::nullopt;
++    }
++    // "cputime=0,datasize=1234,...,memoryuse=45400064,..."
++    std::string_view s{buf.data()};
++    auto prefix = resource + "=";
++    for (size_t pos = 0; pos < s.size();) {
++        auto end = s.find(',', pos);
++        if (end == std::string_view::npos) {
++            end = s.size();
++        }
++        auto item = s.substr(pos, end - pos);
++        if (item.starts_with(prefix)) {
++            try {
++                return std::stoll(std::string{item.substr(prefix.size())});
++            } catch (...) {
++                return std::nullopt;
++            }
++        }
++        pos = end + 1;
++    }
++    return std::nullopt;
++}
++
+ bool apply(const std::string& jail_name, const std::vector<std::string>& rules) {
+     for (const auto& r : rules) {
+         auto rule = "jail:" + jail_name + ":" + r;
+diff --git a/ocijail/rctl.h b/ocijail/rctl.h
+index f94556a..bdfd6a0 100644
+--- a/ocijail/rctl.h
++++ b/ocijail/rctl.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include <cstdint>
+ #include <optional>
+ #include <string>
+ #include <vector>
+@@ -37,6 +38,29 @@ struct translation {
+ };
+ translation from_oci_resources(const nlohmann::json& resources);
+ 
++// Merge a partial OCI linux.resources update (as passed to `update
++// --resources`, like runc) into base: fields present and non-null in update
++// replace those in base, absent or null fields keep their current value.
++// Pure function.
++nlohmann::json merge_oci_resources(const nlohmann::json& base,
++                                   const nlohmann::json& update);
++
++// The rctl resource:action pairs ocijail manages (what from_oci_resources
++// can produce).
++extern const std::vector<std::string> managed_keys;
++
++// Replace the jail's managed rules with rules: for each managed
++// resource:action, remove the existing rule, then add the new one if any.
++// (rctl keeps rules with the same subject, resource and action side by side,
++// and the lowest wins, so adding alone cannot raise a limit.) Same return
++// value and errors as apply.
++bool replace(const std::string& jail_name, const std::vector<std::string>& rules);
++
++// Current usage of a racct resource (e.g. "memoryuse") for the jail, or
++// nullopt if RACCT is unavailable or the resource isn't reported.
++std::optional<std::int64_t> usage(const std::string& jail_name,
++                                  const std::string& resource);
++
+ // Add "jail:<jail_name>:<rule>" for each rule. Returns false if RACCT/RCTL
+ // is unavailable (kern.racct.enable=0 -> ENOSYS) or not permitted (EPERM,
+ // e.g. when ocijail itself runs inside a jail); throws on any other error.
+diff --git a/ocijail/rctl_test.cpp b/ocijail/rctl_test.cpp
+index 176360d..7bf6068 100644
+--- a/ocijail/rctl_test.cpp
++++ b/ocijail/rctl_test.cpp
+@@ -7,6 +7,7 @@
+ 
+ using nlohmann::json;
+ using ocijail::rctl::from_oci_resources;
++using ocijail::rctl::merge_oci_resources;
+ 
+ static void expect(const json& res, std::vector<std::string> rules,
+                    std::vector<std::string> ignored = {}) {
+@@ -19,7 +20,26 @@ static void expect(const json& res, std::vector<std::string> rules,
+     }
+ }
+ 
++static void expect_merge(const char* base, const char* update, const char* want) {
++    auto got = merge_oci_resources(json::parse(base), json::parse(update));
++    if (got != json::parse(want)) {
++        std::cerr << "FAIL merge " << base << " + " << update << "\n  got  " << got.dump()
++                  << "\n  want " << want << "\n";
++        std::exit(1);
++    }
++}
++
+ int main() {
++    // update --resources: partial updates keep what they don't mention
++    // (CRI-O sends cpu {quota, period, shares} and memory {limit} only when set)
++    expect_merge(R"({"memory":{"limit":134217728},"cpu":{"quota":20000,"period":100000,"shares":102},"pids":{"limit":100}})",
++                 R"({"memory":{"limit":268435456},"cpu":{}})",
++                 R"({"memory":{"limit":268435456},"cpu":{"quota":20000,"period":100000,"shares":102},"pids":{"limit":100}})");
++    expect_merge(R"({"cpu":{"quota":20000,"period":100000}})",
++                 R"({"cpu":{"quota":50000,"cpus":""},"memory":{"limit":null}})",
++                 R"({"cpu":{"quota":50000,"period":100000,"cpus":""},"memory":{}})");
++    expect_merge("null", R"({"memory":{"limit":1048576}})", R"({"memory":{"limit":1048576}})");
++
+     // nothing / not an object / empty
+     expect(json(), {});
+     expect(json::object(), {});
+diff --git a/ocijail/update.cpp b/ocijail/update.cpp
+new file mode 100644
+index 0000000..9c418e9
+--- /dev/null
++++ b/ocijail/update.cpp
+@@ -0,0 +1,106 @@
++#include <fstream>
++#include <iostream>
++#include <iterator>
++#include <sstream>
++
++#include "nlohmann/json.hpp"
++
++#include "ocijail/rctl.h"
++#include "ocijail/update.h"
++
++using nlohmann::json;
++
++namespace ocijail {
++
++void update::init(main_app& app) {
++    static update instance{app};
++}
++
++update::update(main_app& app) : app_(app) {
++    auto sub = app.add_subcommand(
++        "update", "Update the resource limits of a container");
++    sub->add_option("container-id", id_, "Unique identifier for the container")
++        ->required();
++    sub->add_option("--resources,-r",
++                    resources_,
++                    "Path to a JSON file with the new OCI linux.resources, "
++                    "or - for standard input")
++        ->required();
++    sub->final_callback([this] { run(); });
++}
++
++void update::run() {
++    json res;
++    try {
++        if (resources_ == "-") {
++            res = json::parse(std::cin);
++        } else {
++            std::ifstream f{resources_};
++            if (!f) {
++                throw std::runtime_error("cannot open " + resources_);
++            }
++            res = json::parse(f);
++        }
++    } catch (const json::exception& e) {
++        throw std::runtime_error(std::string{"update: invalid resources: "} +
++                                 e.what());
++    }
++    if (!res.is_object()) {
++        throw std::runtime_error("update: resources must be a JSON object");
++    }
++
++    auto state = app_.get_runtime_state(id_);
++    auto lk = state.lock();
++    state.load();
++    state.check_status();
++    if (state["status"] != "created" && state["status"] != "running") {
++        std::stringstream ss;
++        ss << "update: container not in \"created\" or \"running\" state "
++              "(currently "
++           << state["status"] << ")";
++        throw std::runtime_error(ss.str());
++    }
++    auto jail_name = state["jail_name"].get<std::string>();
++
++    auto& config = state["config"];
++    json current = json::object();
++    if (config.contains("linux") && config["linux"].contains("resources")) {
++        current = config["linux"]["resources"];
++    }
++    auto merged = rctl::merge_oci_resources(current, res);
++    auto t = rctl::from_oci_resources(merged);
++    for (const auto& ign : t.ignored) {
++        app_.log_debug() << "resource " << ign
++                         << " is not supported on FreeBSD, ignoring";
++    }
++
++    // Like Linux (the kernel refuses a memory.max below usage with EBUSY),
++    // refuse to lower the memory limit below what the container uses now:
++    // memoryuse:sigkill would kill it instead. Best effort: racctd samples
++    // memoryuse once per second, so a container started less than a second
++    // ago may still report 0.
++    if (merged.contains("memory") && merged["memory"].contains("limit") &&
++        merged["memory"]["limit"].is_number_integer()) {
++        auto limit = merged["memory"]["limit"].get<std::int64_t>();
++        if (limit > 0) {
++            if (auto used = rctl::usage(jail_name, "memoryuse");
++                used && *used > limit) {
++                std::stringstream ss;
++                ss << "update: memory limit " << limit
++                   << " is below the container's current usage " << *used;
++                throw std::runtime_error(ss.str());
++            }
++        }
++    }
++
++    if (!rctl::replace(jail_name, t.rules) && !t.rules.empty()) {
++        app_.log() << "warning: rctl unavailable (kern.racct.enable=0, or not "
++                      "permitted in this jail), resource limits not enforced "
++                      "for " << jail_name;
++    }
++
++    config["linux"]["resources"] = merged;
++    state.save();
++}
++
++}  // namespace ocijail
+diff --git a/ocijail/update.h b/ocijail/update.h
+new file mode 100644
+index 0000000..6d26952
+--- /dev/null
++++ b/ocijail/update.h
+@@ -0,0 +1,25 @@
++#pragma once
++
++#include <optional>
++#include <string>
++
++#include "ocijail/main.h"
++
++namespace ocijail {
++
++// `update --resources <file|->`: change a running container's resource limits
++// (OCI linux.resources, as runc update does). CRI-O uses this for the CRI
++// UpdateContainerResources call, i.e. Kubernetes in-place pod resize.
++struct update {
++    static void init(main_app& app);
++
++   private:
++    update(main_app& app);
++    void run();
++
++    main_app& app_;
++    std::string id_;
++    std::string resources_;
++};
++
++}  // namespace ocijail
+diff --git a/test/run_test.py b/test/run_test.py
+index 8e0ec58..077bfaa 100644
+--- a/test/run_test.py
++++ b/test/run_test.py
+@@ -11,6 +11,7 @@ import socket
+ import subprocess
+ import sys
+ import tempfile
++import time
+ import unittest
+ 
+ def racct_enabled():
+@@ -179,6 +180,61 @@ class test_run(unittest.TestCase):
+             self.delete()
+         self.assertEqual(rctl_rules(subject), [])
+ 
++    def update(self, resources):
++        return subprocess.run([cmd, "update", "--resources", "-", self.container_id],
++                              input=json.dumps(resources), text=True,
++                              capture_output=True)
++
++    @unittest.skipUnless(racct_enabled(), "needs kern.racct.enable=1")
++    def test_update_resources(self):
++        # update --resources (CRI UpdateContainerResources, i.e. in-place
++        # pod resize) replaces the jail's rctl rules; partial updates keep
++        # the other limits; a memory limit below current usage is refused.
++        c = self.config()
++        c["process"]["args"] = ["sh", "-c", "exit 0"]
++        c["linux"] = {"resources": {
++            "memory": {"limit": 64 << 20},
++            "cpu": {"quota": 50000, "period": 100000, "shares": 512},
++            "pids": {"limit": 100},
++        }}
++        subject = f"jail:{self.container_id}"
++        with tempfile.TemporaryDirectory() as bundle_dir:
++            with open(os.path.join(bundle_dir, "config.json"), "w") as f:
++                json.dump(c, f)
++            pid, stdout, stderr = self.create(bundle_dir)
++            # what CRI-O sends for a memory-only resize
++            ret = self.update({"cpu": {}, "memory": {"limit": 128 << 20}})
++            self.assertEqual(ret.returncode, 0, ret.stderr)
++            self.assertEqual(rctl_rules(subject), sorted([
++                f"{subject}:maxproc:deny=100",
++                f"{subject}:memoryuse:sigkill=134217728",
++                f"{subject}:pcpu:deny=50",
++            ]))
++            # cpu-only resize; the memory change above was persisted
++            ret = self.update({"cpu": {"quota": 150000, "period": 100000}, "memory": {}})
++            self.assertEqual(ret.returncode, 0, ret.stderr)
++            self.assertEqual(rctl_rules(subject), sorted([
++                f"{subject}:maxproc:deny=100",
++                f"{subject}:memoryuse:sigkill=134217728",
++                f"{subject}:pcpu:deny=150",
++            ]))
++            # below current usage: refused, rules unchanged (racctd samples
++            # memoryuse once per second, so wait for a sample first)
++            time.sleep(1.5)
++            ret = self.update({"memory": {"limit": 4096}})
++            self.assertNotEqual(ret.returncode, 0, rctl_rules(subject))
++            self.assertIn("below the container's current usage", ret.stderr)
++            self.assertIn(f"{subject}:memoryuse:sigkill=134217728", rctl_rules(subject))
++            self.start()
++            os.waitpid(pid, os.WEXITED)
++            stdout.close()
++            stderr.close()
++            # stopped containers can't be updated
++            ret = self.update({"memory": {"limit": 256 << 20}})
++            self.assertNotEqual(ret.returncode, 0)
++            self.delete()
++        self.assertEqual(rctl_rules(subject), [])
++
+     @unittest.skipUnless(racct_enabled(), "needs kern.racct.enable=1")
+     def test_resources_memory_kill(self):
+         # A container whose resident memory exceeds memory.limit is killed
+-- 
+2.54.0 (Apple Git-157)
+

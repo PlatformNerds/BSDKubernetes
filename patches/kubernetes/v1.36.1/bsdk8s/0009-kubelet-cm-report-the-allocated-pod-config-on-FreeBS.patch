@@ -1,0 +1,171 @@
+From d3558007a29a0536ddaf3c8005770af19cad9767 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 21:48:53 -0700
+Subject: [PATCH 9/9] kubelet/cm: report the allocated pod config on FreeBSD
+ instead of nil
+
+doPodResizeAction dereferences the pod-level config returned by
+GetPodCgroupConfig (on Linux it is always read from the pod cgroup), so
+returning nil crashed the kubelet on the first resize. Report what the
+pod's allocated resources imply (unlimited memory / quota -1 when there is
+no limit), so the kubelet sees no pod-level change and only resizes the
+containers. Test.
+---
+ pkg/kubelet/cm/container_manager_freebsd.go   | 41 ++++++++--
+ .../cm/container_manager_freebsd_test.go      | 74 +++++++++++++++++++
+ 2 files changed, 109 insertions(+), 6 deletions(-)
+ create mode 100644 pkg/kubelet/cm/container_manager_freebsd_test.go
+
+diff --git a/pkg/kubelet/cm/container_manager_freebsd.go b/pkg/kubelet/cm/container_manager_freebsd.go
+index 3750a73aef7..1833265fabf 100644
+--- a/pkg/kubelet/cm/container_manager_freebsd.go
++++ b/pkg/kubelet/cm/container_manager_freebsd.go
+@@ -24,6 +24,7 @@ package cm
+ import (
+ 	"context"
+ 	"fmt"
++	"math"
+ 
+ 	"k8s.io/klog/v2"
+ 	"k8s.io/mount-utils"
+@@ -37,6 +38,7 @@ import (
+ 	internalapi "k8s.io/cri-api/pkg/apis"
+ 	pluginwatcherapi "k8s.io/kubelet/pkg/apis/pluginregistration/v1"
+ 	podresourcesapi "k8s.io/kubelet/pkg/apis/podresources/v1"
++	kubeletconfig "k8s.io/kubernetes/pkg/kubelet/apis/config"
+ 	"k8s.io/kubernetes/pkg/kubelet/cadvisor"
+ 	"k8s.io/kubernetes/pkg/kubelet/cm/admission"
+ 	"k8s.io/kubernetes/pkg/kubelet/cm/cpumanager"
+@@ -199,16 +201,43 @@ func (cm *containerManagerImpl) NewPodContainerManager() PodContainerManager {
+ }
+ 
+ // podContainerManagerFreeBSD: FreeBSD has no pod cgroup. Container limits are
+-// rctl rules on each container's jail (set by the runtime), so for in-place
+-// resize the pod-level config is reported as unknown (nil, like the Linux
+-// no-op manager without cgroups-per-QOS) and setting it is a no-op; the
+-// kubelet then resizes the containers through UpdateContainerResources.
++// rctl rules on each container's jail (set by the runtime) and nothing
++// enforces pod-level limits, so for in-place resize the pod's current
++// pod-level config is reported as what its allocated resources imply (no
++// limit: unlimited memory, quota -1, like an unlimited cgroup), and setting it
++// is a no-op. The kubelet then sees no pod-level change to make and resizes
++// the containers through UpdateContainerResources. (The resize code
++// dereferences these values, so they must not be nil.)
+ type podContainerManagerFreeBSD struct {
+ 	podContainerManagerStub
+ }
+ 
+-func (m *podContainerManagerFreeBSD) GetPodCgroupConfig(_ *v1.Pod, _ v1.ResourceName) (*ResourceConfig, error) {
+-	return nil, nil
++func (m *podContainerManagerFreeBSD) GetPodCgroupConfig(pod *v1.Pod, resourceName v1.ResourceName) (*ResourceConfig, error) {
++	rc := ResourceConfigForPod(pod, true, QuotaPeriod, false, kubeletconfig.NoneMemoryReservationPolicy)
++	if rc == nil {
++		rc = &ResourceConfig{}
++	}
++	switch resourceName {
++	case v1.ResourceMemory:
++		memory := int64(math.MaxInt64)
++		if rc.Memory != nil {
++			memory = *rc.Memory
++		}
++		return &ResourceConfig{Memory: &memory}, nil
++	case v1.ResourceCPU:
++		quota, period, shares := int64(-1), uint64(QuotaPeriod), uint64(MinShares)
++		if rc.CPUQuota != nil {
++			quota = *rc.CPUQuota
++		}
++		if rc.CPUPeriod != nil {
++			period = *rc.CPUPeriod
++		}
++		if rc.CPUShares != nil {
++			shares = *rc.CPUShares
++		}
++		return &ResourceConfig{CPUQuota: &quota, CPUPeriod: &period, CPUShares: &shares}, nil
++	}
++	return nil, fmt.Errorf("unsupported pod resource %q", resourceName)
+ }
+ 
+ func (m *podContainerManagerFreeBSD) SetPodCgroupConfig(_ klog.Logger, _ *v1.Pod, _ *ResourceConfig) error {
+diff --git a/pkg/kubelet/cm/container_manager_freebsd_test.go b/pkg/kubelet/cm/container_manager_freebsd_test.go
+new file mode 100644
+index 00000000000..fa98e427ab3
+--- /dev/null
++++ b/pkg/kubelet/cm/container_manager_freebsd_test.go
+@@ -0,0 +1,74 @@
++//go:build freebsd
++
++/*
++Copyright 2026 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package cm
++
++import (
++	"math"
++	"testing"
++
++	v1 "k8s.io/api/core/v1"
++	"k8s.io/apimachinery/pkg/api/resource"
++)
++
++// In-place resize dereferences the pod-level config, so it must always be
++// fully populated, and it must equal what the allocated pod implies (so the
++// kubelet only resizes containers).
++func TestFreeBSDPodContainerManagerGetPodCgroupConfig(t *testing.T) {
++	pcm := &podContainerManagerFreeBSD{}
++	res := func(cpu, mem string) v1.ResourceList {
++		rl := v1.ResourceList{}
++		if cpu != "" {
++			rl[v1.ResourceCPU] = resource.MustParse(cpu)
++		}
++		if mem != "" {
++			rl[v1.ResourceMemory] = resource.MustParse(mem)
++		}
++		return rl
++	}
++	pod := func(req, lim v1.ResourceList) *v1.Pod {
++		return &v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{{Name: "c", Resources: v1.ResourceRequirements{Requests: req, Limits: lim}}}}}
++	}
++	for _, tc := range []struct {
++		name               string
++		pod                *v1.Pod
++		wantMem, wantQuota int64
++		wantShares         uint64
++	}{
++		{"limited", pod(res("100m", "64Mi"), res("200m", "128Mi")), 128 << 20, 20000, 102},
++		{"no limits", pod(res("250m", ""), nil), math.MaxInt64, -1, 256},
++		{"best effort", pod(nil, nil), math.MaxInt64, -1, MinShares},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			mem, err := pcm.GetPodCgroupConfig(tc.pod, v1.ResourceMemory)
++			if err != nil || mem == nil || mem.Memory == nil {
++				t.Fatalf("memory config: %+v, %v", mem, err)
++			}
++			if *mem.Memory != tc.wantMem {
++				t.Errorf("memory = %d, want %d", *mem.Memory, tc.wantMem)
++			}
++			cpu, err := pcm.GetPodCgroupConfig(tc.pod, v1.ResourceCPU)
++			if err != nil || cpu == nil || cpu.CPUQuota == nil || cpu.CPUShares == nil || cpu.CPUPeriod == nil {
++				t.Fatalf("cpu config: %+v, %v", cpu, err)
++			}
++			if *cpu.CPUQuota != tc.wantQuota || *cpu.CPUShares != tc.wantShares {
++				t.Errorf("cpu quota/shares = %d/%d, want %d/%d", *cpu.CPUQuota, *cpu.CPUShares, tc.wantQuota, tc.wantShares)
++			}
++		})
++	}
++}
+-- 
+2.54.0 (Apple Git-157)
+

@@ -39,7 +39,7 @@ one from the same client **to the client's own address**. The cause is `pf_creat
 only for inbound packets; for outbound ones it's the (unchanged) source.
 
 Fix: choose `didx` for redirections and `sidx` for NAT. The commit is on `PlatformNerds/freebsd-src`, branches
-`bsdk8s/pf-sticky-rdr-out` (main) and `-15.1` (patch `freebsd-src/0001`, upstream candidate). Inbound rdr and
+`bsdk8s/pf-sticky-rdr-out` (main) and `-15.1` (patch `freebsd-src/0002`, upstream candidate). Inbound rdr and
 outbound nat behave exactly as before.
 
 Verified on node 2 with a rebuilt `pf.ko`. Before: 1 of 6 DNS queries answered, source node `client -> client`.

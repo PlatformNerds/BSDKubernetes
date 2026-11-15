@@ -142,10 +142,21 @@ pod filling a tmpfs emptyDir, behind a kill switch that deletes the pod if free 
 
 The demo also reserves headroom: `systemReserved` 1Gi, `evictionHard` 500Mi, ARC capped at 25% of RAM.
 
-**Remaining gap:** tmpfs isn't charged to the pod that wrote it. The eviction event said the pod was "using
-4616Ki", since per-pod memory is racct RSS of its jails. With several BestEffort pods, the kubelet may evict by
-the wrong ranking. Fix ideas: charge a pod's emptyDir tmpfs usage to it in the CRI-O/kubelet stats, or rctl
-accounting for tmpfs (kernel).
+**tmpfs charged to its pod, and the ZFS cache counted as used (2026-11-16)** (`cri-o/0007`, `bsdk8s/0017`):
+
+| Test | Result | Log |
+|---|---|---|
+| 4: `hog` (tmpfs fill) vs `bystander` (300 MB RSS) | **Failed.** CRI-O now charged `hog` correctly (6.9 GB vs 303 MB), but no eviction: the ARC stayed at 2.5 GB with its target unchanged while free fell to 290 MB, and "ARC above its minimum" was counted as available. Kill switch. | `conformance/eviction-test4-arc-not-reclaimed.log` |
+| 5: same, ARC counted as used | **Right victim.** "available" tracked free within ~2 MB. At 487 MB available `hog` was evicted; `bystander` kept running; free back to 7 GB. | `conformance/eviction-test5-right-victim.log` |
+
+Details:
+- **CRI-O charging rule:** CRI-O adds a pod's kubelet volume mounts that are tmpfs mount points to its sandbox
+  working set, each file system once. Host tmpfs via hostPath isn't charged.
+- **Tradeoff:** counting the ARC as used means evictions start earlier on hosts with a large cache. Hence the demo
+  caps the ARC at 25% of RAM.
+- **What test 4 suggests about the run-6 hang:** a node full of tmpfs, with an ARC that doesn't shrink and
+  "available" overstated, is a plausible mechanism.
+
 
 ## Pod-level limits (implemented and verified 2026-11-16)
 

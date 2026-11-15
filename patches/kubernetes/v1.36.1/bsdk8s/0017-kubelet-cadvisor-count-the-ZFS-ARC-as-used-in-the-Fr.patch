@@ -1,0 +1,120 @@
+From fdc878af31da83727769c1875b74a8733ba58d48 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 16:53:41 -0700
+Subject: [PATCH] kubelet/cadvisor: count the ZFS ARC as used in the FreeBSD
+ node working set
+
+The ARC above its minimum was counted as available, on the assumption it
+shrinks under memory pressure. Measured on a node filling a memory
+emptyDir: the ARC stayed at 2.5 GB with its target unchanged while free
+memory fell to 290 MB, so the kubelet saw ~2.4 GB available and never
+evicted (a kill switch had to delete the pod). Count it as used; cap it
+with vfs.zfs.arc_max instead (the demo caps it at a quarter of RAM). Tests
+updated with the measured case.
+---
+ pkg/kubelet/cadvisor/cadvisor_freebsd.go      | 25 ++++++++++---------
+ pkg/kubelet/cadvisor/cadvisor_freebsd_test.go | 21 ++++++++--------
+ 2 files changed, 24 insertions(+), 22 deletions(-)
+
+diff --git a/pkg/kubelet/cadvisor/cadvisor_freebsd.go b/pkg/kubelet/cadvisor/cadvisor_freebsd.go
+index c3953329d09..b1c7a5da5be 100644
+--- a/pkg/kubelet/cadvisor/cadvisor_freebsd.go
++++ b/pkg/kubelet/cadvisor/cadvisor_freebsd.go
+@@ -194,11 +194,15 @@ func getMemInfo() (int64, int64, error) {
+ // kernel memory, so the kubelet saw memory as nearly free until the host ran
+ // out, and memory eviction never triggered. Like Linux (usage minus inactive
+ // file pages), count what the kernel can reclaim quickly as available: free
+-// pages, inactive pages and the part of the ARC above its minimum size. But
+-// FreeBSD's inactive queue also holds tmpfs pages, which can't be reclaimed
+-// without swap: filling a tmpfs on a 12 GB node made "available" rise to 5 GB
+-// while 330 MB were free. So inactive pages only count as reclaimable beyond
+-// what tmpfs holds (conservative: tmpfs pages still active are subtracted too).
++// pages and inactive pages. But FreeBSD's inactive queue also holds tmpfs
++// pages, which can't be reclaimed without swap: filling a tmpfs on a 12 GB
++// node made "available" rise to 5 GB while 330 MB were free. So inactive
++// pages only count as reclaimable beyond what tmpfs holds (conservative:
++// tmpfs pages still active are subtracted too). The ZFS ARC counts as used:
++// it is supposed to shrink under pressure, but measured on a node filling a
++// tmpfs it stayed at 2.5 GB (its target unchanged) while free memory fell to
++// 290 MB, so counting it as available hid the pressure from eviction. Cap it
++// (vfs.zfs.arc_max) instead.
+ func nodeMemory(physmem uint64) (workingSet, usage uint64, err error) {
+ 	pagesize := uint64(unix.Getpagesize())
+ 	var free, inactive uint32
+@@ -208,14 +212,11 @@ func nodeMemory(physmem uint64) (workingSet, usage uint64, err error) {
+ 	if inactive, err = unix.SysctlUint32("vm.stats.vm.v_inactive_count"); err != nil {
+ 		return 0, 0, err
+ 	}
+-	// No ZFS loaded: no ARC.
+-	arcSize, _ := unix.SysctlUint64("kstat.zfs.misc.arcstats.size")
+-	arcMin, _ := unix.SysctlUint64("kstat.zfs.misc.arcstats.c_min")
+ 	tmpfs, err := tmpfsUsed()
+ 	if err != nil {
+ 		return 0, 0, err
+ 	}
+-	workingSet, usage = nodeWorkingSet(physmem, uint64(free)*pagesize, uint64(inactive)*pagesize, tmpfs, arcSize, arcMin)
++	workingSet, usage = nodeWorkingSet(physmem, uint64(free)*pagesize, uint64(inactive)*pagesize, tmpfs)
+ 	return workingSet, usage, nil
+ }
+ 
+@@ -250,8 +251,8 @@ func tmpfsUsed() (uint64, error) {
+ }
+ 
+ // nodeWorkingSet: usage is everything not free; the working set additionally
+-// excludes inactive pages not taken by tmpfs, and the reclaimable part of the ARC.
+-func nodeWorkingSet(physmem, free, inactive, tmpfs, arcSize, arcMin uint64) (workingSet, usage uint64) {
++// excludes inactive pages not taken by tmpfs.
++func nodeWorkingSet(physmem, free, inactive, tmpfs uint64) (workingSet, usage uint64) {
+ 	sub := func(a, b uint64) uint64 {
+ 		if b > a {
+ 			return 0
+@@ -259,7 +260,7 @@ func nodeWorkingSet(physmem, free, inactive, tmpfs, arcSize, arcMin uint64) (wor
+ 		return a - b
+ 	}
+ 	usage = sub(physmem, free)
+-	workingSet = sub(sub(usage, sub(inactive, tmpfs)), sub(arcSize, arcMin))
++	workingSet = sub(usage, sub(inactive, tmpfs))
+ 	return workingSet, usage
+ }
+ 
+diff --git a/pkg/kubelet/cadvisor/cadvisor_freebsd_test.go b/pkg/kubelet/cadvisor/cadvisor_freebsd_test.go
+index 98c516cc5e0..0dd4fdc033b 100644
+--- a/pkg/kubelet/cadvisor/cadvisor_freebsd_test.go
++++ b/pkg/kubelet/cadvisor/cadvisor_freebsd_test.go
+@@ -31,22 +31,23 @@ const mb = 1 << 20
+ 
+ func TestNodeWorkingSet(t *testing.T) {
+ 	for _, tc := range []struct {
+-		name                                        string
+-		physmem, free, inactive, tmpfs, arc, arcMin uint64
+-		wantWS, wantUsage                           uint64
++		name                           string
++		physmem, free, inactive, tmpfs uint64
++		wantWS, wantUsage              uint64
+ 	}{
+ 		// measured on a 12 GB dev VM: racct memoryuse said 790 MB
+-		{"idle node", 12255 * mb, 10013 * mb, 449 * mb, 0, 842 * mb, 382 * mb, 1333 * mb, 2242 * mb},
+-		{"ARC below its minimum is not reclaimable", 8192 * mb, 1024 * mb, 0, 0, 256 * mb, 512 * mb, 7168 * mb, 7168 * mb},
+-		{"no ZFS", 4096 * mb, 1024 * mb, 1024 * mb, 0, 0, 0, 2048 * mb, 3072 * mb},
+-		{"never negative", 1024 * mb, 512 * mb, 900 * mb, 0, 0, 0, 0, 512 * mb},
++		{"idle node", 12255 * mb, 10013 * mb, 449 * mb, 0, 1793 * mb, 2242 * mb},
++		{"never negative", 1024 * mb, 512 * mb, 900 * mb, 0, 0, 512 * mb},
+ 		// measured: a 6.6 GB tmpfs fill, pages moving to the inactive queue
+ 		// (free 326 MB); counting them as reclaimable claimed ~5 GB available
+-		{"tmpfs in inactive is not reclaimable", 12255 * mb, 326 * mb, 4760 * mb, 6656 * mb, 1100 * mb, 382 * mb, 11211 * mb, 11929 * mb},
+-		{"inactive beyond tmpfs is reclaimable", 12255 * mb, 326 * mb, 4760 * mb, 1024 * mb, 1100 * mb, 382 * mb, 7475 * mb, 11929 * mb},
++		{"tmpfs in inactive is not reclaimable", 12255 * mb, 326 * mb, 4760 * mb, 6656 * mb, 11929 * mb, 11929 * mb},
++		{"inactive beyond tmpfs is reclaimable", 12255 * mb, 326 * mb, 4760 * mb, 1024 * mb, 8193 * mb, 11929 * mb},
++		// measured: ARC at 2.5 GB didn't shrink as free fell to 290 MB; it
++		// counts as used (it's in usage, nothing subtracts it)
++		{"ARC counts as used", 12255 * mb, 293 * mb, 0, 6917 * mb, 11962 * mb, 11962 * mb},
+ 	} {
+ 		t.Run(tc.name, func(t *testing.T) {
+-			ws, usage := nodeWorkingSet(tc.physmem, tc.free, tc.inactive, tc.tmpfs, tc.arc, tc.arcMin)
++			ws, usage := nodeWorkingSet(tc.physmem, tc.free, tc.inactive, tc.tmpfs)
+ 			if ws != tc.wantWS || usage != tc.wantUsage {
+ 				t.Errorf("workingSet/usage = %d/%d MB, want %d/%d MB", ws/mb, usage/mb, tc.wantWS/mb, tc.wantUsage/mb)
+ 			}
+-- 
+2.54.0 (Apple Git-157)
+

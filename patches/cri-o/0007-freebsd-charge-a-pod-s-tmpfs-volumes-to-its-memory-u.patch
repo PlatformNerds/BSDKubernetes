@@ -1,0 +1,188 @@
+From c7edec8d0c1750ab26f923699857af885f36c4da Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 15:55:26 -0700
+Subject: [PATCH] freebsd: charge a pod's tmpfs volumes to its memory usage
+
+On Linux tmpfs pages are charged to the cgroup of whoever wrote them, so a
+pod filling an emptyDir (medium: Memory) shows that memory as its own and
+the kubelet evicts it first under memory pressure. racct doesn't count
+tmpfs at all: a pod holding 10 GB in a memory emptyDir showed as using 4 MB
+('Container c was using 4616Ki' in the eviction event), so other pods could
+be evicted instead.
+
+Add the pod's tmpfs volumes to the sandbox's working set and usage: kubelet
+volume mounts (source under .../volumes/kubernetes.io~<plugin>/) that are
+tmpfs mount points, each file system once (shared between containers or
+mounted with subPath), so host tmpfs shared through hostPath isn't charged.
+Test.
+---
+ .../lib/statsserver/stats_server_freebsd.go   |  1 +
+ internal/lib/statsserver/tmpfs_freebsd.go     | 89 +++++++++++++++++++
+ .../lib/statsserver/tmpfs_freebsd_test.go     | 47 ++++++++++
+ 3 files changed, 137 insertions(+)
+ create mode 100644 internal/lib/statsserver/tmpfs_freebsd.go
+ create mode 100644 internal/lib/statsserver/tmpfs_freebsd_test.go
+
+diff --git a/internal/lib/statsserver/stats_server_freebsd.go b/internal/lib/statsserver/stats_server_freebsd.go
+index 402e7cece..26ac76a19 100644
+--- a/internal/lib/statsserver/stats_server_freebsd.go
++++ b/internal/lib/statsserver/stats_server_freebsd.go
+@@ -49,6 +49,7 @@ func (ss *StatsServer) updateSandbox(sb *sandbox.Sandbox) *types.PodSandboxStats
+ 	if err := jail.PopulateSandboxStats(sb.ID(), sandboxStats); err != nil {
+ 		logrus.Errorf("Error getting sandbox stats %s: %v", sb.ID(), err)
+ 	}
++	addPodTmpfsMemory(sb, sandboxStats)
+ 
+ 	// Network metrics are collected at pod level only.
+ 	if slices.Contains(ss.Config().EnabledPodMetrics(), config.NetworkMetrics) {
+diff --git a/internal/lib/statsserver/tmpfs_freebsd.go b/internal/lib/statsserver/tmpfs_freebsd.go
+new file mode 100644
+index 000000000..a9e3e6333
+--- /dev/null
++++ b/internal/lib/statsserver/tmpfs_freebsd.go
+@@ -0,0 +1,89 @@
++package statsserver
++
++import (
++	"strings"
++
++	"golang.org/x/sys/unix"
++	types "k8s.io/cri-api/pkg/apis/runtime/v1"
++
++	"github.com/cri-o/cri-o/internal/lib/sandbox"
++)
++
++// kubeletVolumeDir is in the host path of every volume the kubelet sets up
++// for a pod (emptyDir, secret, configMap, projected, ...).
++const kubeletVolumeDir = "/volumes/kubernetes.io~"
++
++// tmpfsMount is what podTmpfsBytes needs to know about a mount source.
++type tmpfsMount struct {
++	fsid       [2]int32
++	mountPoint string
++	fsType     string
++	usedBytes  uint64
++}
++
++// podTmpfsBytes returns the memory held by the pod's tmpfs volumes: on Linux
++// tmpfs pages are charged to the cgroup of whoever wrote them, so the pod's
++// memory usage includes them; on FreeBSD racct doesn't count tmpfs at all,
++// so the kubelet saw a pod filling an emptyDir (medium: Memory) as nearly
++// idle and, under memory pressure, could evict other pods first.
++//
++// Only kubelet volume mounts (source under .../volumes/kubernetes.io~<plugin>/)
++// that are tmpfs mount points themselves count, each file system once (a
++// volume may be mounted into several containers, or with subPath), so host
++// tmpfs file systems shared through hostPath aren't charged to the pod.
++func podTmpfsBytes(sources []string, statfs func(string) (tmpfsMount, error)) uint64 {
++	seen := map[[2]int32]bool{}
++	var total uint64
++	for _, src := range sources {
++		if !strings.Contains(src, kubeletVolumeDir) {
++			continue
++		}
++		m, err := statfs(src)
++		if err != nil || m.fsType != "tmpfs" || m.mountPoint != strings.TrimRight(src, "/") || seen[m.fsid] {
++			continue
++		}
++		seen[m.fsid] = true
++		total += m.usedBytes
++	}
++	return total
++}
++
++func statfsTmpfs(path string) (tmpfsMount, error) {
++	var st unix.Statfs_t
++	if err := unix.Statfs(path, &st); err != nil {
++		return tmpfsMount{}, err
++	}
++	m := tmpfsMount{
++		fsid:       st.Fsid.Val,
++		mountPoint: unix.ByteSliceToString(st.Mntonname[:]),
++		fsType:     unix.ByteSliceToString(st.Fstypename[:]),
++	}
++	if st.Blocks > st.Bfree {
++		m.usedBytes = (st.Blocks - st.Bfree) * st.Bsize
++	}
++	return m, nil
++}
++
++// addPodTmpfsMemory charges the pod's tmpfs volumes to its memory usage.
++func addPodTmpfsMemory(sb *sandbox.Sandbox, stats *types.PodSandboxStats) {
++	mem := stats.GetLinux().GetMemory()
++	if mem == nil {
++		return
++	}
++	var sources []string
++	for _, c := range sb.Containers().List() {
++		spec := c.Spec()
++		for _, m := range spec.Mounts {
++			sources = append(sources, m.Source)
++		}
++	}
++	tmpfs := podTmpfsBytes(sources, statfsTmpfs)
++	if tmpfs == 0 {
++		return
++	}
++	for _, v := range []*types.UInt64Value{mem.WorkingSetBytes, mem.UsageBytes} {
++		if v != nil {
++			v.Value += tmpfs
++		}
++	}
++}
+diff --git a/internal/lib/statsserver/tmpfs_freebsd_test.go b/internal/lib/statsserver/tmpfs_freebsd_test.go
+new file mode 100644
+index 000000000..e2d099809
+--- /dev/null
++++ b/internal/lib/statsserver/tmpfs_freebsd_test.go
+@@ -0,0 +1,47 @@
++package statsserver
++
++import (
++	"errors"
++	"testing"
++)
++
++func TestPodTmpfsBytes(t *testing.T) {
++	const mb = 1 << 20
++	vol := "/var/db/kubelet/pods/u1/volumes/kubernetes.io~empty-dir/fill"
++	tok := "/var/db/kubelet/pods/u1/volumes/kubernetes.io~projected/kube-api-access-x"
++	fake := map[string]tmpfsMount{
++		vol:          {fsid: [2]int32{1, 1}, mountPoint: vol, fsType: "tmpfs", usedBytes: 300 * mb},
++		vol + "/sub": {fsid: [2]int32{1, 1}, mountPoint: vol, fsType: "tmpfs", usedBytes: 300 * mb},
++		tok:          {fsid: [2]int32{2, 2}, mountPoint: tok, fsType: "tmpfs", usedBytes: 1 * mb},
++		"/dev/shm":   {fsid: [2]int32{3, 3}, mountPoint: "/dev/shm", fsType: "tmpfs", usedBytes: 50 * mb},
++		"/var/db/kubelet/pods/u1/volumes/kubernetes.io~empty-dir/disk": {fsid: [2]int32{4, 4}, mountPoint: "/", fsType: "zfs", usedBytes: 9000 * mb},
++	}
++	statfs := func(p string) (tmpfsMount, error) {
++		m, ok := fake[p]
++		if !ok {
++			return tmpfsMount{}, errors.New("not found")
++		}
++		return m, nil
++	}
++	for _, tc := range []struct {
++		name    string
++		sources []string
++		want    uint64
++	}{
++		{"none", nil, 0},
++		{"memory emptyDir", []string{vol}, 300 * mb},
++		{"same volume in two containers", []string{vol, vol}, 300 * mb},
++		// a subPath source isn't the mount point; the volume itself is counted once
++		{"subPath of the same volume", []string{vol + "/sub", vol}, 300 * mb},
++		{"plus service account token", []string{vol, tok}, 301 * mb},
++		{"host tmpfs via hostPath is not charged", []string{"/dev/shm"}, 0},
++		{"disk-backed emptyDir is not memory", []string{"/var/db/kubelet/pods/u1/volumes/kubernetes.io~empty-dir/disk"}, 0},
++		{"unreadable source ignored", []string{"/var/db/kubelet/pods/u1/volumes/kubernetes.io~empty-dir/gone"}, 0},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			if got := podTmpfsBytes(tc.sources, statfs); got != tc.want {
++				t.Errorf("got %d MB, want %d MB", got/mb, tc.want/mb)
++			}
++		})
++	}
++}
+-- 
+2.54.0 (Apple Git-157)
+

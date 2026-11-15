@@ -119,6 +119,34 @@ What it took (each layer refused it before):
   reason. Making them count would need a FreeBSD verification path in the e2e framework (e.g. `rctl` from the
   node), an upstream test change.
 
+## Node memory accounting and eviction (fixed and verified 2026-11-15)
+
+The kubelet never evicted on FreeBSD, because it couldn't see memory pressure. Its node working set came from
+racct `memoryuse` for jail 0, which is process RSS only and leaves out:
+- the ZFS ARC;
+- tmpfs (emptyDir `medium: Memory`, projected service-account tokens);
+- other wired kernel memory.
+
+On an idle 12 GB node it reported 790 MB used when 2.2 GB was. This is the prime suspect for the node-1 hang in
+conformance run 6's first attempt (research/07).
+
+The fix (`PlatformNerds/kubernetes` `23c18881738` + `e917379c18d`, patches `bsdk8s/0011-0012`): working set = (physmem
+− free) − inactive pages not held by tmpfs − ARC above its minimum. It took three tests on node 2, each a BestEffort
+pod filling a tmpfs emptyDir, behind a kill switch that deletes the pod if free memory stays under 400 MB:
+
+| Test | Result | Log |
+|---|---|---|
+| 1: inactive counted as reclaimable | **Failed.** tmpfs pages moved to the inactive queue, and "available" *rose* to 5 GB while 326 MB were free. Kill switch deleted the pod. | `conformance/eviction-test1-inactive-bug.log` |
+| 2: subtract tmpfs, read via `getfsstat(MNT_NOWAIT)` | **Failed.** Those are statistics cached at mount time, which tmpfs never refreshes (`df`: "stats possibly stale"), so tmpfs read as 0. | `conformance/eviction-test2-stale-statfs.log` |
+| 3: `statfs` each tmpfs mount | **Evicted.** "available" tracked free memory within a few MB. At 448 MB available (threshold 500Mi) the kubelet logged `EvictionThresholdMet` and evicted the pod. Free never went below 421 MB. | `conformance/eviction-test3-evicted.log` |
+
+The demo also reserves headroom: `systemReserved` 1Gi, `evictionHard` 500Mi, ARC capped at 25% of RAM.
+
+**Remaining gap:** tmpfs isn't charged to the pod that wrote it. The eviction event said the pod was "using
+4616Ki", since per-pod memory is racct RSS of its jails. With several BestEffort pods, the kubelet may evict by
+the wrong ranking. Fix ideas: charge a pod's emptyDir tmpfs usage to it in the CRI-O/kubelet stats, or rctl
+accounting for tmpfs (kernel).
+
 ## Upstream candidates (fork-first, then upstream; see docs/FORKS.md)
 
 1. ocijail `jail: fix config::set type validation`: **opened as [dfr/ocijail#39](https://github.com/dfr/ocijail/pull/39)** (2026-11-14).

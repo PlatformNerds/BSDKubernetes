@@ -1,0 +1,188 @@
+From e917379c18dbb6f1972b3649a49100ec31a65cb3 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 12:05:47 -0700
+Subject: [PATCH 12/12] kubelet/cadvisor: don't count tmpfs pages as
+ reclaimable in the FreeBSD node working set
+
+FreeBSD's inactive queue also holds tmpfs pages, which can't be reclaimed
+without swap. Filling an emptyDir (medium: Memory) on a 12 GB node showed
+it: as the pages went inactive, the computed 'available' rose to ~5 GB
+while 330 MB were free, and no eviction happened. Count inactive pages as
+reclaimable only beyond the bytes used on tmpfs mounts. Usage comes from
+statfs on each tmpfs mount: getfsstat(MNT_NOWAIT) returns the statistics
+cached at mount time, which tmpfs never refreshes.
+
+Verified on a node: filling a tmpfs emptyDir at 25 MB/s, 'available'
+tracked free memory to within a few MB, the kubelet reported
+EvictionThresholdMet and evicted the pod at 448 MB available (threshold
+500Mi); free memory never went below 421 MB. Live test (as root) that
+tmpfsUsed sees a 64 MB write.
+---
+ pkg/kubelet/cadvisor/cadvisor_freebsd.go      | 56 ++++++++++++++++---
+ pkg/kubelet/cadvisor/cadvisor_freebsd_test.go | 50 ++++++++++++++---
+ 2 files changed, 89 insertions(+), 17 deletions(-)
+
+diff --git a/pkg/kubelet/cadvisor/cadvisor_freebsd.go b/pkg/kubelet/cadvisor/cadvisor_freebsd.go
+index 0e6acf052ad..c3953329d09 100644
+--- a/pkg/kubelet/cadvisor/cadvisor_freebsd.go
++++ b/pkg/kubelet/cadvisor/cadvisor_freebsd.go
+@@ -190,11 +190,15 @@ func getMemInfo() (int64, int64, error) {
+ 
+ // nodeMemory returns the node's memory working set and usage. racct's
+ // memoryuse for jail 0 only sums process RSS: it leaves out the ZFS ARC, tmpfs
+-// (emptyDir medium Memory), and other wired kernel memory, so the kubelet saw
+-// memory as nearly free until the host ran out, and memory eviction never
+-// triggered. Like Linux (usage minus inactive file pages), count what the
+-// kernel can reclaim quickly as available: free and inactive pages, and the
+-// part of the ARC above its minimum size.
++// (emptyDir medium Memory, projected service account tokens), and other wired
++// kernel memory, so the kubelet saw memory as nearly free until the host ran
++// out, and memory eviction never triggered. Like Linux (usage minus inactive
++// file pages), count what the kernel can reclaim quickly as available: free
++// pages, inactive pages and the part of the ARC above its minimum size. But
++// FreeBSD's inactive queue also holds tmpfs pages, which can't be reclaimed
++// without swap: filling a tmpfs on a 12 GB node made "available" rise to 5 GB
++// while 330 MB were free. So inactive pages only count as reclaimable beyond
++// what tmpfs holds (conservative: tmpfs pages still active are subtracted too).
+ func nodeMemory(physmem uint64) (workingSet, usage uint64, err error) {
+ 	pagesize := uint64(unix.Getpagesize())
+ 	var free, inactive uint32
+@@ -207,13 +211,47 @@ func nodeMemory(physmem uint64) (workingSet, usage uint64, err error) {
+ 	// No ZFS loaded: no ARC.
+ 	arcSize, _ := unix.SysctlUint64("kstat.zfs.misc.arcstats.size")
+ 	arcMin, _ := unix.SysctlUint64("kstat.zfs.misc.arcstats.c_min")
+-	workingSet, usage = nodeWorkingSet(physmem, uint64(free)*pagesize, uint64(inactive)*pagesize, arcSize, arcMin)
++	tmpfs, err := tmpfsUsed()
++	if err != nil {
++		return 0, 0, err
++	}
++	workingSet, usage = nodeWorkingSet(physmem, uint64(free)*pagesize, uint64(inactive)*pagesize, tmpfs, arcSize, arcMin)
+ 	return workingSet, usage, nil
+ }
+ 
++// tmpfsUsed returns the bytes in use on all tmpfs mounts.
++func tmpfsUsed() (uint64, error) {
++	n, err := unix.Getfsstat(nil, unix.MNT_NOWAIT)
++	if err != nil {
++		return 0, err
++	}
++	// Mounts can appear between the two calls: leave room.
++	buf := make([]unix.Statfs_t, n+16)
++	if n, err = unix.Getfsstat(buf, unix.MNT_NOWAIT); err != nil {
++		return 0, err
++	}
++	var used uint64
++	for _, fs := range buf[:n] {
++		if unix.ByteSliceToString(fs.Fstypename[:]) != "tmpfs" {
++			continue
++		}
++		// MNT_NOWAIT returns the statistics cached at mount time, which
++		// tmpfs never refreshes (df: "stats possibly stale"): statfs each
++		// tmpfs mount for current numbers (tmpfs never blocks).
++		var st unix.Statfs_t
++		if err := unix.Statfs(unix.ByteSliceToString(fs.Mntonname[:]), &st); err != nil {
++			continue // unmounted meanwhile
++		}
++		if st.Blocks > uint64(st.Bfree) {
++			used += (st.Blocks - uint64(st.Bfree)) * st.Bsize
++		}
++	}
++	return used, nil
++}
++
+ // nodeWorkingSet: usage is everything not free; the working set additionally
+-// excludes inactive pages and the reclaimable part of the ARC.
+-func nodeWorkingSet(physmem, free, inactive, arcSize, arcMin uint64) (workingSet, usage uint64) {
++// excludes inactive pages not taken by tmpfs, and the reclaimable part of the ARC.
++func nodeWorkingSet(physmem, free, inactive, tmpfs, arcSize, arcMin uint64) (workingSet, usage uint64) {
+ 	sub := func(a, b uint64) uint64 {
+ 		if b > a {
+ 			return 0
+@@ -221,7 +259,7 @@ func nodeWorkingSet(physmem, free, inactive, arcSize, arcMin uint64) (workingSet
+ 		return a - b
+ 	}
+ 	usage = sub(physmem, free)
+-	workingSet = sub(sub(usage, inactive), sub(arcSize, arcMin))
++	workingSet = sub(sub(usage, sub(inactive, tmpfs)), sub(arcSize, arcMin))
+ 	return workingSet, usage
+ }
+ 
+diff --git a/pkg/kubelet/cadvisor/cadvisor_freebsd_test.go b/pkg/kubelet/cadvisor/cadvisor_freebsd_test.go
+index 6c10aca6b4e..98c516cc5e0 100644
+--- a/pkg/kubelet/cadvisor/cadvisor_freebsd_test.go
++++ b/pkg/kubelet/cadvisor/cadvisor_freebsd_test.go
+@@ -19,6 +19,9 @@ limitations under the License.
+ package cadvisor
+ 
+ import (
++	"os"
++	"os/exec"
++	"path/filepath"
+ 	"testing"
+ 
+ 	"golang.org/x/sys/unix"
+@@ -28,18 +31,22 @@ const mb = 1 << 20
+ 
+ func TestNodeWorkingSet(t *testing.T) {
+ 	for _, tc := range []struct {
+-		name                                  string
+-		physmem, free, inactive, arc, arcMin uint64
+-		wantWS, wantUsage                     uint64
++		name                                        string
++		physmem, free, inactive, tmpfs, arc, arcMin uint64
++		wantWS, wantUsage                           uint64
+ 	}{
+ 		// measured on a 12 GB dev VM: racct memoryuse said 790 MB
+-		{"idle node", 12255 * mb, 10013 * mb, 449 * mb, 842 * mb, 382 * mb, 1333 * mb, 2242 * mb},
+-		{"ARC below its minimum is not reclaimable", 8192 * mb, 1024 * mb, 0, 256 * mb, 512 * mb, 7168 * mb, 7168 * mb},
+-		{"no ZFS", 4096 * mb, 1024 * mb, 1024 * mb, 0, 0, 2048 * mb, 3072 * mb},
+-		{"never negative", 1024 * mb, 512 * mb, 900 * mb, 0, 0, 0, 512 * mb},
++		{"idle node", 12255 * mb, 10013 * mb, 449 * mb, 0, 842 * mb, 382 * mb, 1333 * mb, 2242 * mb},
++		{"ARC below its minimum is not reclaimable", 8192 * mb, 1024 * mb, 0, 0, 256 * mb, 512 * mb, 7168 * mb, 7168 * mb},
++		{"no ZFS", 4096 * mb, 1024 * mb, 1024 * mb, 0, 0, 0, 2048 * mb, 3072 * mb},
++		{"never negative", 1024 * mb, 512 * mb, 900 * mb, 0, 0, 0, 0, 512 * mb},
++		// measured: a 6.6 GB tmpfs fill, pages moving to the inactive queue
++		// (free 326 MB); counting them as reclaimable claimed ~5 GB available
++		{"tmpfs in inactive is not reclaimable", 12255 * mb, 326 * mb, 4760 * mb, 6656 * mb, 1100 * mb, 382 * mb, 11211 * mb, 11929 * mb},
++		{"inactive beyond tmpfs is reclaimable", 12255 * mb, 326 * mb, 4760 * mb, 1024 * mb, 1100 * mb, 382 * mb, 7475 * mb, 11929 * mb},
+ 	} {
+ 		t.Run(tc.name, func(t *testing.T) {
+-			ws, usage := nodeWorkingSet(tc.physmem, tc.free, tc.inactive, tc.arc, tc.arcMin)
++			ws, usage := nodeWorkingSet(tc.physmem, tc.free, tc.inactive, tc.tmpfs, tc.arc, tc.arcMin)
+ 			if ws != tc.wantWS || usage != tc.wantUsage {
+ 				t.Errorf("workingSet/usage = %d/%d MB, want %d/%d MB", ws/mb, usage/mb, tc.wantWS/mb, tc.wantUsage/mb)
+ 			}
+@@ -63,3 +70,30 @@ func TestNodeMemoryLive(t *testing.T) {
+ 	}
+ 	t.Logf("workingSet %d MB, usage %d MB, physmem %d MB", ws/mb, usage/mb, physmem/mb)
+ }
++
++// tmpfsUsed must see current tmpfs usage, not what getfsstat cached at mount
++// time. Needs root (mounts a tmpfs).
++func TestTmpfsUsedLive(t *testing.T) {
++	if unix.Geteuid() != 0 {
++		t.Skip("needs root")
++	}
++	dir := t.TempDir()
++	if out, err := exec.Command("mount", "-t", "tmpfs", "tmpfs", dir).CombinedOutput(); err != nil {
++		t.Skipf("can't mount tmpfs: %v: %s", err, out)
++	}
++	defer exec.Command("umount", dir).Run()
++	before, err := tmpfsUsed()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(dir, "f"), make([]byte, 64*mb), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	after, err := tmpfsUsed()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if after < before+60*mb {
++		t.Errorf("tmpfs usage %d MB -> %d MB after writing 64 MB", before/mb, after/mb)
++	}
++}
+-- 
+2.54.0 (Apple Git-157)
+

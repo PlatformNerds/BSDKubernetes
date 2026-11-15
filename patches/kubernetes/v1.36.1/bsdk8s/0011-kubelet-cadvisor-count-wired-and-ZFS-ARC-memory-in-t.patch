@@ -1,0 +1,162 @@
+From 23c18881738b95bc52c6aae7ca1e19425f05a71e Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 02:00:38 -0700
+Subject: [PATCH 11/12] kubelet/cadvisor: count wired and ZFS ARC memory in the
+ FreeBSD node working set
+
+The node working set was racct memoryuse for jail 0, i.e. the sum of
+process RSS. It leaves out the ZFS ARC, tmpfs (emptyDir medium Memory) and
+other wired kernel memory: on a 12 GB node it reported 790 MB while 2.2 GB
+were in use, and under load the gap grows by gigabytes, so
+memory.available stayed far above the eviction threshold while the host
+ran out of memory (a two-node conformance run livelocked the control-plane
+node).
+
+Compute it from the VM counters instead, like Linux's usage minus inactive
+file pages: usage = physmem - free; working set = usage - inactive pages -
+the ARC above its minimum size (what the ARC gives back under pressure).
+Falls back to racct if the counters can't be read. Tests for the
+arithmetic and a live sanity check.
+---
+ pkg/kubelet/cadvisor/cadvisor_freebsd.go      | 45 ++++++++++++-
+ pkg/kubelet/cadvisor/cadvisor_freebsd_test.go | 65 +++++++++++++++++++
+ 2 files changed, 109 insertions(+), 1 deletion(-)
+ create mode 100644 pkg/kubelet/cadvisor/cadvisor_freebsd_test.go
+
+diff --git a/pkg/kubelet/cadvisor/cadvisor_freebsd.go b/pkg/kubelet/cadvisor/cadvisor_freebsd.go
+index 55bf17c9122..0e6acf052ad 100644
+--- a/pkg/kubelet/cadvisor/cadvisor_freebsd.go
++++ b/pkg/kubelet/cadvisor/cadvisor_freebsd.go
+@@ -188,6 +188,43 @@ func getMemInfo() (int64, int64, error) {
+ 	return int64(physmem), pagesize * int64(total.Free), nil
+ }
+ 
++// nodeMemory returns the node's memory working set and usage. racct's
++// memoryuse for jail 0 only sums process RSS: it leaves out the ZFS ARC, tmpfs
++// (emptyDir medium Memory), and other wired kernel memory, so the kubelet saw
++// memory as nearly free until the host ran out, and memory eviction never
++// triggered. Like Linux (usage minus inactive file pages), count what the
++// kernel can reclaim quickly as available: free and inactive pages, and the
++// part of the ARC above its minimum size.
++func nodeMemory(physmem uint64) (workingSet, usage uint64, err error) {
++	pagesize := uint64(unix.Getpagesize())
++	var free, inactive uint32
++	if free, err = unix.SysctlUint32("vm.stats.vm.v_free_count"); err != nil {
++		return 0, 0, err
++	}
++	if inactive, err = unix.SysctlUint32("vm.stats.vm.v_inactive_count"); err != nil {
++		return 0, 0, err
++	}
++	// No ZFS loaded: no ARC.
++	arcSize, _ := unix.SysctlUint64("kstat.zfs.misc.arcstats.size")
++	arcMin, _ := unix.SysctlUint64("kstat.zfs.misc.arcstats.c_min")
++	workingSet, usage = nodeWorkingSet(physmem, uint64(free)*pagesize, uint64(inactive)*pagesize, arcSize, arcMin)
++	return workingSet, usage, nil
++}
++
++// nodeWorkingSet: usage is everything not free; the working set additionally
++// excludes inactive pages and the reclaimable part of the ARC.
++func nodeWorkingSet(physmem, free, inactive, arcSize, arcMin uint64) (workingSet, usage uint64) {
++	sub := func(a, b uint64) uint64 {
++		if b > a {
++			return 0
++		}
++		return a - b
++	}
++	usage = sub(physmem, free)
++	workingSet = sub(sub(usage, inactive), sub(arcSize, arcMin))
++	return workingSet, usage
++}
++
+ func createRootContainerInfo() (*cadvisorapiv2.ContainerInfo, error) {
+ 	// Jail id zero represents the host.
+ 	entries, err := getRacct("jail:0")
+@@ -218,7 +255,13 @@ func createRootContainerInfo() (*cadvisorapiv2.ContainerInfo, error) {
+ 			},
+ 		}
+ 	}
+-	if val, ok := entries["memoryuse"]; ok {
++	if ws, usage, err := nodeMemory(physmem); err == nil {
++		stats.Memory = &cadvisorapi.MemoryStats{
++			WorkingSet: ws,
++			Usage:      usage,
++		}
++	} else if val, ok := entries["memoryuse"]; ok {
++		klog.ErrorS(err, "Can't read node memory counters, falling back to process RSS (racct memoryuse)")
+ 		stats.Memory = &cadvisorapi.MemoryStats{
+ 			WorkingSet: val,
+ 		}
+diff --git a/pkg/kubelet/cadvisor/cadvisor_freebsd_test.go b/pkg/kubelet/cadvisor/cadvisor_freebsd_test.go
+new file mode 100644
+index 00000000000..6c10aca6b4e
+--- /dev/null
++++ b/pkg/kubelet/cadvisor/cadvisor_freebsd_test.go
+@@ -0,0 +1,65 @@
++//go:build freebsd
++
++/*
++Copyright 2026 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package cadvisor
++
++import (
++	"testing"
++
++	"golang.org/x/sys/unix"
++)
++
++const mb = 1 << 20
++
++func TestNodeWorkingSet(t *testing.T) {
++	for _, tc := range []struct {
++		name                                  string
++		physmem, free, inactive, arc, arcMin uint64
++		wantWS, wantUsage                     uint64
++	}{
++		// measured on a 12 GB dev VM: racct memoryuse said 790 MB
++		{"idle node", 12255 * mb, 10013 * mb, 449 * mb, 842 * mb, 382 * mb, 1333 * mb, 2242 * mb},
++		{"ARC below its minimum is not reclaimable", 8192 * mb, 1024 * mb, 0, 256 * mb, 512 * mb, 7168 * mb, 7168 * mb},
++		{"no ZFS", 4096 * mb, 1024 * mb, 1024 * mb, 0, 0, 2048 * mb, 3072 * mb},
++		{"never negative", 1024 * mb, 512 * mb, 900 * mb, 0, 0, 0, 512 * mb},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			ws, usage := nodeWorkingSet(tc.physmem, tc.free, tc.inactive, tc.arc, tc.arcMin)
++			if ws != tc.wantWS || usage != tc.wantUsage {
++				t.Errorf("workingSet/usage = %d/%d MB, want %d/%d MB", ws/mb, usage/mb, tc.wantWS/mb, tc.wantUsage/mb)
++			}
++		})
++	}
++}
++
++// On a live system the working set must cover at least the wired memory
++// (the ARC minimum and other wired kernel memory), which process RSS doesn't.
++func TestNodeMemoryLive(t *testing.T) {
++	physmem, err := unix.SysctlUint64("hw.physmem")
++	if err != nil {
++		t.Skip(err)
++	}
++	ws, usage, err := nodeMemory(physmem)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if ws == 0 || ws > usage || usage > physmem {
++		t.Errorf("implausible: workingSet %d, usage %d, physmem %d", ws, usage, physmem)
++	}
++	t.Logf("workingSet %d MB, usage %d MB, physmem %d MB", ws/mb, usage/mb, physmem/mb)
++}
+-- 
+2.54.0 (Apple Git-157)
+

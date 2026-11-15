@@ -2,6 +2,9 @@
 # FreeBSD 15.1 arm64 dev VM on Apple Silicon (QEMU + HVF), provisioned via cloud-init (nuageinit).
 #   scripts/macos-freebsd-vm.sh create   # download image, make disk + seed, first boot
 #   scripts/macos-freebsd-vm.sh start|stop|ssh [cmd...]|console
+#   scripts/macos-freebsd-vm.sh serial          # interactive serial console (works when ssh doesn't)
+#   scripts/macos-freebsd-vm.sh monitor 'info status'   # QEMU monitor command, e.g.
+#       'dump-guest-memory -z vmcore.elf' to capture a hung guest before resetting it
 #   NODE=2 scripts/macos-freebsd-vm.sh create   # more nodes for a multi-node cluster
 # Env: NODE (1) VM_DIR (~/bsdk8s/vm, ~/bsdk8s/vm-<NODE> for NODE>1) VM_CPUS (8) VM_MEM (12G)
 #      VM_DISK (80G) SSH_PORT (2221+NODE) API_PORT (6443, node 1 only)
@@ -25,6 +28,10 @@ FW=$(brew --prefix qemu)/share/qemu/edk2-aarch64-code.fd
 KEY=${KEY:-$HOME/bsdk8s/vm/id_ed25519}   # one key for all nodes
 mkdir -p "$VM_DIR"; cd "$VM_DIR"
 
+# One QEMU monitor command; prints its output.
+monitor() { [ -S monitor.sock ] || { echo "no monitor.sock (VM started by an older script?)"; return 1; }
+  printf '%s\n' "$1" | nc -U -w 2 monitor.sock | tr -d '\r' | grep -v '^QEMU .*monitor\|^(qemu)'; }
+
 ssh_vm() { ssh -q -i "$KEY" -p "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
   -o ConnectTimeout=5 bsdk8s@127.0.0.1 "$@"; }
 
@@ -42,7 +49,9 @@ start() {
     -netdev dgram,id=n1,local.type=inet,local.host=127.0.0.1,local.port=$((20000 + NODE)),remote.type=inet,remote.host=127.0.0.1,remote.port=$((20000 + PEER)) \
     -device virtio-net-pci,netdev=n1,mac=52:54:00:bd:01:$(printf %02x "$NODE") \
     -device virtio-rng-pci \
-    -display none -serial file:console.log -monitor none \
+    -display none \
+    -chardev socket,id=ser0,path=console.sock,server=on,wait=off,logfile=console.log,logappend=on -serial chardev:ser0 \
+    -monitor unix:monitor.sock,server,nowait \
     -daemonize -pidfile vm.pid
   printf "booting"; i=0
   until ssh_vm true 2>/dev/null; do i=$((i+1)); [ $i -gt 120 ] && { echo " timeout; see $VM_DIR/console.log"; exit 1; }; printf .; sleep 3; done
@@ -84,8 +93,11 @@ EOF
 case "${1:-}" in
   create) create ;;
   start) start ;;
-  stop) ssh_vm sudo shutdown -p now || true; sleep 5; [ -f vm.pid ] && kill "$(cat vm.pid)" 2>/dev/null; rm -f vm.pid ;;
+  stop) ssh_vm sudo shutdown -p now || monitor system_powerdown || true; sleep 5
+    [ -f vm.pid ] && kill -0 "$(cat vm.pid)" 2>/dev/null && { monitor quit 2>/dev/null || kill "$(cat vm.pid)"; }; rm -f vm.pid ;;
+  monitor) shift; monitor "$*" ;;
+  serial) echo "serial console (Ctrl-C to leave)"; nc -U console.sock ;;
   ssh) shift; ssh_vm "$@" ;;
   console) tail -f console.log ;;
-  *) echo "usage: $0 create|start|stop|ssh [cmd]|console"; exit 1 ;;
+  *) echo "usage: $0 create|start|stop|ssh [cmd]|console|serial|monitor <cmd>"; exit 1 ;;
 esac

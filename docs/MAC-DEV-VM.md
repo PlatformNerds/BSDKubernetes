@@ -87,3 +87,19 @@ node before an e2e run.
 slirp (`vtnet0`) completes TCP connects to *any* address itself and relays DNS out to the Mac. So `nc -z` to a
 ClusterIP "works" even when nothing redirects it (research/09). Verify Service paths with real responses (an HTTP
 status code, a resolved name), or with a capture on the interface.
+
+## Debugging a hung VM (monitor + serial console)
+
+`ssh` can fail while the guest still runs: in conformance run 6's first attempt, sshd stopped sending its banner and
+the kubelet stopped heartbeating, while the API server kept answering. QEMU user networking accepts the TCP
+connection itself, so an open port proves nothing. The VM script now gives each VM two sockets in its VM dir:
+
+- `monitor.sock`, the QEMU monitor: `scripts/macos-freebsd-vm.sh monitor 'info status'`. To capture a hung guest's
+  memory before resetting it: `monitor 'dump-guest-memory -z hang.elf'`. `stop` falls back to `system_powerdown`
+  and then `quit` when ssh is dead.
+- `console.sock`, the serial console (still logged to `console.log`): `scripts/macos-freebsd-vm.sh serial`. Log in
+  as `bsdk8s` with the password in `~/bsdk8s/vm/serial-password`. It's local-only: the socket is on the Mac and
+  sshd stays key-only. Set it on a new VM with `pw usermod bsdk8s -h 0`.
+
+On a hang, before resetting: `procstat -kk -a > /tmp/stacks`, `vmstat -z`, `top -b -o res`, `sysctl vm.stats`, all
+from the serial console, plus a guest memory dump from the monitor.

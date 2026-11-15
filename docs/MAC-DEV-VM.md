@@ -69,3 +69,21 @@ arm64 crictl.
 - ~~**Per-container accounting is missing.**~~ This was a measurement error: rctl's `jail:` subject is the jail *name*, and `rctl -u jail:<jid>` silently reports an empty entry. Accounting by name works and is hierarchical.
 - **node→ClusterIP times out.** pf `rdr` doesn't apply to host-originated traffic on 15.x (works on 16-CURRENT).
 - containers/common logs `getCPUInfo for OS freebsd not implemented` on every buildah/podman call: harmless, easy upstream fix.
+
+## Clock skew between nodes (found in conformance run 5)
+
+The VMs ran no NTP. One guest's clock fell 35 minutes behind (it stopped advancing while the Mac slept), and the
+other was right after a reboot. With 35 minutes of skew, conformance run 5 lost tests that passed before:
+- **ServiceAccount OIDC discovery:** the token looked expired on the other node.
+- **Job:** pods never completed.
+- **Namespace deletion and Deployment rollover:** timed out.
+
+The VM script now enables `ntpd` with `ntpd_sync_on_start`. On existing VMs:
+`sudo sysrc ntpd_enable=YES ntpd_sync_on_start=YES && sudo service ntpd start`. Check with `date -u` on every
+node before an e2e run.
+
+## QEMU user networking fakes connectivity
+
+slirp (`vtnet0`) completes TCP connects to *any* address itself and relays DNS out to the Mac. So `nc -z` to a
+ClusterIP "works" even when nothing redirects it (research/09). Verify Service paths with real responses (an HTTP
+status code, a resolved name), or with a capture on the interface.

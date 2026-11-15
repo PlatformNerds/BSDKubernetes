@@ -75,6 +75,7 @@ runcmd:
   - "echo '%wheel ALL=(ALL:ALL) NOPASSWD: ALL' > /usr/local/etc/sudoers.d/wheel"
   - "grep -q kern.racct.enable /boot/loader.conf || echo 'kern.racct.enable=1' >> /boot/loader.conf"
   - "sysrc ifconfig_vtnet1='inet 192.168.100.$NODE/24' && service netif start vtnet1"
+  - "sysrc ntpd_enable=YES ntpd_sync_on_start=YES && service ntpd start"
 EOF
   hdiutil makehybrid -quiet -iso -joliet -default-volume-name cidata -o seed.iso seed
   start

@@ -1,0 +1,124 @@
+From a90a3c2edeb84a73635bbf955996f21ac121cfff Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 22:36:14 -0700
+Subject: [PATCH] jail: add allow.pf for managing pf from a non-VNET jail
+
+PRIV_NETINET_PF is only granted to VNET jails, which manage their own
+pf instance. A non-VNET jail shares the host network stack, and there is
+no way to let it manage the host pf, unlike allow.routing for the
+routing table.
+
+This blocks e.g. Kubernetes kube-proxy (pf mode) and network policy
+agents running as host-network containers: pfctl's netlink requests
+(PFNL_CMD_*, .cmd_priv = PRIV_NETINET_PF) fail with EPERM, while the
+legacy /dev/pf ioctl path has no privilege check at all.
+
+Add allow.pf, modelled on allow.routing: a non-VNET jail with allow.pf
+gets PRIV_NETINET_PF. VNET jails are unchanged.
+---
+ sys/kern/kern_jail.c | 17 ++++++++++++++++-
+ sys/sys/jail.h       |  5 ++++-
+ usr.sbin/jail/jail.8 |  8 ++++++++
+ 3 files changed, 28 insertions(+), 2 deletions(-)
+
+diff --git a/sys/kern/kern_jail.c b/sys/kern/kern_jail.c
+index ae22e43ae..39246b9e3 100644
+--- a/sys/kern/kern_jail.c
++++ b/sys/kern/kern_jail.c
+@@ -257,6 +257,7 @@ static struct bool_flags pr_flag_allow[NBBY * NBPW] = {
+ 	 PR_ALLOW_SETTIME},
+ 	{JAIL_PARAM_ALLOW_ROUTING, JAIL_PARAM_ALLOW_NOROUTING,
+ 	 PR_ALLOW_ROUTING},
++	{JAIL_PARAM_ALLOW_PF, JAIL_PARAM_ALLOW_NOPF, PR_ALLOW_PF},
+ 	{JAIL_PARAM_ALLOW_UNPRIV_PARENT_TAMPER,
+ 	    JAIL_PARAM_ALLOW_NOUNPRIV_PARENT_TAMPER,
+ 	    PR_ALLOW_UNPRIV_PARENT_TAMPER},
+@@ -4512,7 +4513,6 @@ prison_priv_check(struct ucred *cred, int priv)
+ 		 */
+ 	case PRIV_NETINET_IPFW:
+ 	case PRIV_NETINET_DIVERT:
+-	case PRIV_NETINET_PF:
+ 	case PRIV_NETINET_DUMMYNET:
+ 	case PRIV_NETINET_CARP:
+ 	case PRIV_NETINET_MROUTE:
+@@ -4827,6 +4827,19 @@ prison_priv_check(struct ucred *cred, int priv)
+ 		else
+ 			return (EPERM);
+ 
++		/*
++		 * A VNET jail manages its own pf instance.  A non-VNET jail
++		 * shares the host network stack and may manage the host pf
++		 * only with allow.pf (e.g. a Kubernetes kube-proxy or network
++		 * policy agent running in a host-network container).
++		 */
++	case PRIV_NETINET_PF:
++		if (cred->cr_prison->pr_flags & PR_VNET)
++			return (0);
++		if (cred->cr_prison->pr_allow & PR_ALLOW_PF)
++			return (0);
++		return (EPERM);
++
+ 	case PRIV_VMM_CREATE:
+ 	case PRIV_VMM_DESTROY:
+ 		/*
+@@ -5325,6 +5338,8 @@ SYSCTL_JAIL_PARAM(_allow, settime, CTLTYPE_INT | CTLFLAG_RW,
+     "B", "Jail may set system time");
+ SYSCTL_JAIL_PARAM(_allow, routing, CTLTYPE_INT | CTLFLAG_RW,
+     "B", "Jail may modify routing table");
++SYSCTL_JAIL_PARAM(_allow, pf, CTLTYPE_INT | CTLFLAG_RW,
++    "B", "Jail may manage the pf firewall without its own vnet");
+ #ifdef AUDIT
+ SYSCTL_JAIL_PARAM(_allow, setaudit, CTLTYPE_INT | CTLFLAG_RW,
+     "B", "Jail may set and get audit session state");
+diff --git a/sys/sys/jail.h b/sys/sys/jail.h
+index dbd2f071f..bdfaf2689 100644
+--- a/sys/sys/jail.h
++++ b/sys/sys/jail.h
+@@ -194,6 +194,8 @@ enum prison_state {
+ #define	JAIL_PARAM_ALLOW_NOSETTIME	"allow.nosettime"
+ #define	JAIL_PARAM_ALLOW_ROUTING	"allow.routing"
+ #define	JAIL_PARAM_ALLOW_NOROUTING	"allow.norouting"
++#define	JAIL_PARAM_ALLOW_PF		"allow.pf"
++#define	JAIL_PARAM_ALLOW_NOPF		"allow.nopf"
+ #define	JAIL_PARAM_ALLOW_UNPRIV_PARENT_TAMPER \
+ 					"allow.unprivileged_parent_tampering"
+ #define	JAIL_PARAM_ALLOW_NOUNPRIV_PARENT_TAMPER \
+@@ -366,6 +368,7 @@ struct prison_racct {
+ #define	PR_ALLOW_ROUTING		0x00200000
+ #define	PR_ALLOW_UNPRIV_PARENT_TAMPER	0x00400000
+ #define	PR_ALLOW_SETAUDIT		0x00800000
++#define	PR_ALLOW_PF			0x01000000
+ 
+ /*
+  * PR_ALLOW_PRISON0 are the allow flags that we apply by default to prison0,
+@@ -380,7 +383,7 @@ struct prison_racct {
+      PR_ALLOW_UNPRIV_DEBUG | PR_ALLOW_SUSER | PR_ALLOW_RESERVED_PORTS | \
+      PR_ALLOW_KMEM_ACCESS | PR_ALLOW_NFSD | PR_ALLOW_EXTATTR | \
+      PR_ALLOW_ADJTIME | PR_ALLOW_SETTIME | PR_ALLOW_ROUTING | \
+-     PR_ALLOW_UNPRIV_PARENT_TAMPER | PR_ALLOW_SETAUDIT)
++     PR_ALLOW_UNPRIV_PARENT_TAMPER | PR_ALLOW_SETAUDIT | PR_ALLOW_PF)
+ 
+ #define	PR_ALLOW_PRISON0		\
+     (PR_ALLOW_ALL_STATIC & ~(PR_ALLOW_UNPRIV_PARENT_TAMPER))
+diff --git a/usr.sbin/jail/jail.8 b/usr.sbin/jail/jail.8
+index 550e62f23..15a6b5400 100644
+--- a/usr.sbin/jail/jail.8
++++ b/usr.sbin/jail/jail.8
+@@ -731,6 +731,14 @@ This permission includes also
+ .It Va allow.routing
+ Allow privileged process in the non-VNET jail to modify the system routing
+ table.
++.It Va allow.pf
++Allow privileged processes in the non-VNET jail to manage the system
++.Xr pf 4
++firewall, for example with
++.Xr pfctl 8 .
++A VNET jail always manages its own
++.Xr pf 4
++instance and does not need this permission.
+ .It Va allow.setaudit
+ Allow privileged processes in the jail to set
+ .Xr audit 4
+-- 
+2.54.0 (Apple Git-157)
+

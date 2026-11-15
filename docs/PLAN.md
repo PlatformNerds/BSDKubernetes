@@ -185,6 +185,7 @@ Details, file lists and LOC are in `research/02` §5. The upstream-friendly item
 | **K14** ✅ | **`allow.pf` jail permission: IMPLEMENTED & VERIFIED** ([research/08](../research/08-allow-pf.md)); `allow.ipfw` not done: grant `PRIV_NETINET_PF` to a non-VNET (hostNetwork) jail, so kube-proxy / CNI / NetworkPolicy agents can run as pods. Also make pf's ioctl and netlink paths enforce the same privilege. **Found in the first real cluster run** (MAC-DEV-VM.md §4 #4). | ~50–100 | High | **1** |
 | N1 | pf "service map" O(1) lookup for kube-proxy | ~2–3 mo | Plausible | 3 |
 | V1 | bhyve virtio-vsock (userspace, FC protocol) + direct kernel boot | ~1.5k + ~1k | High | 2 |
+| **K15** ✅ | **pf: sticky-address source tracking for outbound `rdr-to`: FIXED & VERIFIED** ([research/09](../research/09-host-clusterip.md)): the sticky address was stored at a fixed state-key index, wrong for outbound translations, so clients were redirected to themselves. Needed for session affinity of host-network clients. Branch `bsdk8s/pf-sticky-rdr-out`. | ~30 | High | **1** |
 | K6 | PSI for racct | 0.8–1.5k | Plausible | 3 |
 | K2 | CPU bandwidth controller in ULE | 1.5–2.5k | Possible (option) | 3 |
 | K3-B | CPU weights via ULE priority bias | 0.5–0.9k | Debatable | 3 |

@@ -78,9 +78,8 @@ The first multi-node run: control plane `bsdk8s` (192.168.100.1) + worker `bsdk8
        iptables mode deletes conntrack entries; the pf proxier now lists states after each sync and kills (`pfctl
        -k key`) the UDP rdr states whose endpoint is no longer current. Its rules for a Service whose endpoints all
        went away were also never removed; they are flushed now. Fixes 2 (non-conformance) `Conntrack` tests.
-     - **Open: hostNetwork clients can't reach ClusterIPs.** pf on 15.x doesn't rdr host-originated traffic (the same
-       root cause as the apiserver workaround above), so the `Conntrack ... client is hostNetwork` test fails. Next
-       step: `route-to lo0` + `rdr on lo0` for the Service CIDR.
+     - **hostNetwork clients → ClusterIPs: fixed** (research/09): outbound `rdr-to` filter rules in each Service
+       anchor, Service CIDR routed via the node-IP interface; found and fixed a pf sticky-address kernel bug on the way.
   3. **Garbage collector:** the API call timed out (`context deadline exceeded`) under load. Likely flaky; re-run to
      confirm.
 

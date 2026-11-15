@@ -1,0 +1,356 @@
+From 15b6e6792547cf195bba6fbfad569ffd613aa985 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 22:23:59 -0700
+Subject: [PATCH] proxy/pf: redirect traffic the node itself sends to
+ ClusterIPs
+
+pf rdr rules only see packets arriving on an interface, so connections the
+node itself makes to a ClusterIP (host-network pods, the kubelet, the
+apiserver calling webhooks or aggregated APIs) were never redirected: the
+packets left through the default route to a Service address that exists
+nowhere. FreeBSD 15's pf can translate on output with a filter rule's
+rdr-to, so every service anchor now also gets
+
+	pass out quick <af> proto <p> from any to <ClusterIP> port <p> rdr-to <endpoints> port <t> round-robin
+
+after its translation rules (pf rejects an anchor whose rdr/nat rules don't
+all precede its filter rules). The main ruleset must reference the anchors
+as filter anchors (anchor "cni-rdr/*"), and the reply must be able to reach
+the node: the source is the address of the interface the Service CIDR
+routes through, so a multi-homed node should route the Service CIDR via its
+node-IP interface.
+
+No sticky-address on these rules: pf 15.x records the client's own address
+for outbound rdr-to source tracking (fixed by a separate pf patch), which
+would send every later connection to the client itself; sessionAffinity is
+therefore not honoured for host-network clients.
+
+Also:
+- anchors are flushed with -F nat and -F rules ('-F all' would flush the
+  global state table);
+- stale UDP state cleanup understands outbound redirected states
+  ('src -> endpoint (frontend)', killed by their wire key);
+- rule writing for a service port moved to writeServiceRules, with a test
+  that a NodePort service's filter rule comes after its rdr/nat rules.
+
+Not covered: the host calling a NodePort on its own address (looped
+through lo0).
+---
+ pkg/proxy/pf/proxier.go      | 119 ++++++++++++++++++++++++-----------
+ pkg/proxy/pf/proxier_test.go |  44 ++++++++++++-
+ pkg/proxy/pf/udpstates.go    |  40 ++++++++----
+ 3 files changed, 151 insertions(+), 52 deletions(-)
+
+diff --git a/pkg/proxy/pf/proxier.go b/pkg/proxy/pf/proxier.go
+index 64a664afc64..bc99a9bfd3e 100644
+--- a/pkg/proxy/pf/proxier.go
++++ b/pkg/proxy/pf/proxier.go
+@@ -260,9 +260,7 @@ func CleanupLeftovers(exec utilexec.Interface) (encounteredError bool) {
+ 		anchor = strings.TrimSpace(anchor)
+ 		if strings.HasPrefix(anchor, "cni-rdr/kube-svc-") {
+ 			klog.V(2).Infof("deleting PF anchor %s", anchor)
+-			cmd := exec.Command("pfctl", "-a", anchor, "-F", "nat")
+-			err := cmd.Run()
+-			if err != nil {
++			if err := flushAnchor(exec, anchor); err != nil {
+ 				klog.Errorf("deleting anchor %s: %v", anchor, err)
+ 				encounteredError = true
+ 			}
+@@ -437,6 +435,76 @@ func (proxier *Proxier) redirectRule(af, proto string, destinationIP net.IP, des
+ 	proxier.pfData.Write(words...)
+ }
+ 
++// writeServiceRules writes one service port's anchor: rdr for its ClusterIP
++// and NodePorts, nat for NodePort traffic to remote endpoints, and filter
++// rules for traffic the node itself sends to the ClusterIP. pf rejects a
++// ruleset whose translation rules don't all come before its filter rules,
++// so the filter rules go last.
++func (proxier *Proxier) writeServiceRules(svcName, af, proto string, clusterIP net.IP, port, nodePort int, nodeIPs []net.IP,
++	redirHosts string, remoteIPs []string, targetPort int, sticky bool) {
++	// redirect the service ip+port and optionally also the node port address+port
++	proxier.redirectRule(af, proto, clusterIP, port, redirHosts, targetPort, sticky, "")
++	if nodePort != 0 {
++		for _, ip := range nodeIPs {
++			// Don't try to redirect ::1/128 or 127.0.0.0/8
++			if ip.IsLoopback() {
++				continue
++			}
++			proxier.redirectRule(af, proto, ip, nodePort, redirHosts, targetPort, sticky, nodePortTag)
++		}
++		// Masquerade only what goes to other nodes, to this node's
++		// own address: a single cluster-wide masquerade address
++		// (LocalModeClusterCIDR) would route replies to a node
++		// that can't reverse the NAT.
++		if len(remoteIPs) > 0 {
++			if proxier.nodeIP == nil || proxier.nodeIP.IsUnspecified() {
++				klog.ErrorS(nil, "No node IP: NodePort traffic to endpoints on other nodes is not masqueraded and may fail", "service", svcName)
++			} else {
++				proxier.nodePortSNATRule(af, proto, "{ "+strings.Join(remoteIPs, ", ")+" }", targetPort)
++			}
++		}
++	}
++	proxier.hostRedirectRule(af, proto, clusterIP, port, redirHosts, targetPort)
++}
++
++// hostRedirectRule redirects traffic the node itself sends to a ClusterIP
++// (host-network pods, the kubelet, the apiserver calling webhooks): rdr rules
++// only apply to packets arriving on an interface, never to locally
++// originated ones, so these go out unredirected and fail. FreeBSD 15's pf
++// can translate on output with a filter rule's rdr-to. The rule goes in the
++// service's anchor, which the main ruleset must reference as a filter anchor
++// (anchor "cni-rdr/*"). The reply must come back to this node: its source is
++// the address of the interface the Service CIDR routes through, so on a
++// multi-homed node route the Service CIDR via the node IP's interface.
++//
++// No sticky-address: pf (15.x) records the wrong address for outbound rdr-to
++// source tracking and would redirect every later connection of a client to
++// the client itself (fixed by the bsdk8s pf patch, not yet upstream), so
++// sessionAffinity is not honoured for host-network clients.
++func (proxier *Proxier) hostRedirectRule(af, proto string, destinationIP net.IP, destinationPort int, targetIPs string, targetPort int) {
++	words := []interface{}{
++		"pass out quick", af, "proto", proto,
++		"from any to", destinationIP.String(),
++		"port", strconv.Itoa(destinationPort),
++		"rdr-to", targetIPs, "port", strconv.Itoa(targetPort),
++	}
++	if strings.HasPrefix(targetIPs, "{") {
++		words = append(words, "round-robin")
++	}
++	proxier.pfData.Write(words...)
++}
++
++// flushAnchor removes all translation and filter rules of an anchor. Not
++// "-F all": that would also flush the global state table and source nodes.
++func flushAnchor(execer utilexec.Interface, anchor string) error {
++	for _, what := range []string{"nat", "rules"} {
++		if out, err := execer.Command("pfctl", "-a", anchor, "-F", what).CombinedOutput(); err != nil {
++			return fmt.Errorf("pfctl -a %s -F %s: %w: %s", anchor, what, err, out)
++		}
++	}
++	return nil
++}
++
+ // nodePortSNATRule masquerades NodePort traffic that was redirected to an
+ // endpoint on another node (remoteIPs) to this node's IP. Without it the
+ // endpoint replies straight to the client, bypassing this node, so the rdr is
+@@ -568,9 +636,8 @@ func (proxier *Proxier) syncProxyRules() error {
+ 		if len(targetEndpoints) == 0 {
+ 			// No endpoints (left): drop the rules that still redirect
+ 			// to the old ones.
+-			cmd := proxier.exec.Command("pfctl", "-a", "cni-rdr/"+svcInfo.anchorName, "-F", "nat")
+-			if out, err := cmd.CombinedOutput(); err != nil {
+-				klog.ErrorS(err, "Failed to flush rules of service without endpoints", "service", svcName, "output", string(out))
++			if err := flushAnchor(proxier.exec, "cni-rdr/"+svcInfo.anchorName); err != nil {
++				klog.ErrorS(err, "Failed to flush rules of service without endpoints", "service", svcName)
+ 			}
+ 			continue
+ 		}
+@@ -597,37 +664,15 @@ func (proxier *Proxier) syncProxyRules() error {
+ 			proto = "sctp"
+ 		}
+ 
+-		// We need to redirect the service ip+port and optionally also
+-		// the node port address+port
+-		proxier.pfData.Reset()
+-		sticky := svcInfo.SessionAffinityType() == v1.ServiceAffinityClientIP
+-		proxier.redirectRule(af, proto, svcInfo.ClusterIP(), svcInfo.Port(), redirHosts, targetPort, sticky, "")
+-		if svcInfo.NodePort() != 0 {
+-			for _, ip := range nodeIPs {
+-				// Don't try to redirect ::1/128 or 127.0.0.0/8
+-				if ip.IsLoopback() {
+-					continue
+-				}
+-				proxier.redirectRule(af, proto, ip, svcInfo.NodePort(), redirHosts, targetPort, sticky, nodePortTag)
+-			}
+-			// Masquerade only what goes to other nodes, to this node's
+-			// own address: a single cluster-wide masquerade address
+-			// (LocalModeClusterCIDR) would route replies to a node
+-			// that can't reverse the NAT.
+-			remoteIPs := []string{}
+-			for _, ep := range targetEndpoints {
+-				if !ep.IsLocal() {
+-					remoteIPs = append(remoteIPs, ep.IP())
+-				}
+-			}
+-			if len(remoteIPs) > 0 {
+-				if proxier.nodeIP == nil || proxier.nodeIP.IsUnspecified() {
+-					klog.ErrorS(nil, "No node IP: NodePort traffic to endpoints on other nodes is not masqueraded and may fail", "service", svcName)
+-				} else {
+-					proxier.nodePortSNATRule(af, proto, "{ "+strings.Join(remoteIPs, ", ")+" }", targetPort)
+-				}
++		remoteIPs := []string{}
++		for _, ep := range targetEndpoints {
++			if !ep.IsLocal() {
++				remoteIPs = append(remoteIPs, ep.IP())
+ 			}
+ 		}
++		proxier.pfData.Reset()
++		proxier.writeServiceRules(svcName.String(), af, proto, svcInfo.ClusterIP(), svcInfo.Port(), svcInfo.NodePort(), nodeIPs,
++			redirHosts, remoteIPs, targetPort, svcInfo.SessionAffinityType() == v1.ServiceAffinityClientIP)
+ 
+ 		if proxier.logger.V(2).Enabled() {
+ 			klog.Infof("pfctl -a cni-rdr/%s -f - <EOF", svcInfo.anchorName)
+@@ -648,9 +693,7 @@ func (proxier *Proxier) syncProxyRules() error {
+ 	proxier.killStaleUDPStates(udpFronts)
+ 	for a := range staleAnchors {
+ 		proxier.logger.V(2).Info("deleting PF anchor", a)
+-		cmd := proxier.exec.Command("pfctl", "-a", "cni-rdr/"+a, "-F", "nat")
+-		err := cmd.Run()
+-		if err != nil {
++		if err := flushAnchor(proxier.exec, "cni-rdr/"+a); err != nil {
+ 			klog.Errorf("error flushing rules, err: %v", err)
+ 		}
+ 	}
+diff --git a/pkg/proxy/pf/proxier_test.go b/pkg/proxy/pf/proxier_test.go
+index 79b35c4bc19..f5c0c0aa4d1 100644
+--- a/pkg/proxy/pf/proxier_test.go
++++ b/pkg/proxy/pf/proxier_test.go
+@@ -53,6 +53,42 @@ func TestRedirectRule(t *testing.T) {
+ 	}
+ }
+ 
++func TestHostRedirectRule(t *testing.T) {
++	p := &Proxier{pfData: proxyutil.NewLineBuffer()}
++	p.hostRedirectRule("inet", "udp", net.ParseIP("10.96.0.10"), 53, "{ 10.244.0.206, 10.244.0.207 }", 53)
++	p.hostRedirectRule("inet", "tcp", net.ParseIP("10.96.0.1"), 443, "{ 192.168.100.1 }", 6443)
++	want := "pass out quick inet proto udp from any to 10.96.0.10 port 53 rdr-to { 10.244.0.206, 10.244.0.207 } port 53 round-robin\n" +
++		"pass out quick inet proto tcp from any to 10.96.0.1 port 443 rdr-to { 192.168.100.1 } port 6443 round-robin\n"
++	if got := p.pfData.String(); got != want {
++		t.Errorf("got  %q\nwant %q", got, want)
++	}
++}
++
++// pf refuses an anchor whose translation rules (rdr, nat) don't all come
++// before its filter rules (pass): a NodePort service, with rdr and nat rules
++// for the node ports, must still put the host ClusterIP rule last.
++func TestWriteServiceRulesOrder(t *testing.T) {
++	p := &Proxier{pfData: proxyutil.NewLineBuffer(), nodeIP: net.ParseIP("192.168.100.1")}
++	p.writeServiceRules("ns/svc:http", "inet", "tcp", net.ParseIP("10.96.0.20"), 80, 30080,
++		[]net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("192.168.100.1")},
++		"{ 10.244.1.7 }", []string{"10.244.1.7"}, 8080, false)
++	want := "rdr inet proto tcp from any to 10.96.0.20 port 80 -> { 10.244.1.7 } port 8080 round-robin\n" +
++		"rdr inet proto tcp from any to 192.168.100.1 port 30080 tag KUBE_NODEPORT -> { 10.244.1.7 } port 8080 round-robin\n" +
++		"nat inet proto tcp from any to { 10.244.1.7 } port 8080 tagged KUBE_NODEPORT -> 192.168.100.1\n" +
++		"pass out quick inet proto tcp from any to 10.96.0.20 port 80 rdr-to { 10.244.1.7 } port 8080 round-robin\n"
++	if got := p.pfData.String(); got != want {
++		t.Errorf("got\n%s\nwant\n%s", got, want)
++	}
++	seenFilter := false
++	for _, l := range strings.Split(strings.TrimSpace(p.pfData.String()), "\n") {
++		isFilter := strings.HasPrefix(l, "pass") || strings.HasPrefix(l, "block") || strings.HasPrefix(l, "match")
++		if seenFilter && !isFilter {
++			t.Errorf("translation rule after a filter rule: %q", l)
++		}
++		seenFilter = seenFilter || isFilter
++	}
++}
++
+ func TestNodePortSNATRule(t *testing.T) {
+ 	p := &Proxier{pfData: proxyutil.NewLineBuffer(), nodeIP: net.ParseIP("192.168.100.1")}
+ 	p.nodePortSNATRule("inet", "tcp", "{ 10.244.1.7 }", 8080)
+@@ -71,10 +107,12 @@ all udp 10.244.1.5:53 (10.96.0.99:53) <- 10.244.0.88:4447       MULTIPLE:MULTIPL
+ all udp fd00::7[53] (fd01::a[53]) <- fd00::8[4448]       MULTIPLE:MULTIPLE
+ all udp 192.168.100.1:61234 (10.244.0.88:4444) -> 10.244.1.7:8081       MULTIPLE:MULTIPLE
+ all udp 10.0.2.15:68 <- 10.0.2.2:67       MULTIPLE:MULTIPLE
++all udp 192.168.100.2:5353 -> 10.244.0.207:53 (10.96.0.20:81)       SINGLE:NO_TRAFFIC
++all udp 192.168.100.2:5354 -> 10.244.1.9:8082 (10.96.0.20:81)       SINGLE:NO_TRAFFIC
+ `
+ 	states := parseRdrStates(out)
+-	if len(states) != 6 {
+-		t.Fatalf("parsed %d rdr states, want 6: %v", len(states), states)
++	if len(states) != 8 {
++		t.Fatalf("parsed %d rdr states, want 8: %v", len(states), states)
+ 	}
+ 	fronts := udpFrontends{
+ 		// endpoint 10.244.1.7 is gone: state 4444 is stale
+@@ -93,6 +131,8 @@ all udp 10.0.2.15:68 <- 10.0.2.2:67       MULTIPLE:MULTIPLE
+ 		"udp 192.168.100.2:30081 <- 10.244.0.88:4444",
+ 		"udp 10.96.0.20:81 <- 10.244.0.88:4445",
+ 		"udp fd01::a[53] <- fd00::8[4448]",
++		// host-originated (outbound rdr-to) to a gone endpoint; 5354 is current
++		"udp 192.168.100.2:5353 -> 10.244.0.207:53",
+ 	}
+ 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+ 		t.Errorf("stale states:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+diff --git a/pkg/proxy/pf/udpstates.go b/pkg/proxy/pf/udpstates.go
+index b2125c9937d..bcab39bb3fd 100644
+--- a/pkg/proxy/pf/udpstates.go
++++ b/pkg/proxy/pf/udpstates.go
+@@ -46,30 +46,46 @@ func pfAddrPort(ip string, port int) string {
+ 	return fmt.Sprintf("%s:%d", ip, port)
+ }
+ 
+-// pfState is an inbound translated state from pfctl -ss, e.g.
++// pfState is a redirected state from pfctl -ss. Inbound (rdr rules, traffic
++// from pods and other nodes):
+ //
+ //	all udp 10.244.1.7:8081 (192.168.100.2:30081) <- 10.244.0.88:4444       MULTIPLE:MULTIPLE
+ //
+-// stack is the address after rdr (the endpoint), wire the address the client
+-// sent to (the Service frontend), peer the client.
++// outbound (hostRedirectRule, traffic from the node itself):
++//
++//	all udp 192.168.100.2:5353 -> 10.244.0.207:53 (10.96.0.10:53)       MULTIPLE:MULTIPLE
++//
++// endpoint is the address after the redirection, frontend the address the
++// client sent to (the Service frontend), peer the client.
+ type pfState struct {
+-	proto, stack, wire, peer string
++	proto, endpoint, frontend, peer string
++	outbound                        bool
+ }
+ 
+-// key is the state key that pfctl -k key accepts for this state.
++// key is the state key that pfctl -k key accepts for this state: the
++// addresses as they are on the wire.
+ func (s pfState) key() string {
+-	return s.proto + " " + s.wire + " <- " + s.peer
++	if s.outbound {
++		return s.proto + " " + s.peer + " -> " + s.endpoint
++	}
++	return s.proto + " " + s.frontend + " <- " + s.peer
+ }
+ 
+-// parseRdrStates returns the inbound translated states in pfctl -ss output.
++func parenthesized(s string) bool {
++	return strings.HasPrefix(s, "(") && strings.HasSuffix(s, ")")
++}
++
++// parseRdrStates returns the redirected states in pfctl -ss output.
+ func parseRdrStates(out string) []pfState {
+ 	var states []pfState
+ 	for _, line := range strings.Split(out, "\n") {
+ 		f := strings.Fields(line)
+-		if len(f) < 6 || f[4] != "<-" || !strings.HasPrefix(f[3], "(") || !strings.HasSuffix(f[3], ")") {
+-			continue
++		switch {
++		case len(f) >= 6 && f[4] == "<-" && parenthesized(f[3]):
++			states = append(states, pfState{proto: f[1], endpoint: f[2], frontend: strings.Trim(f[3], "()"), peer: f[5]})
++		case len(f) >= 6 && f[3] == "->" && parenthesized(f[5]):
++			states = append(states, pfState{proto: f[1], peer: f[2], endpoint: f[4], frontend: strings.Trim(f[5], "()"), outbound: true})
+ 		}
+-		states = append(states, pfState{proto: f[1], stack: f[2], wire: strings.Trim(f[3], "()"), peer: f[5]})
+ 	}
+ 	return states
+ }
+@@ -82,7 +98,7 @@ func staleUDPStates(states []pfState, frontends udpFrontends) []pfState {
+ 		if s.proto != "udp" {
+ 			continue
+ 		}
+-		if endpoints, ok := frontends[s.wire]; ok && !endpoints.Has(s.stack) {
++		if endpoints, ok := frontends[s.frontend]; ok && !endpoints.Has(s.endpoint) {
+ 			stale = append(stale, s)
+ 		}
+ 	}
+@@ -100,7 +116,7 @@ func (proxier *Proxier) killStaleUDPStates(frontends udpFrontends) {
+ 		return
+ 	}
+ 	for _, s := range staleUDPStates(parseRdrStates(string(out)), frontends) {
+-		proxier.logger.V(2).Info("Killing stale UDP state", "state", s.key(), "endpoint", s.stack)
++		proxier.logger.V(2).Info("Killing stale UDP state", "state", s.key(), "endpoint", s.endpoint)
+ 		if out, err := proxier.exec.Command("pfctl", "-k", "key", "-k", s.key()).CombinedOutput(); err != nil {
+ 			klog.ErrorS(err, "Failed to kill stale UDP state", "state", s.key(), "output", string(out))
+ 		}
+-- 
+2.54.0 (Apple Git-157)
+

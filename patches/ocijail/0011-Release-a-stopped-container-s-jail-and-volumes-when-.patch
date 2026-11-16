@@ -1,0 +1,139 @@
+From 0e64f620a522843519ec54c308a84958a071d895 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 00:39:07 -0700
+Subject: [PATCH] Release a stopped container's jail and volumes when its stop
+ is observed
+
+On Linux, a container's mounts live in its mount namespace and disappear
+as soon as its init exits; on FreeBSD the nullfs volume mounts made by
+create stayed until delete. The kubelet tears down a pod's volumes (e.g.
+secret and projected tmpfs mounts) once its containers have stopped, but
+only removes the dead containers later, sometimes only in its periodic
+container GC. Until then the unmount fails with EBUSY and the deleted pod
+lingers in the API for up to a minute or more, which slows StatefulSet
+rollouts and namespace deletion. A crash-looping container also kept the
+mounts of its previous, exited instance.
+
+When `state` observes a stopped container, remove its jail (killing any
+process left in it, as a Linux PID namespace does when its init exits) and
+unmount its volumes. This is recorded in the state so it happens once;
+delete still does it if `state` never ran or the release failed, and
+then removes the read-only root, rctl rules and runs poststop hooks as
+before. A failure to release is logged and does not fail `state`.
+---
+ ocijail/delete.cpp | 34 ++++++++++++++++++++++++----------
+ ocijail/delete.h   |  7 +++++++
+ ocijail/state.cpp  | 13 +++++++++++++
+ 3 files changed, 44 insertions(+), 10 deletions(-)
+
+diff --git a/ocijail/delete.cpp b/ocijail/delete.cpp
+index 2c83570..ecec2db 100644
+--- a/ocijail/delete.cpp
++++ b/ocijail/delete.cpp
+@@ -30,6 +30,28 @@ delete_::delete_(main_app& app) : app_(app) {
+     sub->final_callback([this] { run(); });
+ }
+ 
++static fs::path container_root(runtime_state& state) {
++    if (state.contains("root_readonly") && state["root_readonly"] == true) {
++        return fs::path{state["readonly_root_path"]};
++    }
++    return fs::path{state["root_path"]};
++}
++
++void release_stopped_container(main_app& app, runtime_state& state) {
++    if (state.contains("released") && state["released"] == true) {
++        return;
++    }
++    auto j = jail::find(int(state["jid"]));
++    j.remove();
++    if (state["config"].contains("mounts") &&
++        !state["config"]["mounts"].is_null()) {
++        unmount_volumes(
++            app, state, container_root(state), state["config"]["mounts"]);
++    }
++    state["released"] = true;
++    state.save();
++}
++
+ void delete_::run() {
+     auto state = app_.get_runtime_state(id_);
+ 
+@@ -70,8 +92,7 @@ void delete_::run() {
+         throw std::runtime_error(ss.str());
+     }
+ 
+-    auto j = jail::find(int(state["jid"]));
+-    j.remove();
++    release_stopped_container(app_, state);
+     if (auto& jail_name = state["jail_name"]; jail_name.is_string()) {
+         rctl::remove(jail_name.get<std::string>());
+     }
+@@ -80,14 +101,7 @@ void delete_::run() {
+     if (state.contains("root_readonly")) {
+         root_readonly = state["root_readonly"];
+     }
+-    fs::path root_path = state["root_path"];
+-    if (root_readonly) {
+-        root_path = fs::path{state["readonly_root_path"]};
+-    }
+-    if (state["config"].contains("mounts") &&
+-        !state["config"]["mounts"].is_null()) {
+-        unmount_volumes(app_, state, root_path, state["config"]["mounts"]);
+-    }
++    fs::path root_path = container_root(state);
+     if (root_readonly) {
+         if (::unmount(root_path.c_str(), MNT_FORCE) > 0) {
+             throw std::system_error{errno,
+diff --git a/ocijail/delete.h b/ocijail/delete.h
+index 0aeb187..6d19c34 100644
+--- a/ocijail/delete.h
++++ b/ocijail/delete.h
+@@ -6,6 +6,13 @@
+ 
+ namespace ocijail {
+ 
++// Release what a stopped container holds on the host: remove its jail (killing
++// any processes left in it, as a Linux PID namespace does when its init exits)
++// and unmount its volumes, so that e.g. the kubelet can tear down a pod's
++// volumes as soon as its containers have stopped instead of waiting for the
++// container to be deleted. Idempotent; delete() calls it too.
++void release_stopped_container(main_app& app, runtime_state& state);
++
+ struct delete_ {
+     static void init(main_app& app);
+ 
+diff --git a/ocijail/state.cpp b/ocijail/state.cpp
+index 11ef982..42c4a60 100644
+--- a/ocijail/state.cpp
++++ b/ocijail/state.cpp
+@@ -3,6 +3,7 @@
+ 
+ #include "nlohmann/json.hpp"
+ 
++#include "delete.h"
+ #include "state.h"
+ 
+ namespace fs = std::filesystem;
+@@ -31,6 +32,18 @@ void state::run() {
+     // update state
+     state.check_status();
+ 
++    // Once stopped, release the container's jail and volumes right away
++    // (see release_stopped_container). Failing here must not hide the state:
++    // the release is retried on the next query and by delete.
++    if (state["status"] == "stopped") {
++        try {
++            release_stopped_container(app_, state);
++        } catch (const std::exception& e) {
++            app_.log() << "releasing stopped container " << id_ << ": "
++                       << e.what();
++        }
++    }
++
+     std::cout << state.report();
+ }
+ 
+-- 
+2.54.0 (Apple Git-157)
+

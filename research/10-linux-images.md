@@ -48,8 +48,18 @@ Both nodes boot `kernel.bsdk8s3` = 15.1 + allow.pf + pf sticky + rctl hierarchy 
 - **Linuxulator coverage:**
   - `io_setup()` (Linux AIO) returns ENOSYS. nginx logs `[emerg]` and continues.
   - `/proc/net/tcp` is missing, so `netstat` inside Linux containers is empty.
-  - metrics-server's certificate-file watch fails: `fsnotify: read: resource temporarily unavailable` (inotify
-    under epoll). It's non-fatal, but cert hot-reload is broken.
+  - ~~metrics-server's certificate-file watch fails: `fsnotify: read: resource temporarily unavailable`.~~ **Fixed
+    (kernel `bsdk8s/linux-epoll-filters`, patch freebsd-src/0008).** Go's netpoller registers every fd for
+    `EPOLLIN|EPOLLOUT|EPOLLRDHUP|EPOLLET`. The inotify kqfilter only supports `EVFILT_READ`, so the Linuxulator's
+    `epoll_ctl` failed with EINVAL. Worse, it left the read filter registered, so a retry got EEXIST. Go then
+    treated the fd as unpollable, and reads returned EAGAIN. timerfd and kqueue fds have the same problem.
+    Linux accepts any mask and never reports events the file can't produce. `epoll_ctl` now registers each filter
+    separately and skips filters the file rejects. A probe (inotify/timerfd ADD/EEXIST/MOD/DEL, no spurious
+    events, Go `os.File.Read` via the netpoller) passes, and metrics-server shows 0 fsnotify errors.
+  - `unsupported fcntl cmd 36` = Linux `F_OFD_GETLK`. A DTrace ustack plus `go tool addr2line` traced it to
+    `go.etcd.io/etcd/client/pkg/v3/fileutil.init`. That init function is a feature probe that falls back to
+    `F_SETLK` on EINVAL, and every client-go binary links it. It's harmless log noise, so OFD locks aren't
+    implemented.
   - research/04 also lists: unshare/setns, io_uring, signalfd, pidfd, bpf, keyctl, landlock.
 - **Images with FreeBSD twins.** Our FreeBSD test images use upstream names (e.g. `agnhost:2.63.0`). A Linux pod
   asking for the same tag gets the local FreeBSD image.

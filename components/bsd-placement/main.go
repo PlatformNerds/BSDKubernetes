@@ -1,13 +1,17 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -89,6 +93,8 @@ func main() {
 	rc := flag.String("runtime-class", "linux", "RuntimeClass for Linux workloads")
 	sel := flag.String("node-selector", "bsdk8s.io/linux-abi=true", "nodeSelector added to rewritten pods (k=v,...)")
 	nodeOS := flag.String("node-os", "freebsd", "kubernetes.io/os value of the target nodes")
+	every := flag.Duration("reconcile-interval", 30*time.Second, "how often to look for Linux-pinned pods admitted without the webhook (0 disables)")
+	minAge := flag.Duration("reconcile-min-age", time.Minute, "only act on pods pending at least this long")
 	flag.Parse()
 
 	ns, err := parseSelector(*sel)
@@ -100,8 +106,28 @@ func main() {
 	mux.Handle("/mutate", handler(cfg))
 	mux.Handle("/mutate-force", handler(cfg))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { fmt.Fprintln(w, "ok") })
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
+	defer stop()
+	if *every > 0 {
+		c, err := inClusterClient()
+		if err != nil {
+			log.Printf("reconciler disabled: %v", err)
+		} else {
+			self, _ := os.ReadFile(saDir + "/namespace")
+			go reconcileLoop(ctx, c, cfg, strings.TrimSpace(string(self)), *every, *minAge)
+		}
+	}
 	srv := &http.Server{Addr: *addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	log.Printf("bsd-placement: runtimeClass=%s nodeSelector=%s nodeOS=%s listening on %s",
 		cfg.RuntimeClass, strings.Join(sortedKeys(ns), ","), cfg.NodeOS, *addr)
-	log.Fatal(srv.ListenAndServeTLS(*cert, *key))
+	go func() {
+		<-ctx.Done()
+		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		srv.Shutdown(shutdown)
+	}()
+	if err := srv.ListenAndServeTLS(*cert, *key); err != http.ErrServerClosed {
+		log.Fatal(err)
+	}
+	log.Print("bsd-placement: stopped")
 }

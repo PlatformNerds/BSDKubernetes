@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 var cfg = Config{RuntimeClass: "linux", NodeSelector: map[string]string{"bsdk8s.io/linux-abi": "true"}, NodeOS: "freebsd"}
@@ -166,5 +167,39 @@ func TestHandlerForcePath(t *testing.T) {
 		if got := len(out.Response.Patch) > 0; got != want {
 			t.Errorf("%s: patched = %v, want %v", path, got, want)
 		}
+	}
+}
+
+func TestFindStuck(t *testing.T) {
+	now := time.Date(2026, 11, 16, 8, 0, 0, 0, time.UTC)
+	old := now.Add(-5 * time.Minute).Format(time.RFC3339)
+	young := now.Add(-5 * time.Second).Format(time.RFC3339)
+	pod := func(name, ns, created, phase, node, extra string) string {
+		return `{"metadata":{"name":"` + name + `","namespace":"` + ns + `","uid":"u-` + name + `","creationTimestamp":"` + created + `"` + extra +
+			`},"spec":{"nodeName":"` + node + `","nodeSelector":{"kubernetes.io/os":"linux"}},"status":{"phase":"` + phase + `"}}`
+	}
+	owned := `,"ownerReferences":[{"kind":"ReplicaSet","name":"rs","controller":true}]`
+	list := `{"items":[` + strings.Join([]string{
+		pod("stuck", "app", old, "Pending", "", owned),
+		pod("bare", "app", old, "Pending", "", ""),
+		pod("young", "app", young, "Pending", "", owned),
+		pod("scheduled", "app", old, "Pending", "n1", owned),
+		pod("ignored", "skip", old, "Pending", "", owned),
+		pod("deleting", "app", old, "Pending", "", owned+`,"deletionTimestamp":"`+old+`"`),
+		`{"metadata":{"name":"fbsd","namespace":"app","creationTimestamp":"` + old + `"},"spec":{"nodeSelector":{"kubernetes.io/os":"freebsd"}},"status":{"phase":"Pending"}}`,
+	}, ",") + `]}`
+	got, err := findStuck(cfg, []byte(list), func(ns string) bool { return ns == "skip" }, now, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := map[string]string{}
+	for _, sp := range got {
+		names[sp.meta.Name] = sp.owner
+	}
+	if len(names) != 2 || names["stuck"] != "ReplicaSet/rs" || names["bare"] != "" {
+		t.Errorf("findStuck = %v, want stuck (ReplicaSet/rs) and bare", names)
+	}
+	if _, ok := names["bare"]; !ok {
+		t.Error("bare pod not reported")
 	}
 }

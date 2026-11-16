@@ -55,6 +55,25 @@ second webhook entry (`/mutate-force`). That covers manifests with no OS pin at 
 | DaemonSet `busybox:1.36` with required affinity `kubernetes.io/os In [linux]` | template rewritten to `In [freebsd]`; 1 pod per node; `uname -sr` = `Linux 5.15.0` |
 | cert-manager v1.16.2 release manifest (sha256 `1d51cdec…`), unmodified | 3/3 pods Running, 0 restarts; Certificates Ready; webhook denies invalid Certificate |
 
+## Availability: the drain incident and the reconciler
+
+Rebooting node 2 for a kernel update meant draining it. The drain evicted the (then single) bsd-placement replica
+**and** cert-manager's pods at the same moment. The ReplicaSets recreated cert-manager's pods while the webhook was
+down. `failurePolicy: Ignore` admitted them unchanged, and they stayed `Pending` for good: `runtimeClassName`
+can't be changed on an existing pod. The fix has two parts:
+
+- **Stay up:** 2 replicas, `topologySpreadConstraints` (`DoNotSchedule`, `matchLabelKeys: [pod-template-hash]`)
+  for one replica per node, and a PodDisruptionBudget `minAvailable: 1`. A single-node drain can no longer take
+  the webhook down. Graceful shutdown on SIGTERM gives exit 0 instead of `Error`.
+- **Self-heal:** the webhook process also runs a reconciler, every 30 s by default. It lists unscheduled
+  `Pending` pods older than 1 minute that it would have rewritten. It deletes the controller-owned ones, with
+  a UID precondition, so their controller recreates them through the webhook. Bare pods are only logged. The
+  RBAC is `pods: list, delete` and `namespaces: get`. Namespaces labeled `bsdk8s.io/placement=ignore` and its own
+  namespace are skipped. This is unit-tested, and it was verified live: it deleted the 3 stuck cert-manager pods,
+  and their replacements were Running 10 s later.
+
+The force webhook (namespace label) is not covered by the reconciler. It doesn't look up namespace labels for that.
+
 ## Found on the way
 
 - **Short image names.** CRI-O had no `unqualified-search-registries`, so `image: nginx:1.27-alpine` failed with

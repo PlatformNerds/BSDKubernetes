@@ -5,19 +5,41 @@ kind: Namespace
 metadata:
   name: bsd-placement
 ---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: bsd-placement, namespace: bsd-placement}
+---
+# The reconciler deletes controller-owned pods that were admitted while the
+# webhook was unavailable, so their controller recreates them through it.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: bsd-placement}
+rules:
+- {apiGroups: [""], resources: [pods], verbs: [list, delete]}
+- {apiGroups: [""], resources: [namespaces], verbs: [get]}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: bsd-placement}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: bsd-placement}
+subjects: [{kind: ServiceAccount, name: bsd-placement, namespace: bsd-placement}]
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: bsd-placement
   namespace: bsd-placement
 spec:
-  replicas: 1
+  replicas: 2  # one per node: a drain must not take the webhook down
   selector: {matchLabels: {app: bsd-placement}}
   template:
     metadata:
       labels: {app: bsd-placement}
     spec:
+      serviceAccountName: bsd-placement
       nodeSelector: {kubernetes.io/os: freebsd}
+      topologySpreadConstraints:
+      - {maxSkew: 1, topologyKey: kubernetes.io/hostname, whenUnsatisfiable: DoNotSchedule, matchLabelKeys: [pod-template-hash], labelSelector: {matchLabels: {app: bsd-placement}}}
       tolerations:
       - {key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule}
       securityContext: {runAsNonRoot: true, runAsUser: 65534}
@@ -37,6 +59,13 @@ spec:
       - name: certs
         secret: {secretName: bsd-placement-tls}
 ---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: {name: bsd-placement, namespace: bsd-placement}
+spec:
+  minAvailable: 1
+  selector: {matchLabels: {app: bsd-placement}}
+---
 apiVersion: v1
 kind: Service
 metadata:
@@ -47,7 +76,8 @@ spec:
   ports: [{port: 443, targetPort: https}]
 ---
 # failurePolicy Ignore: if the webhook is down, pods are admitted unchanged
-# (Linux-pinned ones then stay Pending) rather than blocking the cluster.
+# rather than blocking every pod create in the cluster; the reconciler then
+# replaces controller-owned Linux-pinned pods that got stuck Pending.
 apiVersion: admissionregistration.k8s.io/v1
 kind: MutatingWebhookConfiguration
 metadata:

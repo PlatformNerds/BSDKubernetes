@@ -1,0 +1,65 @@
+From 6412a9310dd0cb3ca55fecb2e778e027d4e988c7 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 22:28:03 -0700
+Subject: [PATCH 9/9] freebsd: unhide devfs /dev/shm for Linux images
+
+/dev/shm is a directory in devfs, the mount point of the tmpfs Linux
+programs expect there, but the jail's devfs ruleset hides it and nothing
+can be created in devfs, so creating the container failed ('create_directory:
+Operation not supported .../dev/shm'). Add 'rule=path shm unhide mode 1777'
+to the /dev devfs mount, as podman does for Linux containers. Test.
+---
+ server/image_os_freebsd.go      | 13 ++++++++++++-
+ server/image_os_freebsd_test.go | 11 +++++++++++
+ 2 files changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/server/image_os_freebsd.go b/server/image_os_freebsd.go
+index 26e10c5b1..7def69807 100644
+--- a/server/image_os_freebsd.go
++++ b/server/image_os_freebsd.go
+@@ -52,8 +52,19 @@ func addImageOSMounts(specgen *generate.Generator, img *storage.ImageResult, con
+ 	for _, m := range containerConfig.GetMounts() {
+ 		have[filepath.Clean(m.GetContainerPath())] = true
+ 	}
+-	for _, m := range specgen.Mounts() {
++	mounts := specgen.Mounts()
++	for i, m := range mounts {
+ 		have[filepath.Clean(m.Destination)] = true
++		// devfs has a /dev/shm directory (the tmpfs mount point below),
++		// but the jail's devfs ruleset hides it, and nothing can be created
++		// in devfs: unhide it, as podman does for Linux containers.
++		if filepath.Clean(m.Destination) == "/dev" && m.Type == "devfs" && !have["/dev/shm"] {
++			mounts[i].Options = append(mounts[i].Options, "rule=path shm unhide mode 1777")
++		}
++	}
++	specgen.ClearMounts()
++	for _, m := range mounts {
++		specgen.AddMount(m)
+ 	}
+ 	for _, m := range linuxImageMounts {
+ 		if !have[m.Destination] {
+diff --git a/server/image_os_freebsd_test.go b/server/image_os_freebsd_test.go
+index e57760761..acc69802c 100644
+--- a/server/image_os_freebsd_test.go
++++ b/server/image_os_freebsd_test.go
+@@ -38,6 +38,17 @@ func TestAddImageOSMounts(t *testing.T) {
+ 	if got["/proc"] != "linprocfs" || got["/sys"] != "linsysfs" || got["/dev/shm"] != "tmpfs" {
+ 		t.Errorf("Linux image mounts: %v", got)
+ 	}
++	// /dev/shm is a devfs directory hidden by the jail's ruleset: unhide it
++	g, err := generate.New("freebsd")
++	if err != nil {
++		t.Fatal(err)
++	}
++	g.ClearMounts()
++	g.AddMount(rspec.Mount{Destination: "/dev", Type: "devfs", Source: "devfs", Options: []string{"ruleset=4"}})
++	addImageOSMounts(&g, linux, &types.ContainerConfig{})
++	if opts := g.Mounts()[0].Options; len(opts) != 2 || opts[1] != "rule=path shm unhide mode 1777" {
++		t.Errorf("devfs options: %v", opts)
++	}
+ 	// a /dev/shm the pod supplies (emptyDir) and an existing /proc win
+ 	got = mounts(linux, &types.ContainerConfig{Mounts: []*types.Mount{{ContainerPath: "/dev/shm"}}},
+ 		rspec.Mount{Destination: "/proc", Type: "procfs"})
+-- 
+2.54.0 (Apple Git-157)
+

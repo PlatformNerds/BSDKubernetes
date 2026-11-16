@@ -1,0 +1,236 @@
+From 96833842c11362999c311a5059ab6b49834f1ba4 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 22:22:36 -0700
+Subject: [PATCH 8/9] freebsd: run Linux images through a runtime handler
+ (Linuxulator)
+
+FreeBSD runs Linux ELF binaries directly under the Linux ABI (linux64.ko),
+in jails like any container; podman already uses this. Let CRI-O do it for
+Kubernetes pods whose RuntimeClass maps to a runtime handler with
+default_annotations io.bsdk8s.image-os = "linux":
+
+- pull: images for such pods are pulled for that OS instead of the host's
+  (the CRI passes the runtime handler with pulls only behind the alpha
+  RuntimeClassInImageCriApi gate, but the kubelet creates the sandbox
+  first, so it is found by the pod UID);
+- create: containers of Linux images get /proc (linprocfs), /sys
+  (linsysfs) and /dev/shm (tmpfs), as podman gives Linux containers;
+  mounts the pod supplies win.
+
+No change for other platforms. Test.
+---
+ server/container_create.go      |  2 +
+ server/image_os_freebsd.go      | 69 +++++++++++++++++++++++++++++++++
+ server/image_os_freebsd_test.go | 47 ++++++++++++++++++++++
+ server/image_os_other.go        | 16 ++++++++
+ server/image_pull.go            |  6 +++
+ server/server.go                |  3 ++
+ 6 files changed, 143 insertions(+)
+ create mode 100644 server/image_os_freebsd.go
+ create mode 100644 server/image_os_freebsd_test.go
+ create mode 100644 server/image_os_other.go
+
+diff --git a/server/container_create.go b/server/container_create.go
+index 81391dca7..01cbb0378 100644
+--- a/server/container_create.go
++++ b/server/container_create.go
+@@ -840,6 +840,8 @@ func (s *Server) createSandboxContainer(ctx context.Context, ctr container.Conta
+ 		return nil, err
+ 	}
+ 
++	addImageOSMounts(specgen, imgInfo.imgResult, containerConfig)
++
+ 	err = ctr.SpecAddAnnotations(ctx, sb, containerVolumes, mountPoint, stopSignal, imgInfo.imgResult, s.config.CgroupManager().IsSystemd(), seccompRef, runtimePath)
+ 	if err != nil {
+ 		return nil, err
+diff --git a/server/image_os_freebsd.go b/server/image_os_freebsd.go
+new file mode 100644
+index 000000000..26e10c5b1
+--- /dev/null
++++ b/server/image_os_freebsd.go
+@@ -0,0 +1,69 @@
++package server
++
++import (
++	"path/filepath"
++
++	rspec "github.com/opencontainers/runtime-spec/specs-go"
++	"github.com/opencontainers/runtime-tools/generate"
++	types "k8s.io/cri-api/pkg/apis/runtime/v1"
++
++	"github.com/cri-o/cri-o/internal/storage"
++)
++
++// ImageOSAnnotation, set in a runtime handler's default_annotations, selects
++// the operating system of the images pulled for pods using that handler. On
++// FreeBSD, a handler with "io.bsdk8s.image-os" = "linux" (exposed through a
++// Kubernetes RuntimeClass) runs Linux images in jails under the Linux ABI
++// (Linuxulator): their ELF binaries run directly on the FreeBSD kernel.
++//
++//	[crio.runtime.runtimes.linux]
++//	runtime_path = "/usr/local/bin/ocijail"
++//	default_annotations = { "io.bsdk8s.image-os" = "linux" }
++const ImageOSAnnotation = "io.bsdk8s.image-os"
++
++// imageOSForPod returns the image OS for a pull on behalf of a pod: the
++// kubelet creates the pod's sandbox before pulling its images, so the
++// sandbox's runtime handler is known (the CRI only passes the handler with
++// pulls behind the alpha RuntimeClassInImageCriApi gate).
++func (s *Server) imageOSForPod(sc *types.PodSandboxConfig) string {
++	uid := sc.GetMetadata().GetUid()
++	if uid == "" {
++		return ""
++	}
++	for _, sb := range s.ContainerServer.ListSandboxes() {
++		if sb.Metadata().GetUid() != uid {
++			continue
++		}
++		if h, ok := s.config.Runtimes[sb.RuntimeHandler()]; ok && h != nil {
++			return h.DefaultAnnotations[ImageOSAnnotation]
++		}
++	}
++	return ""
++}
++
++// addImageOSMounts gives containers of Linux images the Linux views of /proc
++// and /sys and a /dev/shm, as podman does for Linux containers on FreeBSD.
++// Mounts the pod supplies itself win.
++func addImageOSMounts(specgen *generate.Generator, img *storage.ImageResult, containerConfig *types.ContainerConfig) {
++	if img == nil || img.OCIConfig == nil || img.OCIConfig.OS != "linux" {
++		return
++	}
++	have := map[string]bool{}
++	for _, m := range containerConfig.GetMounts() {
++		have[filepath.Clean(m.GetContainerPath())] = true
++	}
++	for _, m := range specgen.Mounts() {
++		have[filepath.Clean(m.Destination)] = true
++	}
++	for _, m := range linuxImageMounts {
++		if !have[m.Destination] {
++			specgen.AddMount(m)
++		}
++	}
++}
++
++var linuxImageMounts = []rspec.Mount{
++	{Destination: "/proc", Type: "linprocfs", Source: "proc", Options: []string{"nodev"}},
++	{Destination: "/sys", Type: "linsysfs", Source: "sysfs", Options: []string{"nodev"}},
++	{Destination: "/dev/shm", Type: "tmpfs", Source: "shm", Options: []string{"mode=1777"}},
++}
+diff --git a/server/image_os_freebsd_test.go b/server/image_os_freebsd_test.go
+new file mode 100644
+index 000000000..e57760761
+--- /dev/null
++++ b/server/image_os_freebsd_test.go
+@@ -0,0 +1,47 @@
++package server
++
++import (
++	"testing"
++
++	specs "github.com/opencontainers/image-spec/specs-go/v1"
++	rspec "github.com/opencontainers/runtime-spec/specs-go"
++	"github.com/opencontainers/runtime-tools/generate"
++	types "k8s.io/cri-api/pkg/apis/runtime/v1"
++
++	"github.com/cri-o/cri-o/internal/storage"
++)
++
++func TestAddImageOSMounts(t *testing.T) {
++	mounts := func(img *storage.ImageResult, cc *types.ContainerConfig, pre ...rspec.Mount) map[string]string {
++		g, err := generate.New("freebsd")
++		if err != nil {
++			t.Fatal(err)
++		}
++		g.ClearMounts()
++		for _, m := range pre {
++			g.AddMount(m)
++		}
++		addImageOSMounts(&g, img, cc)
++		got := map[string]string{}
++		for _, m := range g.Mounts() {
++			got[m.Destination] = m.Type
++		}
++		return got
++	}
++	linux := &storage.ImageResult{OCIConfig: &specs.Image{Platform: specs.Platform{OS: "linux"}}}
++	freebsd := &storage.ImageResult{OCIConfig: &specs.Image{Platform: specs.Platform{OS: "freebsd"}}}
++
++	if got := mounts(freebsd, &types.ContainerConfig{}); len(got) != 0 {
++		t.Errorf("FreeBSD image got Linux mounts: %v", got)
++	}
++	got := mounts(linux, &types.ContainerConfig{})
++	if got["/proc"] != "linprocfs" || got["/sys"] != "linsysfs" || got["/dev/shm"] != "tmpfs" {
++		t.Errorf("Linux image mounts: %v", got)
++	}
++	// a /dev/shm the pod supplies (emptyDir) and an existing /proc win
++	got = mounts(linux, &types.ContainerConfig{Mounts: []*types.Mount{{ContainerPath: "/dev/shm"}}},
++		rspec.Mount{Destination: "/proc", Type: "procfs"})
++	if got["/proc"] != "procfs" || got["/dev/shm"] != "" || got["/sys"] != "linsysfs" {
++		t.Errorf("supplied mounts not respected: %v", got)
++	}
++}
+diff --git a/server/image_os_other.go b/server/image_os_other.go
+new file mode 100644
+index 000000000..48dfa47dc
+--- /dev/null
++++ b/server/image_os_other.go
+@@ -0,0 +1,16 @@
++//go:build !freebsd
++
++package server
++
++import (
++	"github.com/opencontainers/runtime-tools/generate"
++	types "k8s.io/cri-api/pkg/apis/runtime/v1"
++
++	"github.com/cri-o/cri-o/internal/storage"
++)
++
++// imageOSForPod: images are pulled for the host's OS.
++func (s *Server) imageOSForPod(_ *types.PodSandboxConfig) string { return "" }
++
++// addImageOSMounts: nothing to add for native images.
++func addImageOSMounts(_ *generate.Generator, _ *storage.ImageResult, _ *types.ContainerConfig) {}
+diff --git a/server/image_pull.go b/server/image_pull.go
+index 8f6036027..d70bb6198 100644
+--- a/server/image_pull.go
++++ b/server/image_pull.go
+@@ -54,6 +54,8 @@ func (s *Server) PullImage(ctx context.Context, req *types.PullImageRequest) (*t
+ 		if sc.GetMetadata() != nil {
+ 			pullArgs.namespace = sc.GetMetadata().GetNamespace()
+ 		}
++
++		pullArgs.os = s.imageOSForPod(sc)
+ 	}
+ 
+ 	if req.GetAuth() != nil {
+@@ -156,6 +158,10 @@ func (s *Server) pullImage(ctx context.Context, pullArgs *pullArguments) (string
+ 	}
+ 
+ 	sourceCtx.DockerLogMirrorChoice = true // Add info level log of the pull source
++	if pullArgs.os != "" {
++		sourceCtx.OSChoice = pullArgs.os
++		log.Infof(ctx, "Pulling image %s for OS %s", pullArgs.image, pullArgs.os)
++	}
+ 	if pullArgs.credentials.Username != "" {
+ 		sourceCtx.DockerAuthConfig = &pullArgs.credentials
+ 	}
+diff --git a/server/server.go b/server/server.go
+index 49f91e8ed..607e5ea83 100644
+--- a/server/server.go
++++ b/server/server.go
+@@ -110,6 +110,9 @@ type pullArguments struct {
+ 	sandboxCgroup string
+ 	credentials   imageTypes.DockerAuthConfig
+ 	namespace     string
++	// os, when set, is the operating system to pull the image for
++	// (imageOSForPod); otherwise the host's.
++	os string
+ }
+ 
+ // pullOperation is used to synchronize parallel pull operations via the
+-- 
+2.54.0 (Apple Git-157)
+

@@ -147,6 +147,9 @@ A real eBPF VM in the kernel (the old generic-ebpf project, hooked into pf/ipfw)
      - **Rootfs:** ZFS zvol clones, with no virtio-fs needed.
      - **Shim:** a new FreeBSD containerd/CRI-O shim for Kata.
      - **Effort:** ~4–6 engineer-months.
+- **Status 2026-11-16 (research/10):** the `linux` RuntimeClass (Linuxulator in jails) works. Unmodified nginx
+  and metrics-server run on FreeBSD nodes, and `kubectl top` works. EPOLLEXCLUSIVE has been fixed in the kernel.
+  Open: an `os=linux` nodeSelector webhook, AIO, `/proc/net`, inotify+epoll.
 - **Hard truth:** cloud VMs have no nested virtualization, so on EC2/GCE FreeBSD nodes Linux images only get the Linuxulator path. Bare metal gets bhyve.
 
 ### 5.5 Storage & images (`research/05`)

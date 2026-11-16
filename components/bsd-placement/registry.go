@@ -224,7 +224,8 @@ func (c *registryClient) lookup(ctx context.Context, image string) (map[string]b
 		MediaType string `json:"mediaType"`
 		Manifests []struct {
 			Platform struct {
-				OS string `json:"os"`
+				OS           string `json:"os"`
+				Architecture string `json:"architecture"`
 			} `json:"platform"`
 		} `json:"manifests"`
 		Config struct {
@@ -243,6 +244,11 @@ func (c *registryClient) lookup(ctx context.Context, image string) (map[string]b
 		for _, d := range m.Manifests {
 			if d.Platform.OS != "" && d.Platform.OS != "unknown" { // "unknown" = attestations
 				oses[d.Platform.OS] = true
+				arch := d.Platform.Architecture
+				if arch == "" {
+					arch = "*" // unspecified: assume any
+				}
+				oses[d.Platform.OS+"/"+arch] = true
 			}
 		}
 	case mtOCIManifest, mtDockerSchema:
@@ -254,12 +260,18 @@ func (c *registryClient) lookup(ctx context.Context, image string) (map[string]b
 			return nil, err
 		}
 		var ic struct {
-			OS string `json:"os"`
+			OS           string `json:"os"`
+			Architecture string `json:"architecture"`
 		}
 		if err := json.Unmarshal(cfg, &ic); err != nil || ic.OS == "" {
 			return nil, fmt.Errorf("%s: no os in image config", image)
 		}
 		oses[ic.OS] = true
+		arch := ic.Architecture
+		if arch == "" {
+			arch = "*" // unspecified: assume any
+		}
+		oses[ic.OS+"/"+arch] = true
 	default:
 		return nil, fmt.Errorf("%s: unsupported manifest type %q", image, mt)
 	}
@@ -387,7 +399,16 @@ const (
 )
 
 // decideImages looks at every container image of a pod spec.
-func decideImages(ctx context.Context, rc *registryClient, nodeOS string, images []string) (imageDecision, string) {
+// has reports whether the image has an os (and, if arch is set, os/arch)
+// variant.
+func has(oses map[string]bool, os, arch string) bool {
+	if arch == "" {
+		return oses[os]
+	}
+	return oses[os+"/"+arch] || oses[os+"/*"]
+}
+
+func decideImages(ctx context.Context, rc *registryClient, nodeOS, nodeArch string, images []string) (imageDecision, string) {
 	needLinux, needNative := []string{}, []string{}
 	for _, img := range images {
 		oses, err := rc.platforms(ctx, img)
@@ -395,9 +416,9 @@ func decideImages(ctx context.Context, rc *registryClient, nodeOS string, images
 			return undecided, err.Error()
 		}
 		switch {
-		case oses[nodeOS]:
+		case has(oses, nodeOS, nodeArch):
 			// runs natively
-		case oses["linux"]:
+		case has(oses, "linux", nodeArch):
 			needLinux = append(needLinux, img)
 		default:
 			needNative = append(needNative, img) // e.g. windows-only
@@ -405,7 +426,7 @@ func decideImages(ctx context.Context, rc *registryClient, nodeOS string, images
 	}
 	switch {
 	case len(needNative) > 0:
-		return undecided, "no " + nodeOS + " or linux variant: " + strings.Join(needNative, ", ")
+		return undecided, "no " + nodeOS + " or linux variant for " + nodeArch + ": " + strings.Join(needNative, ", ")
 	case len(needLinux) > 0:
 		return useLinux, "linux-only image: " + strings.Join(needLinux, ", ")
 	}

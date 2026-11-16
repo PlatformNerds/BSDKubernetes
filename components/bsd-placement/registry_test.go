@@ -61,6 +61,9 @@ func fakeRegistry(t *testing.T, hits *int32) *httptest.Server {
 		case "/v2/o/lnx/manifests/v1":
 			w.Header().Set("Content-Type", mtDockerList)
 			w.Write([]byte(`{"manifests":[{"platform":{"os":"linux"}},{"platform":{"os":"unknown"}}]}`))
+		case "/v2/o/amd/manifests/v1":
+			w.Header().Set("Content-Type", mtOCIIndex)
+			w.Write([]byte(`{"manifests":[{"platform":{"os":"freebsd","architecture":"amd64"}},{"platform":{"os":"linux","architecture":"amd64"}}]}`))
 		case "/v2/o/single/manifests/v1":
 			w.Header().Set("Content-Type", mtOCIManifest)
 			w.Write([]byte(`{"config":{"digest":"sha256:cfg"}}`))
@@ -86,7 +89,7 @@ func TestPlatforms(t *testing.T) {
 	defer srv.Close()
 	rc, host := testClient(srv)
 	ctx := context.Background()
-	for img, want := range map[string]string{"/o/multi:v1": "freebsd,linux", "/o/lnx:v1": "linux", "/o/single:v1": "linux"} {
+	for img, want := range map[string]string{"/o/multi:v1": "freebsd,freebsd/arm64,linux,linux/arm64", "/o/lnx:v1": "linux,linux/*", "/o/single:v1": "linux,linux/arm64"} {
 		oses, err := rc.platforms(ctx, host+img)
 		if err != nil {
 			t.Fatalf("%s: %v", img, err)
@@ -120,7 +123,7 @@ func TestDecideAndAutoMutate(t *testing.T) {
 	defer srv.Close()
 	rc, host := testClient(srv)
 	decide := func(images []string) (imageDecision, string) {
-		return decideImages(context.Background(), rc, "freebsd", images)
+		return decideImages(context.Background(), rc, "freebsd", "arm64", images)
 	}
 	pod := func(images ...string) string {
 		var cs []string
@@ -224,5 +227,22 @@ func TestRealmWithQuery(t *testing.T) {
 	}
 	if _, err := rc.anonymousToken(context.Background(), `Bearer realm="ftp://x/t"`); err == nil {
 		t.Error("non-http(s) realm accepted")
+	}
+}
+
+func TestArchitecture(t *testing.T) {
+	var hits int32
+	srv := fakeRegistry(t, &hits)
+	defer srv.Close()
+	rc, host := testClient(srv)
+	ctx := context.Background()
+	if d, why := decideImages(ctx, rc, "freebsd", "arm64", []string{host + "/o/amd:v1"}); d != undecided || !strings.Contains(why, "arm64") {
+		t.Errorf("amd64-only image on arm64: %v %q", d, why)
+	}
+	if d, _ := decideImages(ctx, rc, "freebsd", "amd64", []string{host + "/o/amd:v1"}); d != keepNative {
+		t.Errorf("amd64 image on amd64: %v", d)
+	}
+	if d, _ := decideImages(ctx, rc, "freebsd", "", []string{host + "/o/amd:v1"}); d != keepNative {
+		t.Errorf("any arch: %v", d)
 	}
 }

@@ -1,0 +1,315 @@
+From 0a2da577520668a5d6059d4253ba8f53c6c05963 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 12:17:44 -0700
+Subject: [PATCH] Apply pod network sysctls (linux.sysctl) inside a new vnet
+ jail
+
+CRI-O passes a pod's sysctls (from securityContext.sysctls and the
+default_sysctls config) in the sandbox spec's linux.sysctl, which ocijail
+ignored. When ocijail creates a jail with its own vnet (the pod sandbox),
+translate the entries that have a per-vnet FreeBSD equivalent and set them
+from inside the jail (fork, jail_attach, sysctlbyname; the kernel lets a
+jail that owns its vnet write CTLFLAG_VNET sysctls):
+
+  net.ipv4.ip_unprivileged_port_start=N -> net.inet.ip.portrange.reservedhigh=max(N-1,0)
+  net.ipv4.ip_local_port_range="LO HI"  -> net.inet.ip.portrange.first/last
+
+Others are logged and ignored. With CRI-O's default_sysctls set to
+net.ipv4.ip_unprivileged_port_start=0 (the containerd 2.x default), non-root
+processes can bind ports below 1024 in their pod, e.g. ingress-nginx
+(uid 101 + NET_BIND_SERVICE), while the host keeps its reserved ports.
+Translation is unit tested (sysctl_test).
+---
+ ocijail/BUILD           |   9 +++
+ ocijail/create.cpp      |  18 ++++++
+ ocijail/sysctl.cpp      | 119 ++++++++++++++++++++++++++++++++++++++++
+ ocijail/sysctl.h        |  35 ++++++++++++
+ ocijail/sysctl_test.cpp |  48 ++++++++++++++++
+ 5 files changed, 229 insertions(+)
+ create mode 100644 ocijail/sysctl.cpp
+ create mode 100644 ocijail/sysctl.h
+ create mode 100644 ocijail/sysctl_test.cpp
+
+diff --git a/ocijail/BUILD b/ocijail/BUILD
+index f233e62..9ae62a0 100644
+--- a/ocijail/BUILD
++++ b/ocijail/BUILD
+@@ -35,6 +35,8 @@ cc_binary(
+         "start.h",
+         "state.cpp",
+         "state.h",
++        "sysctl.cpp",
++        "sysctl.h",
+         "tty.cpp",
+         "tty.h",
+         "update.cpp",
+@@ -53,3 +55,10 @@ cc_test(
+     srcs = ["rctl_test.cpp", "rctl.cpp", "rctl.h"],
+     deps = ["@nlohmann_json//:json"],
+ )
++
++cc_test(
++    name = "sysctl_test",
++    copts = ["-std=c++20"],
++    srcs = ["sysctl_test.cpp", "sysctl.cpp", "sysctl.h"],
++    deps = ["@nlohmann_json//:json"],
++)
+diff --git a/ocijail/create.cpp b/ocijail/create.cpp
+index 40efd05..684401e 100644
+--- a/ocijail/create.cpp
++++ b/ocijail/create.cpp
+@@ -15,6 +15,7 @@
+ #include "ocijail/hook.h"
+ #include "ocijail/jail.h"
+ #include "ocijail/rctl.h"
++#include "ocijail/sysctl.h"
+ #include "ocijail/mount.h"
+ #include "ocijail/process.h"
+ #include "ocijail/tty.h"
+@@ -465,6 +466,23 @@ void create::run() {
+ 
+     auto j = jail::create(jconf);
+ 
++    // Per-pod network sysctls: only for a jail with its own vnet (the pod
++    // sandbox), where the kernel scopes them to that vnet.
++    if (vnet == jail::NEW && config.contains("linux") &&
++        config["linux"].contains("sysctl")) {
++        auto t = sysctl::from_oci_sysctl(config["linux"]["sysctl"]);
++        for (const auto& ign : t.ignored) {
++            app_.log() << "warning: sysctl " << ign
++                       << " has no per-vnet FreeBSD equivalent, ignoring";
++        }
++        try {
++            sysctl::apply_in_jail(j.jid(), t);
++        } catch (...) {
++            j.remove();
++            throw;
++        }
++    }
++
+     // Resource limits: translate OCI linux.resources into rctl rules on this
+     // jail. Rules are keyed by jail name (not jid) and outlive the jail, so
+     // first drop any stale rules left under this name (e.g. by a crash, or a
+diff --git a/ocijail/sysctl.cpp b/ocijail/sysctl.cpp
+new file mode 100644
+index 0000000..b5d8d62
+--- /dev/null
++++ b/ocijail/sysctl.cpp
+@@ -0,0 +1,119 @@
++#include "ocijail/sysctl.h"
++
++#include <sys/param.h>
++#include <sys/jail.h>
++#include <sys/sysctl.h>
++#include <sys/wait.h>
++#include <unistd.h>
++
++#include <algorithm>
++#include <cerrno>
++#include <cstring>
++#include <sstream>
++#include <stdexcept>
++#include <system_error>
++
++namespace ocijail::sysctl {
++
++static bool parse_int(const std::string& s, int& out) {
++    if (s.empty()) {
++        return false;
++    }
++    char* end = nullptr;
++    errno = 0;
++    long v = std::strtol(s.c_str(), &end, 10);
++    if (errno != 0 || *end != '\0' || v < 0 || v > 65535) {
++        return false;
++    }
++    out = static_cast<int>(v);
++    return true;
++}
++
++translation from_oci_sysctl(const nlohmann::json& sysctls) {
++    translation t;
++    if (!sysctls.is_object()) {
++        return t;
++    }
++    for (const auto& [key, val] : sysctls.items()) {
++        std::string v = val.is_string() ? val.get<std::string>() : val.dump();
++        if (key == "net.ipv4.ip_unprivileged_port_start") {
++            int n;
++            if (!parse_int(v, n)) {
++                t.ignored.push_back(key + "=" + v);
++                continue;
++            }
++            t.settings.emplace_back("net.inet.ip.portrange.reservedhigh",
++                                    std::max(n - 1, 0));
++        } else if (key == "net.ipv4.ip_local_port_range") {
++            std::istringstream in(v);
++            std::string lo_s, hi_s, extra;
++            int lo, hi;
++            if (!(in >> lo_s >> hi_s) || (in >> extra) || !parse_int(lo_s, lo) ||
++                !parse_int(hi_s, hi) || lo == 0 || lo > hi) {
++                t.ignored.push_back(key + "=" + v);
++                continue;
++            }
++            t.settings.emplace_back("net.inet.ip.portrange.first", lo);
++            t.settings.emplace_back("net.inet.ip.portrange.last", hi);
++        } else {
++            t.ignored.push_back(key + "=" + v);
++        }
++    }
++    return t;
++}
++
++void apply_in_jail(int jid, const translation& t) {
++    if (t.settings.empty()) {
++        return;
++    }
++    int pipefd[2];
++    if (::pipe(pipefd) < 0) {
++        throw std::system_error{errno, std::system_category(), "pipe"};
++    }
++    pid_t pid = ::fork();
++    if (pid < 0) {
++        int e = errno;
++        ::close(pipefd[0]);
++        ::close(pipefd[1]);
++        throw std::system_error{e, std::system_category(), "fork"};
++    }
++    if (pid == 0) {
++        // Child: report the index of the failing setting and errno.
++        ::close(pipefd[0]);
++        int report[2] = {-1, 0};
++        if (::jail_attach(jid) < 0) {
++            report[1] = errno;
++        } else {
++            for (std::size_t i = 0; i < t.settings.size(); i++) {
++                int v = t.settings[i].second;
++                if (::sysctlbyname(t.settings[i].first.c_str(), nullptr,
++                                   nullptr, &v, sizeof(v)) < 0) {
++                    report[0] = static_cast<int>(i);
++                    report[1] = errno;
++                    break;
++                }
++            }
++        }
++        (void)!::write(pipefd[1], report, sizeof(report));
++        ::_exit(report[1] == 0 ? 0 : 1);
++    }
++    ::close(pipefd[1]);
++    int report[2] = {-1, 0};
++    ssize_t n = ::read(pipefd[0], report, sizeof(report));
++    ::close(pipefd[0]);
++    int status = 0;
++    while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
++    }
++    if (n != sizeof(report)) {
++        throw std::runtime_error("sysctl: helper process failed");
++    }
++    if (report[1] != 0) {
++        std::string what = report[0] < 0
++                               ? std::string{"jail_attach"}
++                               : "setting " + t.settings[report[0]].first;
++        throw std::system_error{report[1], std::system_category(),
++                                "sysctl: " + what};
++    }
++}
++
++}  // namespace ocijail::sysctl
+diff --git a/ocijail/sysctl.h b/ocijail/sysctl.h
+new file mode 100644
+index 0000000..678ec93
+--- /dev/null
++++ b/ocijail/sysctl.h
+@@ -0,0 +1,35 @@
++#pragma once
++
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "nlohmann/json.hpp"
++
++namespace ocijail::sysctl {
++
++// Translate OCI "linux.sysctl" entries into FreeBSD sysctls that are
++// per-VNET, so they can be set inside a pod's own vnet jail without
++// touching the host. Pure function, no syscalls, so it can be unit tested.
++//
++//   net.ipv4.ip_unprivileged_port_start=N
++//       -> net.inet.ip.portrange.reservedhigh=max(N-1, 0)
++//          Ports up to reservedhigh need privilege to bind; 0 lets any user
++//          bind any port, like Linux with ip_unprivileged_port_start=0 (the
++//          containerd 2.x default for pods). Covers IPv4 and IPv6.
++//   net.ipv4.ip_local_port_range="LOW HIGH"
++//       -> net.inet.ip.portrange.first=LOW, net.inet.ip.portrange.last=HIGH
++//
++// Anything else is returned in "ignored" (Linux-only, or not per-VNET).
++struct translation {
++    std::vector<std::pair<std::string, int>> settings;
++    std::vector<std::string> ignored;
++};
++
++translation from_oci_sysctl(const nlohmann::json& sysctls);
++
++// Set the given sysctls from inside the jail (fork, jail_attach,
++// sysctlbyname). The jail must own its vnet for the kernel to allow it.
++void apply_in_jail(int jid, const translation& t);
++
++}  // namespace ocijail::sysctl
+diff --git a/ocijail/sysctl_test.cpp b/ocijail/sysctl_test.cpp
+new file mode 100644
+index 0000000..85e5cdf
+--- /dev/null
++++ b/ocijail/sysctl_test.cpp
+@@ -0,0 +1,48 @@
++// Unit tests for sysctl::from_oci_sysctl (pure translation, no syscalls).
++#include <cstdlib>
++#include <iostream>
++
++#include "ocijail/sysctl.h"
++
++using nlohmann::json;
++using ocijail::sysctl::from_oci_sysctl;
++using settings = std::vector<std::pair<std::string, int>>;
++
++static void expect(const json& in, settings want,
++                   std::vector<std::string> ignored = {}) {
++    auto t = from_oci_sysctl(in);
++    if (t.settings != want || t.ignored != ignored) {
++        std::cerr << "FAIL for " << in.dump() << "\n  got:";
++        for (auto& [k, v] : t.settings) std::cerr << " " << k << "=" << v;
++        std::cerr << "\n  ignored:";
++        for (auto& i : t.ignored) std::cerr << " " << i;
++        std::cerr << "\n";
++        std::exit(1);
++    }
++}
++
++int main() {
++    const std::string rh = "net.inet.ip.portrange.reservedhigh";
++    expect(json::object(), {});
++    expect(json(nullptr), {});
++    expect({{"net.ipv4.ip_unprivileged_port_start", "0"}}, {{rh, 0}});
++    expect({{"net.ipv4.ip_unprivileged_port_start", "1"}}, {{rh, 0}});
++    expect({{"net.ipv4.ip_unprivileged_port_start", "1024"}}, {{rh, 1023}});
++    expect({{"net.ipv4.ip_unprivileged_port_start", "80x"}}, {},
++           {"net.ipv4.ip_unprivileged_port_start=80x"});
++    expect({{"net.ipv4.ip_unprivileged_port_start", "-1"}}, {},
++           {"net.ipv4.ip_unprivileged_port_start=-1"});
++    expect({{"net.ipv4.ip_local_port_range", "32768 60999"}},
++           {{"net.inet.ip.portrange.first", 32768},
++            {"net.inet.ip.portrange.last", 60999}});
++    expect({{"net.ipv4.ip_local_port_range", "2000\t3000"}},
++           {{"net.inet.ip.portrange.first", 2000},
++            {"net.inet.ip.portrange.last", 3000}});
++    expect({{"net.ipv4.ip_local_port_range", "3000 2000"}}, {},
++           {"net.ipv4.ip_local_port_range=3000 2000"});
++    expect({{"net.ipv4.ip_local_port_range", "1 2 3"}}, {},
++           {"net.ipv4.ip_local_port_range=1 2 3"});
++    expect({{"kernel.shm_rmid_forced", "1"}}, {}, {"kernel.shm_rmid_forced=1"});
++    std::cout << "sysctl_test: PASS\n";
++    return 0;
++}
+-- 
+2.54.0 (Apple Git-157)
+

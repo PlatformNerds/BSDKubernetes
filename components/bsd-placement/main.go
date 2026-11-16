@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -68,7 +69,7 @@ func handler(cfg Config, rc *registryClient) http.HandlerFunc {
 			ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 			defer cancel()
 			decide = func(images []string) (imageDecision, string) {
-				return decideImages(ctx, rc, cfg.NodeOS, images)
+				return decideImages(ctx, rc, cfg.NodeOS, cfg.NodeArch, images)
 			}
 		}
 		resp := &admissionResponse{UID: req.UID, Allowed: true}
@@ -113,6 +114,7 @@ func main() {
 	rc := flag.String("runtime-class", "linux", "RuntimeClass for Linux workloads")
 	sel := flag.String("node-selector", "bsdk8s.io/linux-abi=true", "nodeSelector added to rewritten pods (k=v,...)")
 	nodeOS := flag.String("node-os", "freebsd", "kubernetes.io/os value of the target nodes")
+	nodeArch := flag.String("node-arch", runtime.GOARCH, "architecture of the target nodes for image lookups (\"\" = any)")
 	cacheTTL := flag.Duration("image-cache-ttl", 10*time.Minute, "how long to cache an image's platforms (auto namespaces)")
 	every := flag.Duration("reconcile-interval", 30*time.Second, "how often to look for Linux-pinned pods admitted without the webhook (0 disables)")
 	minAge := flag.Duration("reconcile-min-age", time.Minute, "only act on pods pending at least this long")
@@ -122,7 +124,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	cfg := Config{RuntimeClass: *rc, NodeSelector: ns, NodeOS: *nodeOS}
+	cfg := Config{RuntimeClass: *rc, NodeSelector: ns, NodeOS: *nodeOS, NodeArch: *nodeArch}
 	mux := http.NewServeMux()
 	reg := newRegistryClient(*cacheTTL)
 	h := handler(cfg, reg)

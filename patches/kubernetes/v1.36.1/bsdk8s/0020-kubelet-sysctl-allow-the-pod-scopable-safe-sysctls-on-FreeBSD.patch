@@ -1,0 +1,78 @@
+From 318a2644e05753764a35be3a51b6336fd164a993 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 12:16:34 -0700
+Subject: [PATCH] kubelet/sysctl: allow the pod-scopable safe sysctls on
+ FreeBSD
+
+SafeSysctlAllowlist returned nothing on non-Linux, so any pod-level
+sysctl was refused (SysctlForbidden). On FreeBSD, ocijail maps
+net.ipv4.ip_unprivileged_port_start and net.ipv4.ip_local_port_range onto
+per-vnet sysctls of the pod's vnet jail; allow exactly those.
+---
+ pkg/kubelet/sysctl/safe_sysctls.go            | 14 +++++++++++++
+ .../sysctl/safe_sysctls_freebsd_test.go       | 21 +++++++++++++++++++
+ 2 files changed, 35 insertions(+)
+ create mode 100644 pkg/kubelet/sysctl/safe_sysctls_freebsd_test.go
+
+diff --git a/pkg/kubelet/sysctl/safe_sysctls.go b/pkg/kubelet/sysctl/safe_sysctls.go
+index d5e1146f378..cf76efd7ac5 100644
+--- a/pkg/kubelet/sysctl/safe_sysctls.go
++++ b/pkg/kubelet/sysctl/safe_sysctls.go
+@@ -32,6 +32,17 @@ type sysctl struct {
+ 	kernel string
+ }
+ 
++// freebsdSafeSysctls are the safe sysctls a FreeBSD runtime can scope to a
++// pod: ocijail maps them onto per-vnet sysctls of the pod's own vnet jail
++// (ip_unprivileged_port_start -> net.inet.ip.portrange.reservedhigh,
++// ip_local_port_range -> net.inet.ip.portrange.first/last). The other Linux
++// safe sysctls have no per-pod FreeBSD equivalent, and allowing them would
++// let pods ask for settings that are silently ignored.
++var freebsdSafeSysctls = []string{
++	"net.ipv4.ip_local_port_range",
++	"net.ipv4.ip_unprivileged_port_start",
++}
++
+ var safeSysctls = []sysctl{
+ 	{
+ 		name: "kernel.shm_rmid_forced",
+@@ -77,6 +88,9 @@ var safeSysctls = []sysctl{
+ // - it is namespaced in the container or the pod
+ // - it is isolated, i.e. has no influence on any other pod on the same node.
+ func SafeSysctlAllowlist(ctx context.Context) []string {
++	if goruntime.GOOS == "freebsd" {
++		return freebsdSafeSysctls
++	}
+ 	if goruntime.GOOS != "linux" {
+ 		return nil
+ 	}
+diff --git a/pkg/kubelet/sysctl/safe_sysctls_freebsd_test.go b/pkg/kubelet/sysctl/safe_sysctls_freebsd_test.go
+new file mode 100644
+index 00000000000..b5b14f4165b
+--- /dev/null
++++ b/pkg/kubelet/sysctl/safe_sysctls_freebsd_test.go
+@@ -0,0 +1,21 @@
++//go:build freebsd
++
++package sysctl
++
++import (
++	"context"
++	"testing"
++)
++
++func TestSafeSysctlAllowlistFreeBSD(t *testing.T) {
++	got := SafeSysctlAllowlist(context.Background())
++	want := map[string]bool{"net.ipv4.ip_local_port_range": true, "net.ipv4.ip_unprivileged_port_start": true}
++	if len(got) != len(want) {
++		t.Fatalf("SafeSysctlAllowlist() = %v, want %v", got, want)
++	}
++	for _, s := range got {
++		if !want[s] {
++			t.Errorf("unexpected safe sysctl %q", s)
++		}
++	}
++}
+-- 
+2.54.0 (Apple Git-157)
+

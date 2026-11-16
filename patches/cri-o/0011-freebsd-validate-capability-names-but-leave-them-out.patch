@@ -1,0 +1,82 @@
+From cd0ae538e755c86b0708d25c573a65d0fe33909d Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 12:13:52 -0700
+Subject: [PATCH 2/2] freebsd: validate capability names but leave them out of
+ the spec
+
+The runtime-tools generator rejects every capability as "not supported on
+the current host" on FreeBSD (there is no kernel capability set to check
+against). Jails do not enforce capabilities, so validate the requested
+names (typos are still errors) and put none in the spec.
+---
+ internal/factory/container/container.go       | 22 +++++++++++++++++++
+ .../factory/container/container_freebsd.go    |  5 +++++
+ internal/factory/container/container_linux.go |  3 +++
+ 3 files changed, 30 insertions(+)
+
+diff --git a/internal/factory/container/container.go b/internal/factory/container/container.go
+index bdae89764..dde528186 100644
+--- a/internal/factory/container/container.go
++++ b/internal/factory/container/container.go
+@@ -652,6 +652,28 @@ func (c *container) SpecSetupCapabilities(caps *types.Capability, defaultCaps ca
+ 		caps = &types.Capability{}
+ 	}
+ 
++	if !capabilitiesEnforced {
++		// Validate the names (a typo is still an error) but put nothing in
++		// the spec: the platform has no capabilities to set.
++		known, err := getOCICapabilitiesList()
++		if err != nil {
++			return fmt.Errorf("get OCI capabilities list: %w", err)
++		}
++		for _, cp := range append(caps.GetAddCapabilities(), caps.GetDropCapabilities()...) {
++			if strings.EqualFold(cp, "ALL") {
++				continue
++			}
++			name := strings.ToUpper(cp)
++			if !strings.HasPrefix(name, "CAP_") {
++				name = "CAP_" + name
++			}
++			if !inStringSlice(known, name) {
++				return fmt.Errorf("unknown capability %q", name)
++			}
++		}
++		return nil
++	}
++
+ 	toCAPPrefixed := func(capability string) string {
+ 		if !strings.HasPrefix(strings.ToLower(capability), "cap_") {
+ 			return "CAP_" + strings.ToUpper(capability)
+diff --git a/internal/factory/container/container_freebsd.go b/internal/factory/container/container_freebsd.go
+index 1e64a28cd..911ade3da 100644
+--- a/internal/factory/container/container_freebsd.go
++++ b/internal/factory/container/container_freebsd.go
+@@ -10,6 +10,11 @@ func (c *container) SelinuxLabel(sboxLabel string) ([]string, error) {
+ 	return []string{}, nil
+ }
+ 
++// capabilitiesEnforced is false: jails have no capabilities, so none are put
++// in the OCI spec (the generator would reject them as unsupported by the
++// host).
++const capabilitiesEnforced = false
++
+ // getOCICapabilitiesList returns the Linux capability names a pod may add or
+ // drop. FreeBSD has no capabilities and jails don't enforce them: root in a
+ // jail keeps root's (jail-restricted) privileges and other users have none.
+diff --git a/internal/factory/container/container_linux.go b/internal/factory/container/container_linux.go
+index a7aed849b..610f0b7d9 100644
+--- a/internal/factory/container/container_linux.go
++++ b/internal/factory/container/container_linux.go
+@@ -41,6 +41,9 @@ func (c *container) SelinuxLabel(sboxLabel string) ([]string, error) {
+ }
+ 
+ // getOCICapabilitiesList returns a list of all available capabilities.
++// capabilitiesEnforced: Linux applies the capability sets in the spec.
++const capabilitiesEnforced = true
++
+ func getOCICapabilitiesList() ([]string, error) {
+ 	caps := make([]string, 0, len(capability.ListKnown()))
+ 
+-- 
+2.54.0 (Apple Git-157)
+

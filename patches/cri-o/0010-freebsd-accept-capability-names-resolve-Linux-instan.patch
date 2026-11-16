@@ -1,0 +1,196 @@
+From 90eaaba124f50a8ef981b0cf10342c8606b24fb4 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 12:09:59 -0700
+Subject: [PATCH 1/2] freebsd: accept capability names; resolve Linux instances
+ of digest-pinned images
+
+Two fixes for unmodified Linux manifests on FreeBSD nodes (seen with
+ingress-nginx):
+
+- getOCICapabilitiesList returned no capabilities on FreeBSD, so any
+  securityContext.capabilities.add (e.g. NET_BIND_SERVICE) failed with
+  "unknown capability ... to add". Return the known Linux capability
+  names. Jails do not enforce them (FreeBSD has no capabilities); binding
+  ports below 1024 as non-root is provided per pod through the
+  net.ipv4.ip_unprivileged_port_start sysctl, which ocijail maps to the pod
+  vnet's net.inet.ip.portrange.reservedhigh.
+
+- An image referenced by tag@digest where the digest names a multi-platform
+  index was resolved in local storage for the host OS. For the Linux
+  RuntimeClass the stored instance is linux, so ImageStatus and
+  CreateContainer failed with "no image found in image index for
+  architecture arm64, variant "", OS freebsd" although the image had been
+  pulled. Resolve through imageStatusByName, which retries with the
+  platform's fallback OSes (linux on FreeBSD) on exactly that error.
+---
+ .../factory/container/container_freebsd.go    | 24 +++++++++++-
+ server/container_create.go                    |  2 +-
+ server/image_os_freebsd.go                    |  4 ++
+ server/image_os_other.go                      |  3 ++
+ server/image_pull.go                          |  2 +-
+ server/image_remove.go                        |  2 +-
+ server/image_status.go                        |  2 +-
+ server/image_status_os.go                     | 39 +++++++++++++++++++
+ 8 files changed, 72 insertions(+), 6 deletions(-)
+ create mode 100644 server/image_status_os.go
+
+diff --git a/internal/factory/container/container_freebsd.go b/internal/factory/container/container_freebsd.go
+index a90a52564..1e64a28cd 100644
+--- a/internal/factory/container/container_freebsd.go
++++ b/internal/factory/container/container_freebsd.go
+@@ -1,10 +1,30 @@
+ package container
+ 
++import (
++	"strings"
++
++	"github.com/moby/sys/capability"
++)
++
+ func (c *container) SelinuxLabel(sboxLabel string) ([]string, error) {
+ 	return []string{}, nil
+ }
+ 
+-// getOCICapabilitiesList returns a list of all available capabilities.
++// getOCICapabilitiesList returns the Linux capability names a pod may add or
++// drop. FreeBSD has no capabilities and jails don't enforce them: root in a
++// jail keeps root's (jail-restricted) privileges and other users have none.
++// Accepting the names lets unmodified manifests that add/drop capabilities
++// (e.g. NET_BIND_SERVICE for a non-root web server) run; rejecting them made
++// container creation fail with "unknown capability". The one capability
++// commonly needed by non-root workloads, binding ports below 1024, is
++// provided per pod instead via the net.ipv4.ip_unprivileged_port_start sysctl
++// (see default_sysctls), which ocijail maps to the pod vnet's
++// net.inet.ip.portrange.reservedhigh.
+ func getOCICapabilitiesList() ([]string, error) {
+-	return []string{}, nil
++	known := capability.ListKnown()
++	caps := make([]string, 0, len(known))
++	for _, c := range known {
++		caps = append(caps, "CAP_"+strings.ToUpper(c.String()))
++	}
++	return caps, nil
+ }
+diff --git a/server/container_create.go b/server/container_create.go
+index 01cbb0378..872e086fd 100644
+--- a/server/container_create.go
++++ b/server/container_create.go
+@@ -1297,7 +1297,7 @@ func (s *Server) resolveAndVerifyContainerImage(ctx context.Context, ctr contain
+ 
+ 		var imgResultErr error
+ 		for _, name := range potentialMatches {
+-			imgResult, imgResultErr = s.ContainerServer.StorageImageServer().ImageStatusByName(s.config.SystemContext, name)
++			imgResult, imgResultErr = s.imageStatusByName(name)
+ 			if imgResultErr == nil {
+ 				break
+ 			}
+diff --git a/server/image_os_freebsd.go b/server/image_os_freebsd.go
+index 7def69807..03d0d839f 100644
+--- a/server/image_os_freebsd.go
++++ b/server/image_os_freebsd.go
+@@ -78,3 +78,7 @@ var linuxImageMounts = []rspec.Mount{
+ 	{Destination: "/sys", Type: "linsysfs", Source: "sysfs", Options: []string{"nodev"}},
+ 	{Destination: "/dev/shm", Type: "tmpfs", Source: "shm", Options: []string{"mode=1777"}},
+ }
++
++// imageOSFallbacks: images of the Linux RuntimeClass are stored as Linux
++// instances; see imageStatusByName.
++func imageOSFallbacks() []string { return []string{"linux"} }
+diff --git a/server/image_os_other.go b/server/image_os_other.go
+index 48dfa47dc..61d164224 100644
+--- a/server/image_os_other.go
++++ b/server/image_os_other.go
+@@ -14,3 +14,6 @@ func (s *Server) imageOSForPod(_ *types.PodSandboxConfig) string { return "" }
+ 
+ // addImageOSMounts: nothing to add for native images.
+ func addImageOSMounts(_ *generate.Generator, _ *storage.ImageResult, _ *types.ContainerConfig) {}
++
++// imageOSFallbacks: images are always resolved for the host's OS.
++func imageOSFallbacks() []string { return nil }
+diff --git a/server/image_pull.go b/server/image_pull.go
+index d70bb6198..f44f2e5cb 100644
+--- a/server/image_pull.go
++++ b/server/image_pull.go
+@@ -345,7 +345,7 @@ func (s *Server) pullImageCandidate(ctx context.Context, sourceCtx *imageTypes.S
+ // store.
+ func (s *Server) resolveImageRefToID(ctx context.Context, imageRef storage.RegistryImageReference) (string, error) {
+ 	// Try resolving as a regular container image first.
+-	imageResult, err := s.ContainerServer.StorageImageServer().ImageStatusByName(s.config.SystemContext, imageRef)
++	imageResult, err := s.imageStatusByName(imageRef)
+ 	if err == nil {
+ 		return imageResult.ID.IDStringForOutOfProcessConsumptionOnly(), nil
+ 	}
+diff --git a/server/image_remove.go b/server/image_remove.go
+index 1ce91a4e7..36271d8d5 100644
+--- a/server/image_remove.go
++++ b/server/image_remove.go
+@@ -72,7 +72,7 @@ func (s *Server) removeImage(ctx context.Context, imageRef string) (untagErr err
+ 	for _, name := range potentialMatches {
+ 		var status *storage.ImageResult
+ 
+-		status, statusErr = s.ContainerServer.StorageImageServer().ImageStatusByName(s.config.SystemContext, name)
++		status, statusErr = s.imageStatusByName(name)
+ 		if statusErr != nil {
+ 			log.Warnf(ctx, "Error getting image status %s: %v", name, statusErr)
+ 
+diff --git a/server/image_status.go b/server/image_status.go
+index 4d498744a..29d9d28e0 100644
+--- a/server/image_status.go
++++ b/server/image_status.go
+@@ -126,7 +126,7 @@ func (s *Server) storageImageStatus(ctx context.Context, spec *types.ImageSpec)
+ 	var lastErr error
+ 
+ 	for _, name := range potentialMatches {
+-		status, err := s.ContainerServer.StorageImageServer().ImageStatusByName(s.config.SystemContext, name)
++		status, err := s.imageStatusByName(name)
+ 		if err != nil {
+ 			if errors.Is(err, istorage.ErrNoSuchImage) {
+ 				log.Debugf(ctx, "Can't find %s", name)
+diff --git a/server/image_status_os.go b/server/image_status_os.go
+new file mode 100644
+index 000000000..c26516725
+--- /dev/null
++++ b/server/image_status_os.go
+@@ -0,0 +1,39 @@
++package server
++
++import (
++	"strings"
++
++	imagetypes "go.podman.io/image/v5/types"
++
++	pkgstorage "github.com/cri-o/cri-o/internal/storage"
++)
++
++// imageStatusByName resolves an image name in local storage. A name that
++// refers to a multi-platform index (e.g. "repo:tag@sha256:<index digest>")
++// is resolved to the instance for the host's OS. On FreeBSD, images pulled
++// for the Linux RuntimeClass are Linux instances, so that fails with "no
++// image found in image index ... OS freebsd" although the image is present;
++// retry with each fallback OS (imageOSFallbacks) before giving up.
++func (s *Server) imageStatusByName(name pkgstorage.RegistryImageReference) (*pkgstorage.ImageResult, error) {
++	status, err := s.ContainerServer.StorageImageServer().ImageStatusByName(s.config.SystemContext, name)
++	if err == nil || !isNoInstanceForPlatform(err) {
++		return status, err
++	}
++	for _, os := range imageOSFallbacks() {
++		sc := imagetypes.SystemContext{}
++		if s.config.SystemContext != nil {
++			sc = *s.config.SystemContext
++		}
++		sc.OSChoice = os
++		if st, ferr := s.ContainerServer.StorageImageServer().ImageStatusByName(&sc, name); ferr == nil {
++			return st, nil
++		}
++	}
++	return status, err
++}
++
++func isNoInstanceForPlatform(err error) bool {
++	msg := err.Error()
++	return strings.Contains(msg, "no image found in image index for") ||
++		strings.Contains(msg, "no image found in manifest list for")
++}
+-- 
+2.54.0 (Apple Git-157)
+

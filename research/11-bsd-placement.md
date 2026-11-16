@@ -127,7 +127,8 @@ Also fixed:
 - An auth realm that already carries a query string works.
 
 Still open (low):
-- **Architecture is ignored.** A `freebsd/arm64`-only image counts as native on an amd64 node.
+- ~~**Architecture is ignored.**~~ Fixed. Platforms are matched as `os/arch`, with `--node-arch` defaulting to the
+  webhook's GOARCH; index entries without an architecture count as any.
 - **The reconciler only repairs pinned pods**, not `force`/`auto` ones.
 - **RuntimeClass `overhead`/`tolerations` aren't copied.** Ours defines neither.
 - **The serving cert isn't hot-reloaded.**

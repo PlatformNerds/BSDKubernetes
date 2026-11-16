@@ -38,6 +38,7 @@ type Config struct {
 	RuntimeClass string            // RuntimeClass to use for Linux pods
 	NodeSelector map[string]string // added so pods land on Linux-ABI nodes
 	NodeOS       string            // value of kubernetes.io/os on those nodes
+	NodeArch     string            // their architecture, for image lookups ("" = any)
 }
 
 // podSpecPath returns where the pod spec lives inside an object of the given

@@ -1,0 +1,112 @@
+From b8d8c98b4753eee8e021a364223973cdcf4eb669 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 17:37:36 -0700
+Subject: [PATCH 19/19] proxy/pf: masquerade hairpin connections (a pod
+ reaching itself through a Service)
+
+When round-robin redirected a pod's connection to a Service back to that
+same pod, the pod answered itself directly inside its own network stack:
+the reply never passed the node, the rdr was never reversed, and the
+client saw a reply from its own address instead of the Service's, so the
+connection failed (measured: every time the client itself was picked, i.e.
+half the requests with two endpoints). Linux kube-proxy masquerades
+hairpin traffic for the same reason. For each local endpoint, nat traffic
+from it to itself on the target port to the node IP: the reply then comes
+back through the node, which reverses both translations. Test.
+---
+ pkg/proxy/pf/proxier.go      | 33 +++++++++++++++++++++++++++++----
+ pkg/proxy/pf/proxier_test.go | 11 ++++++-----
+ 2 files changed, 35 insertions(+), 9 deletions(-)
+
+diff --git a/pkg/proxy/pf/proxier.go b/pkg/proxy/pf/proxier.go
+index 1dab4d68826..a352f84ccb1 100644
+--- a/pkg/proxy/pf/proxier.go
++++ b/pkg/proxy/pf/proxier.go
+@@ -441,9 +441,15 @@ func (proxier *Proxier) redirectRule(af, proto string, destinationIP net.IP, des
+ // ruleset whose translation rules don't all come before its filter rules,
+ // so the filter rules go last.
+ func (proxier *Proxier) writeServiceRules(svcName, af, proto string, clusterIP net.IP, port, nodePort int, nodeIPs []net.IP,
+-	redirHosts string, remoteIPs []string, targetPort int, sticky bool) {
++	redirHosts string, remoteIPs, localIPs []string, targetPort int, sticky bool) {
+ 	// redirect the service ip+port and optionally also the node port address+port
+ 	proxier.redirectRule(af, proto, clusterIP, port, redirHosts, targetPort, sticky, "")
++	// hairpin: a local endpoint redirected to itself
++	if proxier.nodeIP != nil && !proxier.nodeIP.IsUnspecified() {
++		for _, ip := range localIPs {
++			proxier.hairpinSNATRule(af, proto, ip, targetPort)
++		}
++	}
+ 	if nodePort != 0 {
+ 		for _, ip := range nodeIPs {
+ 			// Don't try to redirect ::1/128 or 127.0.0.0/8
+@@ -475,6 +481,23 @@ func (proxier *Proxier) writeServiceRules(svcName, af, proto string, clusterIP n
+ 	}
+ }
+ 
++// hairpinSNATRule masquerades a pod's connection to a Service that was
++// redirected to the pod itself. Without it the pod answers itself directly
++// inside its own network stack, the reply never passes this node, the rdr is
++// never reversed, and the client sees a reply from its own address instead
++// of the Service's, so the connection fails (every time round-robin picks the
++// client). Linux kube-proxy masquerades hairpin traffic the same way. With
++// the node IP as source, the reply comes back through the node, which
++// reverses both translations.
++func (proxier *Proxier) hairpinSNATRule(af, proto string, endpointIP string, targetPort int) {
++	proxier.pfData.Write(
++		"nat", af, "proto", proto,
++		"from", endpointIP, "to", endpointIP,
++		"port", strconv.Itoa(targetPort),
++		"->", proxier.nodeIP.String(),
++	)
++}
++
+ // hostNodePortRule redirects the node's own connections to one of its
+ // NodePorts. Those go out through lo0 and back in, where the NodePort rdr
+ // rule matches but the redirected packet isn't forwarded off lo0, so they
+@@ -693,15 +716,17 @@ func (proxier *Proxier) syncProxyRules() error {
+ 			proto = "sctp"
+ 		}
+ 
+-		remoteIPs := []string{}
++		remoteIPs, localIPs := []string{}, []string{}
+ 		for _, ep := range targetEndpoints {
+-			if !ep.IsLocal() {
++			if ep.IsLocal() {
++				localIPs = append(localIPs, ep.IP())
++			} else {
+ 				remoteIPs = append(remoteIPs, ep.IP())
+ 			}
+ 		}
+ 		proxier.pfData.Reset()
+ 		proxier.writeServiceRules(svcName.String(), af, proto, svcInfo.ClusterIP(), svcInfo.Port(), svcInfo.NodePort(), nodeIPs,
+-			redirHosts, remoteIPs, targetPort, svcInfo.SessionAffinityType() == v1.ServiceAffinityClientIP)
++			redirHosts, remoteIPs, localIPs, targetPort, svcInfo.SessionAffinityType() == v1.ServiceAffinityClientIP)
+ 
+ 		if proxier.logger.V(2).Enabled() {
+ 			klog.Infof("pfctl -a cni-rdr/%s -f - <EOF", svcInfo.anchorName)
+diff --git a/pkg/proxy/pf/proxier_test.go b/pkg/proxy/pf/proxier_test.go
+index 4b678376996..18468292c7f 100644
+--- a/pkg/proxy/pf/proxier_test.go
++++ b/pkg/proxy/pf/proxier_test.go
+@@ -71,12 +71,13 @@ func TestWriteServiceRulesOrder(t *testing.T) {
+ 	p := &Proxier{pfData: proxyutil.NewLineBuffer(), nodeIP: net.ParseIP("192.168.100.1")}
+ 	p.writeServiceRules("ns/svc:http", "inet", "tcp", net.ParseIP("10.96.0.20"), 80, 30080,
+ 		[]net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("192.168.100.1")},
+-		"{ 10.244.1.7 }", []string{"10.244.1.7"}, 8080, false)
+-	want := "rdr inet proto tcp from any to 10.96.0.20 port 80 -> { 10.244.1.7 } port 8080 round-robin\n" +
+-		"rdr inet proto tcp from any to 192.168.100.1 port 30080 tag KUBE_NODEPORT -> { 10.244.1.7 } port 8080 round-robin\n" +
++		"{ 10.244.1.7, 10.244.0.5 }", []string{"10.244.1.7"}, []string{"10.244.0.5"}, 8080, false)
++	want := "rdr inet proto tcp from any to 10.96.0.20 port 80 -> { 10.244.1.7, 10.244.0.5 } port 8080 round-robin\n" +
++		"nat inet proto tcp from 10.244.0.5 to 10.244.0.5 port 8080 -> 192.168.100.1\n" +
++		"rdr inet proto tcp from any to 192.168.100.1 port 30080 tag KUBE_NODEPORT -> { 10.244.1.7, 10.244.0.5 } port 8080 round-robin\n" +
+ 		"nat inet proto tcp from any to { 10.244.1.7 } port 8080 tagged KUBE_NODEPORT -> 192.168.100.1\n" +
+-		"pass out quick inet proto tcp from any to 10.96.0.20 port 80 rdr-to { 10.244.1.7 } port 8080 round-robin\n" +
+-		"pass out quick on lo0 inet proto tcp from any to 192.168.100.1 port 30080 rdr-to { 10.244.1.7 } port 8080 round-robin\n"
++		"pass out quick inet proto tcp from any to 10.96.0.20 port 80 rdr-to { 10.244.1.7, 10.244.0.5 } port 8080 round-robin\n" +
++		"pass out quick on lo0 inet proto tcp from any to 192.168.100.1 port 30080 rdr-to { 10.244.1.7, 10.244.0.5 } port 8080 round-robin\n"
+ 	if got := p.pfData.String(); got != want {
+ 		t.Errorf("got\n%s\nwant\n%s", got, want)
+ 	}
+-- 
+2.54.0 (Apple Git-157)
+

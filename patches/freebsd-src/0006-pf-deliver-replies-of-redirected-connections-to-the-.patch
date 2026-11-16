@@ -1,0 +1,62 @@
+From da85f57c900efd502fec9b67429c084425686105 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 17:30:16 -0700
+Subject: [PATCH] pf: deliver replies of redirected connections to the host's
+ own address
+
+A host connecting to one of its own addresses, with an outbound rule
+redirecting the connection to another host, e.g.
+
+	pass out on lo0 proto tcp to <own address> port 30080 rdr-to <container>
+
+(a Kubernetes NodePort reached from the node itself): the SYN leaves
+through the container's interface, but the reverse translation of the
+replies restores the host's own address as their source, and they arrive
+on a non-loopback interface. ip_input()'s source address validation
+(net.inet.ip.source_address_validation, on by default) drops them as
+spoofed, so the connection never completes.
+
+Such replies match a state created by this host's own outbound packet:
+mark inbound IPv4 packets of a translated outbound state whose source and
+destination are both local addresses M_FASTFWD_OURS, so ip_input()
+delivers them locally. Nothing else is exempted from the check.
+
+Tested on 15.1 arm64: curl from the host to its own address and a port
+redirected that way to a container on a bridge: 3/3 succeed (before: the
+container's SYN-ACK was dropped and the connect timed out).
+---
+ sys/netpfil/pf/pf.c | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/sys/netpfil/pf/pf.c b/sys/netpfil/pf/pf.c
+index 7aee28e7b..a9182b491 100644
+--- a/sys/netpfil/pf/pf.c
++++ b/sys/netpfil/pf/pf.c
+@@ -11237,6 +11237,24 @@ pf_test(sa_family_t af, int dir, int pflags, struct ifnet *ifp, struct mbuf **m0
+ 	    pf_is_loopback(af, pd.dst))
+ 		pd.m->m_flags |= M_SKIP_FIREWALL;
+ 
++#ifdef INET
++	/*
++	 * A connection this host made to one of its own addresses that an
++	 * outbound rule redirected to another host (e.g. "pass out on lo0 ...
++	 * rdr-to <container>" for a service published on the host's address):
++	 * the reverse translation of the replies restores the host's own
++	 * address as their source, and they arrive on a non-loopback
++	 * interface, so ip_input()'s source address validation drops them as
++	 * spoofed (net.inet.ip.source_address_validation).  They match a state
++	 * created by this host's own outbound packet, so deliver them locally.
++	 */
++	if (dir == PF_IN && action == PF_PASS && af == AF_INET && s != NULL &&
++	    s->direction == PF_OUT &&
++	    s->key[PF_SK_WIRE] != s->key[PF_SK_STACK] &&
++	    in_localip(pd.src->v4) && in_localip(pd.dst->v4))
++		pd.m->m_flags |= M_FASTFWD_OURS;
++#endif
++
+ 	if (action == PF_PASS && r->divert.port && !PACKET_LOOPED(&pd)) {
+ 		mtag = m_tag_alloc(MTAG_PF_DIVERT, 0,
+ 		    sizeof(struct pf_divert_mtag), M_NOWAIT | M_ZERO);
+-- 
+2.54.0 (Apple Git-157)
+

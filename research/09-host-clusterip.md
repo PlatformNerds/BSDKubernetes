@@ -56,6 +56,32 @@ kube-proxy doesn't emit `sticky-address` on host rules, so it works on unpatched
   is hostNetwork` passes. It failed in the previous run.
 - Pod → NodePort and ClusterIP matrix: all six pod cases connect; host → the other node's NodePort connects.
 
-**Not covered:** a host calling a NodePort on **its own** address. That traffic loops through `lo0`, and a
-`pass out ... rdr-to` rule for it loads but doesn't work: the redirected packet apparently can't be forwarded from
-`lo0`. Linux handles this in iptables' OUTPUT chain. It's open.
+## The node's own NodePort, and hairpin (fixed 2026-11-16)
+
+**The node calling its own NodePort** (`curl <own IP>:30080`) failed in two steps:
+
+1. The traffic loops through `lo0`. The NodePort `rdr` matches as it comes back in, but the redirected packet is
+   never forwarded off `lo0`. kube-proxy now redirects it on the way **out** instead
+   (`pass out quick on lo0 ... to <nodeIP> port <nodePort> rdr-to <endpoints>`, `bsdk8s/0018`).
+2. The SYN then reaches the pod, but the host drops the pod's SYN-ACK. After pf reverses the translation, the reply
+   has the host's *own* address as source and arrives on the bridge. `ip_input()`'s source address validation
+   (`net.inet.ip.source_address_validation`, on by default since 14.0) drops that as spoofed.
+
+**Kernel fix:** pf marks inbound IPv4 packets `M_FASTFWD_OURS` when they belong to a translated state that this
+host created **outbound** and both their addresses are local, so `ip_input()` delivers them. Nothing else is
+exempted from the check. (`PlatformNerds/freebsd-src` `bsdk8s/pf-self-hairpin`, `-15.1`; patch `freebsd-src/0006`;
+both nodes now boot `kernel.bsdk8s2` = `kernel.bsdk8s` + this.) The rejected alternative was turning source
+address validation off node-wide.
+
+| Host → NodePort | Old kernel | Patched |
+|---|---|---|
+| own IP, endpoints local and remote | timeout (SYN-ACK dropped) | 4/4 and 6/6, round-robin across both endpoints |
+| the other node's IP | ok | ok |
+
+**Hairpin:** a pod reaching itself through its own Service failed **every time round-robin picked the client**
+(half the requests with two endpoints). The pod answered itself inside its own stack, so the reply never passed
+the node and the `rdr` was never reversed. kube-proxy now masquerades hairpin traffic like Linux kube-proxy does:
+`nat from <ep> to <ep> port <tp> -> <nodeIP>` for each local endpoint (`bsdk8s/0019`).
+
+After the fix: 8/8 from both pods, alternating endpoints. The server sees the client's pod IP for normal requests
+and the node IP for hairpinned ones, the same as Linux.

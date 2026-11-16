@@ -1,0 +1,76 @@
+From fd6a4bafd52dc32909444af087e5ed21266d2afa Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 17:30:52 -0700
+Subject: [PATCH 18/19] proxy/pf: redirect the node's own connections to its
+ NodePorts
+
+A connection from the node to nodeIP:nodePort goes out through lo0 and back
+in; the NodePort rdr rule matches there, but the redirected packet isn't
+forwarded off lo0, so it failed. Redirect it on the way out (pass out on
+lo0 ... rdr-to), after the anchor's translation rules. The replies come
+back on the endpoint's interface with the node's own address as source;
+with the pf change 'deliver replies of redirected connections to the
+host's own address' they are delivered, on other kernels the connection
+still fails as before. Test.
+---
+ pkg/proxy/pf/proxier.go      | 29 +++++++++++++++++++++++++++++
+ pkg/proxy/pf/proxier_test.go |  3 ++-
+ 2 files changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/pkg/proxy/pf/proxier.go b/pkg/proxy/pf/proxier.go
+index bc99a9bfd3e..1dab4d68826 100644
+--- a/pkg/proxy/pf/proxier.go
++++ b/pkg/proxy/pf/proxier.go
+@@ -465,6 +465,35 @@ func (proxier *Proxier) writeServiceRules(svcName, af, proto string, clusterIP n
+ 		}
+ 	}
+ 	proxier.hostRedirectRule(af, proto, clusterIP, port, redirHosts, targetPort)
++	if nodePort != 0 {
++		for _, ip := range nodeIPs {
++			if ip.IsLoopback() {
++				continue
++			}
++			proxier.hostNodePortRule(af, proto, ip, nodePort, redirHosts, targetPort)
++		}
++	}
++}
++
++// hostNodePortRule redirects the node's own connections to one of its
++// NodePorts. Those go out through lo0 and back in, where the NodePort rdr
++// rule matches but the redirected packet isn't forwarded off lo0, so they
++// are redirected on the way out instead. The replies then come back with the
++// node's own address as source on the endpoint's interface, which source
++// address validation drops unless pf delivers them (the bsdk8s pf change
++// "deliver replies of redirected connections to the host's own address");
++// on other kernels this rule is harmless: such connections failed anyway.
++func (proxier *Proxier) hostNodePortRule(af, proto string, nodeIP net.IP, nodePort int, targetIPs string, targetPort int) {
++	words := []interface{}{
++		"pass out quick on lo0", af, "proto", proto,
++		"from any to", nodeIP.String(),
++		"port", strconv.Itoa(nodePort),
++		"rdr-to", targetIPs, "port", strconv.Itoa(targetPort),
++	}
++	if strings.HasPrefix(targetIPs, "{") {
++		words = append(words, "round-robin")
++	}
++	proxier.pfData.Write(words...)
+ }
+ 
+ // hostRedirectRule redirects traffic the node itself sends to a ClusterIP
+diff --git a/pkg/proxy/pf/proxier_test.go b/pkg/proxy/pf/proxier_test.go
+index f5c0c0aa4d1..4b678376996 100644
+--- a/pkg/proxy/pf/proxier_test.go
++++ b/pkg/proxy/pf/proxier_test.go
+@@ -75,7 +75,8 @@ func TestWriteServiceRulesOrder(t *testing.T) {
+ 	want := "rdr inet proto tcp from any to 10.96.0.20 port 80 -> { 10.244.1.7 } port 8080 round-robin\n" +
+ 		"rdr inet proto tcp from any to 192.168.100.1 port 30080 tag KUBE_NODEPORT -> { 10.244.1.7 } port 8080 round-robin\n" +
+ 		"nat inet proto tcp from any to { 10.244.1.7 } port 8080 tagged KUBE_NODEPORT -> 192.168.100.1\n" +
+-		"pass out quick inet proto tcp from any to 10.96.0.20 port 80 rdr-to { 10.244.1.7 } port 8080 round-robin\n"
++		"pass out quick inet proto tcp from any to 10.96.0.20 port 80 rdr-to { 10.244.1.7 } port 8080 round-robin\n" +
++		"pass out quick on lo0 inet proto tcp from any to 192.168.100.1 port 30080 rdr-to { 10.244.1.7 } port 8080 round-robin\n"
+ 	if got := p.pfData.String(); got != want {
+ 		t.Errorf("got\n%s\nwant\n%s", got, want)
+ 	}
+-- 
+2.54.0 (Apple Git-157)
+

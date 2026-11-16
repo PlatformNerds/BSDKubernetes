@@ -1,5 +1,8 @@
 # 13: ingress-nginx unmodified: capabilities, low ports, digest-pinned images (2026-11-16)
 
+> **Note:** ingress-nginx is being retired upstream; Gateway API is the path forward (research/14). The fixes here
+> are generic: digest-pinned Linux images, capabilities, and non-root low ports. Envoy Gateway relies on them too.
+
 **Result [verified]:** ingress-nginx `controller-v1.12.0` installs from its unmodified bare-metal release manifest
 (sha256 `765ed0a8…`):
 - **Admission-cert Jobs:** both run to completion.

@@ -44,6 +44,28 @@ runs. The equivalent number for FreeBSD is the second column. Both are shown so 
    and aggregated API call timed out (21 tests in run 1; the apiserver log had 256× `context deadline exceeded`).
    This resolves those Services to endpoints instead. It's in the demo's kubeadm config.
 
+## Run 8: 424/446, the one new failure was clock skew (2026-11-16)
+
+This run checked:
+- `kernel.bsdk8s4` (the Linuxulator per-filter epoll registration);
+- ocijail releasing stopped containers' jails and volumes (research/12);
+- bsd-placement with 2 replicas and the reconciler, left running during the run.
+
+The webhook rewrote no e2e pods: none pin `kubernetes.io/os=linux`.
+
+**21 of 22 failures are identical to run 7** (`conformance/run8-failures.json`). The new one, `[sig-apps] Deployment
+should support rollover`, was **not** a regression:
+1. 16:50–16:58 UTC: the Mac went into idle sleep on battery, freezing both VMs.
+2. Afterwards both guests were 35–43 minutes behind. Node 1's ntpd had exited: `Clock offset exceeds panic threshold.
+   Set system clock by hand.` Node 2's was "running free". The nodes were also minutes apart from each other.
+3. The test needs `minReadySeconds`. The controller-manager on node 1 compared it with a Ready time that node 2's
+   kubelet stamped minutes in the future, so the new pod never became available.
+4. Run alone with skewed clocks, it failed again. After fixing ntpd and resyncing, it passed **3/3** in 16–21 s.
+
+Fix (docs/MAC-DEV-VM.md, VM script): `tinker panic 0 stepout 30` and `maxpoll 6` in `ntp.conf`; use `caffeinate`
+for long runs. Corrected for that, run 8 matches run 7: **425/446, no regressions** from the kernel or ocijail
+changes.
+
 ## Run 7: regression check, same 21 failures as run 6 (2026-11-16)
 
 This run checked everything since run 6:

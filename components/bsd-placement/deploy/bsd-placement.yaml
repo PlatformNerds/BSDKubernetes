@@ -53,7 +53,7 @@ spec:
           httpGet: {path: /healthz, port: https, scheme: HTTPS}
         resources:
           requests: {cpu: 10m, memory: 16Mi}
-          limits: {memory: 64Mi}
+          limits: {memory: 128Mi}
         volumeMounts: [{name: certs, mountPath: /certs, readOnly: true}]
       volumes:
       - name: certs
@@ -113,3 +113,20 @@ webhooks:
   sideEffects: None
   failurePolicy: Ignore
   timeoutSeconds: 5
+# Namespaces labeled bsdk8s.io/default-runtime=auto: decide by the images'
+# published platforms (anonymous registry lookup, cached): all have a FreeBSD
+# variant -> native jail; a Linux-only image -> RuntimeClass linux; lookup
+# failure -> unchanged, with a warning. Lookups take up to 3 s uncached.
+- name: auto.bsd-placement.bsdk8s.io
+  clientConfig:
+    service: {name: bsd-placement, namespace: bsd-placement, path: /mutate-auto}
+    caBundle: ${CA_BUNDLE}
+  rules:
+  - {apiGroups: [""], apiVersions: [v1], operations: [CREATE], resources: [pods]}
+  - {apiGroups: [apps], apiVersions: [v1], operations: [CREATE, UPDATE], resources: [daemonsets]}
+  namespaceSelector:
+    matchLabels: {bsdk8s.io/default-runtime: auto}
+  admissionReviewVersions: [v1]
+  sideEffects: None
+  failurePolicy: Ignore
+  timeoutSeconds: 10

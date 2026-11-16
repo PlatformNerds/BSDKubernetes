@@ -44,7 +44,11 @@ func apply(t *testing.T, obj string, ops []patchOp) map[string]any {
 
 func mustMutate(t *testing.T, kind, obj string, force bool) (map[string]any, string) {
 	t.Helper()
-	ops, why, err := mutate(cfg, kind, []byte(obj), force)
+	m := pinnedOnly
+	if force {
+		m = forceLinux
+	}
+	ops, why, _, err := mutate(cfg, kind, []byte(obj), m, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +143,7 @@ func TestDaemonSet(t *testing.T) {
 func TestHandler(t *testing.T) {
 	review := `{"apiVersion":"admission.k8s.io/v1","kind":"AdmissionReview","request":{"uid":"u1","kind":{"group":"","version":"v1","kind":"Pod"},"namespace":"default","operation":"CREATE","object":{"metadata":{"generateName":"web-"},"spec":{"nodeSelector":{"kubernetes.io/os":"linux"}}}}}`
 	rec := httptest.NewRecorder()
-	handler(cfg)(rec, httptest.NewRequest(http.MethodPost, "/mutate", bytes.NewBufferString(review)))
+	handler(cfg, nil)(rec, httptest.NewRequest(http.MethodPost, "/mutate", bytes.NewBufferString(review)))
 	var out admissionReview
 	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
 		t.Fatal(err, rec.Body.String())
@@ -150,7 +154,7 @@ func TestHandler(t *testing.T) {
 	}
 	// Malformed object: still allowed, with a warning.
 	rec = httptest.NewRecorder()
-	handler(cfg)(rec, httptest.NewRequest(http.MethodPost, "/mutate", bytes.NewBufferString(`{"request":{"uid":"u2","kind":{"kind":"Pod"},"object":"x"}}`)))
+	handler(cfg, nil)(rec, httptest.NewRequest(http.MethodPost, "/mutate", bytes.NewBufferString(`{"request":{"uid":"u2","kind":{"kind":"Pod"},"object":"x"}}`)))
 	json.Unmarshal(rec.Body.Bytes(), &out)
 	if !out.Response.Allowed || len(out.Response.Warnings) == 0 {
 		t.Errorf("malformed: %s", rec.Body.String())
@@ -161,7 +165,7 @@ func TestHandlerForcePath(t *testing.T) {
 	review := `{"request":{"uid":"u3","kind":{"kind":"Pod"},"object":{"spec":{"containers":[]}}}}`
 	for path, want := range map[string]bool{"/mutate": false, "/mutate-force": true} {
 		rec := httptest.NewRecorder()
-		handler(cfg)(rec, httptest.NewRequest(http.MethodPost, path, bytes.NewBufferString(review)))
+		handler(cfg, nil)(rec, httptest.NewRequest(http.MethodPost, path, bytes.NewBufferString(review)))
 		var out admissionReview
 		json.Unmarshal(rec.Body.Bytes(), &out)
 		if got := len(out.Response.Patch) > 0; got != want {
@@ -186,6 +190,7 @@ func TestFindStuck(t *testing.T) {
 		pod("scheduled", "app", old, "Pending", "n1", owned),
 		pod("ignored", "skip", old, "Pending", "", owned),
 		pod("deleting", "app", old, "Pending", "", owned+`,"deletionTimestamp":"`+old+`"`),
+		pod("workflow", "app", old, "Pending", "", `,"ownerReferences":[{"kind":"Workflow","name":"wf","controller":true}]`),
 		`{"metadata":{"name":"fbsd","namespace":"app","creationTimestamp":"` + old + `"},"spec":{"nodeSelector":{"kubernetes.io/os":"freebsd"}},"status":{"phase":"Pending"}}`,
 	}, ",") + `]}`
 	got, err := findStuck(cfg, []byte(list), func(ns string) bool { return ns == "skip" }, now, time.Minute)
@@ -196,8 +201,8 @@ func TestFindStuck(t *testing.T) {
 	for _, sp := range got {
 		names[sp.meta.Name] = sp.owner
 	}
-	if len(names) != 2 || names["stuck"] != "ReplicaSet/rs" || names["bare"] != "" {
-		t.Errorf("findStuck = %v, want stuck (ReplicaSet/rs) and bare", names)
+	if len(names) != 3 || names["stuck"] != "ReplicaSet/rs" || names["bare"] != "" || names["workflow"] != "" {
+		t.Errorf("findStuck = %v, want stuck (ReplicaSet/rs), bare and workflow (report only)", names)
 	}
 	if _, ok := names["bare"]; !ok {
 		t.Error("bare pod not reported")

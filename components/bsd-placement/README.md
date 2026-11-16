@@ -16,6 +16,11 @@ go test ./...
 
 Namespace labels:
 - `bsdk8s.io/default-runtime=linux` treats every pod as Linux.
+- `bsdk8s.io/default-runtime=auto` decides by image: a pod with a Linux-only image (per its registry) runs as
+  Linux, and a pod whose images all publish `freebsd` runs natively. A lookup failure leaves the pod unchanged
+  and returns a warning.
 - `bsdk8s.io/placement=ignore` skips the namespace.
 
-Flags: `--runtime-class` (default `linux`), `--node-selector` (`bsdk8s.io/linux-abi=true`), `--node-os` (`freebsd`).
+Live registry check: `BSD_PLACEMENT_LIVE=1 go test -run TestLiveRegistries -v`.
+
+Flags: `--image-cache-ttl` (10m), `--reconcile-interval` (30s), `--reconcile-min-age` (1m), `--runtime-class` (default `linux`), `--node-selector` (`bsdk8s.io/linux-abi=true`), `--node-os` (`freebsd`).

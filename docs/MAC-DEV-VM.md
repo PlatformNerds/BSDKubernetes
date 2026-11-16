@@ -82,6 +82,26 @@ The VM script now enables `ntpd` with `ntpd_sync_on_start`. On existing VMs:
 `sudo sysrc ntpd_enable=YES ntpd_sync_on_start=YES && sudo service ntpd start`. Check with `date -u` on every
 node before an e2e run.
 
+**That was not enough (run 8).** ntpd exits when the offset exceeds its panic threshold (1000 s): `Clock offset
+exceeds panic threshold. Set system clock by hand.` That is exactly what happens after the Mac sleeps for more than
+~17 minutes. On battery it idle-sleeps after a few minutes and keeps doing short maintenance sleeps. Afterwards both
+guests were 35–43 minutes behind. Node 1's ntpd had exited; node 2's was "running free". Run 8's only new failure,
+`Deployment should support rollover`, came from that. The controller-manager judged `minReadySeconds` against a
+Ready time the other node's kubelet stamped minutes in the future. With clocks synced, the test passed 3/3.
+
+The VM script now also writes `tinker panic 0 stepout 30` (never exit; step large offsets after 30 s) and
+`maxpoll 6` on the pool lines (poll at least every 64 s, so a wake is noticed quickly) into `/etc/ntp.conf`. On
+existing VMs:
+
+```sh
+sudo sed -i '' '/^pool /s/iburst$/iburst maxpoll 6/' /etc/ntp.conf
+echo 'tinker panic 0 stepout 30' | cat - /etc/ntp.conf | sudo tee /etc/ntp.conf.new >/dev/null && sudo mv /etc/ntp.conf.new /etc/ntp.conf
+sudo service ntpd restart
+```
+
+For long runs (conformance), also keep the Mac awake: `caffeinate -i -s -w <pid of the run>`, or plug in
+power and disable sleep.
+
 ## QEMU user networking fakes connectivity
 
 slirp (`vtnet0`) completes TCP connects to *any* address itself and relays DNS out to the Mac. So `nc -z` to a

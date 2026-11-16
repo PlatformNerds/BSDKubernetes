@@ -58,24 +58,36 @@ type patchOp struct {
 	Value any    `json:"value,omitempty"`
 }
 
+// mode selects which pods without a Linux pin are rewritten too.
+type mode int
+
+const (
+	pinnedOnly mode = iota // only pods pinned to kubernetes.io/os=linux
+	forceLinux             // every pod (namespace default-runtime=linux)
+	autoImages             // pods with a Linux-only image (default-runtime=auto)
+)
+
+// decider classifies a pod's images (registry lookup in production).
+type decider func(images []string) (imageDecision, string)
+
 // mutate returns the JSONPatch for obj (raw JSON of a Pod or DaemonSet), or
-// nil when the object needs no change. force applies the rewrite even when the
-// pod spec has no Linux OS pin.
-func mutate(cfg Config, kind string, obj []byte, force bool) ([]patchOp, string, error) {
+// nil when the object needs no change, plus why it changed it and, if it
+// could not decide, a warning for the user.
+func mutate(cfg Config, kind string, obj []byte, m mode, decide decider) ([]patchOp, string, string, error) {
 	base, ok := podSpecPath(kind)
 	if !ok {
-		return nil, "", nil
+		return nil, "", "", nil
 	}
 	var o map[string]any
 	if err := json.Unmarshal(obj, &o); err != nil {
-		return nil, "", fmt.Errorf("decode %s: %w", kind, err)
+		return nil, "", "", fmt.Errorf("decode %s: %w", kind, err)
 	}
 	spec := lookup(o, strings.Split(strings.TrimPrefix(base, "/"), "/")...)
 	if spec == nil {
-		return nil, "", nil
+		return nil, "", "", nil
 	}
 	if rc, _ := spec["runtimeClassName"].(string); rc != "" {
-		return nil, "", nil
+		return nil, "", "", nil
 	}
 
 	var reasons []string
@@ -96,11 +108,26 @@ func mutate(cfg Config, kind string, obj []byte, force bool) ([]patchOp, string,
 	if affinityChanged {
 		reasons = append(reasons, "nodeAffinity "+osLabel+" In [linux]")
 	}
-	if len(reasons) == 0 && !force {
-		return nil, "", nil
-	}
 	if len(reasons) == 0 {
-		reasons = append(reasons, "namespace default")
+		switch m {
+		case pinnedOnly:
+			return nil, "", "", nil
+		case forceLinux:
+			reasons = append(reasons, "namespace default")
+		case autoImages:
+			if decide == nil {
+				return nil, "", "", nil
+			}
+			d, detail := decide(podImages(spec))
+			switch d {
+			case useLinux:
+				reasons = append(reasons, detail)
+			case undecided:
+				return nil, "", "bsd-placement: left unchanged, could not place by image: " + detail, nil
+			default:
+				return nil, "", "", nil
+			}
+		}
 	}
 	for k, v := range cfg.NodeSelector {
 		nodeSelector[k] = v
@@ -115,7 +142,7 @@ func mutate(cfg Config, kind string, obj []byte, force bool) ([]patchOp, string,
 	}
 	why := "runtimeClassName=" + cfg.RuntimeClass + " (" + strings.Join(reasons, ", ") + ")"
 	ops = append(ops, annotationOps(o, why)...)
-	return ops, why, nil
+	return ops, why, "", nil
 }
 
 // rewriteAffinity rewrites required node affinity expressions that only allow

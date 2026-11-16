@@ -41,7 +41,7 @@ type admissionResponse struct {
 	AuditAnn  map[string]string `json:"auditAnnotations,omitempty"`
 }
 
-func handler(cfg Config) http.HandlerFunc {
+func handler(cfg Config, rc *registryClient) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
 		if err != nil {
@@ -54,9 +54,29 @@ func handler(cfg Config) http.HandlerFunc {
 			return
 		}
 		req := review.Request
-		force := r.URL.Path == "/mutate-force"
+		m := pinnedOnly
+		switch r.URL.Path {
+		case "/mutate-force":
+			m = forceLinux
+		case "/mutate-auto":
+			m = autoImages
+		}
+		var decide decider
+		if rc != nil {
+			// Stay well inside the webhook timeout; on timeout the pod is
+			// left unchanged (and the lookup is retried next time).
+			ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+			defer cancel()
+			decide = func(images []string) (imageDecision, string) {
+				return decideImages(ctx, rc, cfg.NodeOS, images)
+			}
+		}
 		resp := &admissionResponse{UID: req.UID, Allowed: true}
-		ops, why, err := mutate(cfg, req.Kind.Kind, req.Object, force)
+		ops, why, warning, err := mutate(cfg, req.Kind.Kind, req.Object, m, decide)
+		if warning != "" {
+			resp.Warnings = append(resp.Warnings, warning)
+			log.Printf("%s %s %s/%s: %s", req.Operation, req.Kind.Kind, req.Namespace, nameOf(req), warning)
+		}
 		switch {
 		case err != nil:
 			// Never block admission: placement is best effort.
@@ -93,6 +113,7 @@ func main() {
 	rc := flag.String("runtime-class", "linux", "RuntimeClass for Linux workloads")
 	sel := flag.String("node-selector", "bsdk8s.io/linux-abi=true", "nodeSelector added to rewritten pods (k=v,...)")
 	nodeOS := flag.String("node-os", "freebsd", "kubernetes.io/os value of the target nodes")
+	cacheTTL := flag.Duration("image-cache-ttl", 10*time.Minute, "how long to cache an image's platforms (auto namespaces)")
 	every := flag.Duration("reconcile-interval", 30*time.Second, "how often to look for Linux-pinned pods admitted without the webhook (0 disables)")
 	minAge := flag.Duration("reconcile-min-age", time.Minute, "only act on pods pending at least this long")
 	flag.Parse()
@@ -103,8 +124,11 @@ func main() {
 	}
 	cfg := Config{RuntimeClass: *rc, NodeSelector: ns, NodeOS: *nodeOS}
 	mux := http.NewServeMux()
-	mux.Handle("/mutate", handler(cfg))
-	mux.Handle("/mutate-force", handler(cfg))
+	reg := newRegistryClient(*cacheTTL)
+	h := handler(cfg, reg)
+	mux.Handle("/mutate", h)
+	mux.Handle("/mutate-force", h)
+	mux.Handle("/mutate-auto", h)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { fmt.Fprintln(w, "ok") })
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()

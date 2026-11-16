@@ -77,7 +77,8 @@ leaks identically, so this isn't a regression from it. ocijail now records each 
 and unmounts by it. After the fix: 0 mounts left for all four images, pods gone in 1 s. 12 stranded mounts on node 2
 were cleaned by hand: only mounts under container roots that were no longer mounted.
 
-**Node.js 22 doesn't run under the Linuxulator on arm64.** `node --version` dies with SIGBUS on both the old and the
+~~**Node.js 22 doesn't run under the Linuxulator on arm64.**~~ **Fixed (research/16): three kernel bugs.** Node now
+reports `constrainedMemory` 256 MiB and sizes V8 to 259 MiB in a 256 Mi pod. `node --version` dies with SIGBUS on both the old and the
 new kernel, so it's unrelated to this work. That means Node's cgroup behaviour isn't verified. Open; next to
 investigate.
 

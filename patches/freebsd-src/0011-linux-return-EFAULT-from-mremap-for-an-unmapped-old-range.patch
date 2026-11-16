@@ -1,0 +1,77 @@
+From 805a8dfb3a8e056ea44d2f1882a03994eba63227 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 15:10:13 -0700
+Subject: [PATCH] linux: return EFAULT from mremap(2) for an unmapped old range
+
+Note (BSDKubernetes): FreeBSD main already has equivalent behaviour (linux_mremap() checks
+useracc() and returns EFAULT); this patch is only needed on 15.x.
+
+linux_mremap() does not implement growing a mapping and returned ENOMEM
+for any growth, whether or not the old range was mapped.  Linux returns
+EFAULT when the old range is not (entirely) within one mapping.  musl's
+pthread_getattr_np() for the main thread relies on that: it finds the
+stack size by growing one page in place, walking down from the stack
+top, until mremap() fails with something other than ENOMEM.  With ENOMEM
+for unmapped pages it walked the whole address space (millions of calls;
+Node.js, which calls it at startup, appeared to hang).
+
+Check the old range first and return EFAULT if it is not mapped; stack
+guard entries count as unmapped, like Linux's gap below a stack.
+---
+ sys/compat/linux/linux_misc.c | 32 ++++++++++++++++++++++++++++++++
+ 1 file changed, 32 insertions(+)
+
+diff --git a/sys/compat/linux/linux_misc.c b/sys/compat/linux/linux_misc.c
+index d35429e17..44464b173 100644
+--- a/sys/compat/linux/linux_misc.c
++++ b/sys/compat/linux/linux_misc.c
+@@ -299,6 +299,27 @@ linux_select(struct thread *td, struct linux_select_args *args)
+ }
+ #endif
+ 
++/*
++ * Whether [addr, addr + len) lies within one mapping, as Linux's mremap(2)
++ * requires of the old range (otherwise EFAULT).  Guard entries, such as the
++ * gap below a growable stack, are not mappings.
++ */
++static bool
++linux_mremap_mapped(struct thread *td, uintptr_t addr, size_t len)
++{
++	vm_map_t map;
++	vm_map_entry_t entry;
++	bool mapped;
++
++	map = &td->td_proc->p_vmspace->vm_map;
++	vm_map_lock_read(map);
++	mapped = vm_map_lookup_entry(map, addr, &entry) &&
++	    (entry->eflags & MAP_ENTRY_GUARD) == 0 &&
++	    len <= entry->end - addr;
++	vm_map_unlock_read(map);
++	return (mapped);
++}
++
+ int
+ linux_mremap(struct thread *td, struct linux_mremap_args *args)
+ {
+@@ -324,7 +345,18 @@ linux_mremap(struct thread *td, struct linux_mremap_args *args)
+ 	args->old_len = round_page(args->old_len);
+ 
+ 	if (args->new_len > args->old_len) {
++		/*
++		 * Growing is not supported.  Like Linux, fail with EFAULT if
++		 * the old range is not mapped and ENOMEM otherwise: musl's
++		 * pthread_getattr_np() finds the main thread's stack size by
++		 * growing pages in place downwards from the stack top until
++		 * EFAULT, so returning ENOMEM for unmapped pages made it (and
++		 * Node.js, which calls it at startup) walk the whole address
++		 * space.
++		 */
+ 		td->td_retval[0] = 0;
++		if (!linux_mremap_mapped(td, args->addr, args->old_len))
++			return (EFAULT);
+ 		return (ENOMEM);
+ 	}
+ 
+-- 
+2.54.0 (Apple Git-157)
+

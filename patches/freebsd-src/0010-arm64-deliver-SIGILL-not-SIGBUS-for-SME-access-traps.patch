@@ -1,0 +1,58 @@
+From f97ecc2b105cfc11ce366f2ace44eb292a489646 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 15:10:03 -0700
+Subject: [PATCH] arm64: deliver SIGILL, not SIGBUS, for SME access traps
+
+On CPUs that implement SME, instructions of the Scalable Matrix
+Extension trap with exception class 0x1d when SME is not enabled.
+do_el0_sync() had no case for it, so the trap fell through to the
+default case and the process got SIGBUS (BUS_OBJERR).  Code that probes
+for SME by executing an instruction expects SIGILL, as for any
+unsupported instruction (and as Linux delivers when it does not support
+SME): OpenSSL's capability detection, for example, catches SIGILL during
+its probes, so programs embedding it (Node.js) died at startup.
+
+Define EXCP_SME and treat it like an undefined instruction.  Seen with
+an Apple M6 (FEAT_SME) host running FreeBSD as a guest.
+---
+ sys/arm64/arm64/trap.c     | 11 +++++++++++
+ sys/arm64/include/armreg.h |  1 +
+ 2 files changed, 12 insertions(+)
+
+diff --git a/sys/arm64/arm64/trap.c b/sys/arm64/arm64/trap.c
+index 867e5c57f..e3374df13 100644
+--- a/sys/arm64/arm64/trap.c
++++ b/sys/arm64/arm64/trap.c
+@@ -743,6 +743,17 @@ do_el0_sync(struct thread *td, struct trapframe *frame)
+ 		call_trapsignal(td, SIGILL, ILL_ILLOPN, (void *)frame->tf_elr,
+ 		    exception);
+ 		break;
++	case EXCP_SME:
++		/*
++		 * SME is not supported, so its instructions trap.  Treat them
++		 * like undefined instructions (as Linux does without SME):
++		 * code that probes for SME by executing an instruction, such
++		 * as OpenSSL's capability detection, expects SIGILL and dies
++		 * on the SIGBUS of the default case on CPUs that have SME.
++		 */
++		call_trapsignal(td, SIGILL, ILL_ILLTRP, (void *)frame->tf_elr,
++		    exception);
++		break;
+ 	case EXCP_SP_ALIGN:
+ 		call_trapsignal(td, SIGBUS, BUS_ADRALN, (void *)frame->tf_sp,
+ 		    exception);
+diff --git a/sys/arm64/include/armreg.h b/sys/arm64/include/armreg.h
+index 271fe693c..fb3e62321 100644
+--- a/sys/arm64/include/armreg.h
++++ b/sys/arm64/include/armreg.h
+@@ -671,6 +671,7 @@
+ #define	 EXCP_MSR		0x18	/* MSR/MRS trap */
+ #define	 EXCP_SVE		0x19	/* SVE trap */
+ #define	 EXCP_FPAC		0x1c	/* Faulting PAC trap */
++#define	 EXCP_SME		0x1d	/* SME trap */
+ #define	 EXCP_INSN_ABORT_L	0x20	/* Instruction abort, from lower EL */
+ #define	 EXCP_INSN_ABORT	0x21	/* Instruction abort, from same EL */ 
+ #define	 EXCP_PC_ALIGN		0x22	/* PC alignment fault */
+-- 
+2.54.0 (Apple Git-157)
+

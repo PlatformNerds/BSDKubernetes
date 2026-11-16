@@ -43,8 +43,8 @@ Both nodes boot `kernel.bsdk8s3` = 15.1 + allow.pf + pf sticky + rctl hierarchy 
 ## Known gaps (honest)
 
 - **Scheduling.** Upstream manifests pin `nodeSelector: kubernetes.io/os: linux`, which FreeBSD nodes never match.
-  metrics-server needed that one field patched to `runtimeClassName: linux`. A mutating webhook (plan:
-  `bsd-placement`) should do it automatically. This is the biggest blocker for "install any chart".
+  metrics-server needed that one field patched to `runtimeClassName: linux`. **Solved by the `bsd-placement`
+  webhook (research/11):** cert-manager now installs unmodified.
 - **Linuxulator coverage:**
   - `io_setup()` (Linux AIO) returns ENOSYS. nginx logs `[emerg]` and continues.
   - `/proc/net/tcp` is missing, so `netstat` inside Linux containers is empty.
@@ -53,6 +53,6 @@ Both nodes boot `kernel.bsdk8s3` = 15.1 + allow.pf + pf sticky + rctl hierarchy 
   - research/04 also lists: unshare/setns, io_uring, signalfd, pidfd, bpf, keyctl, landlock.
 - **Images with FreeBSD twins.** Our FreeBSD test images use upstream names (e.g. `agnhost:2.63.0`). A Linux pod
   asking for the same tag gets the local FreeBSD image.
-- **Not tested yet:** controllers with admission webhooks (cert-manager), images that need `unshare`, or Java.
+- **Not tested yet:** images that need `unshare`, or Java. cert-manager (admission webhooks): works, see research/11.
 - **bhyve/Kata** for images the Linuxulator can't run still needs bare metal: no nested virtualization in the Mac
   VM.

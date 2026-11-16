@@ -171,6 +171,10 @@ A real eBPF VM in the kernel (the old generic-ebpf project, hooked into pf/ipfw)
    - Else use `kata-bhyve`, or leave the pod on Linux nodes.
 
    This is the **"out-of-the-box" piece** that makes "unchanged Helm charts" mostly true without lying in `spec.os`.
+
+   **Status (2026-11-16):** a first version runs (`components/bsd-placement`, research/11). It is selector-driven:
+   Linux-pinned pods and DaemonSets go to RuntimeClass `linux`. There's no image-platform lookup yet. cert-manager
+   installs unmodified.
 4. **DaemonSets:** FreeBSD-native builds of kube-proxy (pf), the CNI and node_exporter. Everything else gets excluded by the taint.
 
 ## 6. Kernel work plan (FreeBSD), prioritised

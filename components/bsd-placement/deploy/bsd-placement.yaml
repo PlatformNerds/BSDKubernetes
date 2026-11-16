@@ -1,0 +1,85 @@
+# bsd-placement: rewrites Linux-pinned pods/DaemonSets to RuntimeClass "linux".
+# Installed by install.sh, which fills in CA_BUNDLE and the serving cert.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: bsd-placement
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bsd-placement
+  namespace: bsd-placement
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: bsd-placement}}
+  template:
+    metadata:
+      labels: {app: bsd-placement}
+    spec:
+      nodeSelector: {kubernetes.io/os: freebsd}
+      tolerations:
+      - {key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule}
+      securityContext: {runAsNonRoot: true, runAsUser: 65534}
+      containers:
+      - name: webhook
+        image: ${IMAGE}
+        imagePullPolicy: IfNotPresent
+        args: ["--listen=:8443"]
+        ports: [{containerPort: 8443, name: https}]
+        readinessProbe:
+          httpGet: {path: /healthz, port: https, scheme: HTTPS}
+        resources:
+          requests: {cpu: 10m, memory: 16Mi}
+          limits: {memory: 64Mi}
+        volumeMounts: [{name: certs, mountPath: /certs, readOnly: true}]
+      volumes:
+      - name: certs
+        secret: {secretName: bsd-placement-tls}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bsd-placement
+  namespace: bsd-placement
+spec:
+  selector: {app: bsd-placement}
+  ports: [{port: 443, targetPort: https}]
+---
+# failurePolicy Ignore: if the webhook is down, pods are admitted unchanged
+# (Linux-pinned ones then stay Pending) rather than blocking the cluster.
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: bsd-placement
+webhooks:
+- name: pods.bsd-placement.bsdk8s.io
+  clientConfig:
+    service: {name: bsd-placement, namespace: bsd-placement, path: /mutate}
+    caBundle: ${CA_BUNDLE}
+  rules:
+  - {apiGroups: [""], apiVersions: [v1], operations: [CREATE], resources: [pods]}
+  - {apiGroups: [apps], apiVersions: [v1], operations: [CREATE, UPDATE], resources: [daemonsets]}
+  namespaceSelector:
+    matchExpressions:
+    - {key: kubernetes.io/metadata.name, operator: NotIn, values: [bsd-placement]}
+    - {key: bsdk8s.io/placement, operator: NotIn, values: [ignore]}
+  admissionReviewVersions: [v1]
+  sideEffects: None
+  failurePolicy: Ignore
+  timeoutSeconds: 5
+# Namespaces labeled bsdk8s.io/default-runtime=linux: every pod/DaemonSet
+# without a runtimeClassName runs as Linux, pinned or not.
+- name: default-linux.bsd-placement.bsdk8s.io
+  clientConfig:
+    service: {name: bsd-placement, namespace: bsd-placement, path: /mutate-force}
+    caBundle: ${CA_BUNDLE}
+  rules:
+  - {apiGroups: [""], apiVersions: [v1], operations: [CREATE], resources: [pods]}
+  - {apiGroups: [apps], apiVersions: [v1], operations: [CREATE, UPDATE], resources: [daemonsets]}
+  namespaceSelector:
+    matchLabels: {bsdk8s.io/default-runtime: linux}
+  admissionReviewVersions: [v1]
+  sideEffects: None
+  failurePolicy: Ignore
+  timeoutSeconds: 5

@@ -1,0 +1,544 @@
+From 0fed4882e325f31443c7620661154967a9425c01 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 14:22:45 -0700
+Subject: [PATCH] linux: cgroup v2 view of jail limits (lincgroupfs)
+
+Linux runtimes size themselves from cgroup v2 files: the JVM picks its
+default heap from memory.max and its CPU count from cpu.max, Go (1.25+)
+sets GOMAXPROCS from cpu.max, coreutils nproc honours cpu.max, and .NET
+and Node do similar.  Under the Linuxulator there was no cgroup file
+system, so a Linux program in a jail limited by rctl(8) saw the whole
+host: in a 256 MiB container the JVM chose a 3 GB heap and would be
+killed by the memoryuse rule under load.
+
+Add lincgroupfs, a second pseudofs in the linsysfs module that shows the
+reading process its jail's limits as a read-only cgroup v2 hierarchy:
+
+  memory.max       lowest memoryuse rule (deny or signal), or "max"
+  memory.current   the jail's resident memory (racct)
+  cpu.max          pcpu rule as "<quota> 100000"
+  cpu.stat         usage_usec from the jail's cputime
+  pids.max/current maxproc
+  + cgroup.controllers, cpuset.cpus.effective and fixed defaults
+
+Limits come from rctl_get_jail_limit(), which considers the rules of the
+process's jail (and, with hierarchical jail rules, its ancestors), so
+in-place changes to the rules are visible immediately.
+
+It is its own file system so that statfs(2) can return
+CGROUP2_SUPER_MAGIC (the JVM and .NET check it) and linprocfs can list it
+as "cgroup2" in /proc/<pid>/mountinfo and mounts.  linsysfs provides
+/sys/fs/cgroup as its mount point; linprocfs adds /proc/<pid>/cgroup
+("0::/") and /proc/cgroups (unified hierarchy).  The module advertises
+kern.features.linux_cgroupfs so that container runtimes mount it only
+where it exists.
+
+Verified on arm64 in jails with rctl limits (256Mi/500m): Temurin 21
+reports Provider cgroupv2, Memory Limit 256M, CPU quota 50000/100000 and
+picks a 126 MiB heap (3 GB before); Go GOMAXPROCS follows cpu.max (2 for
+1.5 CPUs); nproc reports 1; an in-place resize shows up immediately.
+---
+ sys/compat/linprocfs/linprocfs.c |  36 ++++-
+ sys/compat/linsysfs/linsysfs.c   | 219 +++++++++++++++++++++++++++++++
+ sys/compat/linux/linux_stats.c   |   2 +
+ sys/kern/kern_racct.c            |  49 +++++++
+ sys/kern/kern_rctl.c             |  36 +++++
+ sys/sys/racct.h                  |  16 +++
+ sys/sys/rctl.h                   |   1 +
+ 7 files changed, 358 insertions(+), 1 deletion(-)
+
+diff --git a/sys/compat/linprocfs/linprocfs.c b/sys/compat/linprocfs/linprocfs.c
+index df3434848..33faa25c7 100644
+--- a/sys/compat/linprocfs/linprocfs.c
++++ b/sys/compat/linprocfs/linprocfs.c
+@@ -472,7 +472,9 @@ _mtab_helper(const struct pfs_node *pn, const struct statfs *sp,
+ 			*mntfrom += 4;
+ 	}
+ 
+-	if (strcmp(*fstype, "linsysfs") == 0) {
++	if (strcmp(*fstype, "lincgroupfs") == 0) {
++		*mntfrom = *fstype = "cgroup2";
++	} else if (strcmp(*fstype, "linsysfs") == 0) {
+ 		*mntfrom = *fstype = "sysfs";
+ 	} else {
+ 		/* For Linux msdosfs is called vfat */
+@@ -560,6 +562,34 @@ linprocfs_domtab(PFS_FILL_ARGS)
+ 	return (error);
+ }
+ 
++/*
++ * Filler function for proc/pid/cgroup: every process is at the root of its
++ * container's cgroup v2 hierarchy (lincgroupfs, see linsysfs.c).
++ */
++static int
++linprocfs_doproccgroup(PFS_FILL_ARGS)
++{
++
++	sbuf_cat(sb, "0::/\n");
++	return (0);
++}
++
++/*
++ * Filler function for proc/cgroups: hierarchy 0 for every controller means
++ * cgroup v2 (unified), which is what lincgroupfs provides.
++ */
++static int
++linprocfs_docgroups(PFS_FILL_ARGS)
++{
++	static const char *controllers[] = { "cpuset", "cpu", "cpuacct",
++	    "memory", "pids" };
++
++	sbuf_cat(sb, "#subsys_name\thierarchy\tnum_cgroups\tenabled\n");
++	for (size_t i = 0; i < nitems(controllers); i++)
++		sbuf_printf(sb, "%s\t0\t1\t1\n", controllers[i]);
++	return (0);
++}
++
+ static int
+ linprocfs_doprocmountinfo(PFS_FILL_ARGS)
+ {
+@@ -2375,6 +2405,8 @@ linprocfs_init(PFS_INIT_ARGS)
+ 	/* /proc/... */
+ 	pfs_create_file(root, NULL, "cmdline", &linprocfs_docmdline, NULL, NULL,
+ 	    NULL, PFS_RD);
++	pfs_create_file(root, NULL, "cgroups", &linprocfs_docgroups, NULL, NULL,
++	    NULL, PFS_RD);
+ 	pfs_create_file(root, NULL, "cpuinfo", &linprocfs_docpuinfo, NULL, NULL,
+ 	    NULL, PFS_RD);
+ 	pfs_create_file(root, NULL, "devices", &linprocfs_dodevices, NULL, NULL,
+@@ -2418,6 +2450,8 @@ linprocfs_init(PFS_INIT_ARGS)
+ 
+ 	/* /proc/<pid>/... */
+ 	pfs_create_dir(root, &dir, "pid", NULL, NULL, NULL, PFS_PROCDEP);
++	pfs_create_file(dir, NULL, "cgroup", &linprocfs_doproccgroup, NULL,
++	    NULL, NULL, PFS_RD);
+ 	pfs_create_file(dir, NULL, "cmdline", &linprocfs_doproccmdline, NULL,
+ 	    NULL, NULL, PFS_RD);
+ 	pfs_create_link(dir, NULL, "cwd", &linprocfs_doproccwd, NULL, NULL,
+diff --git a/sys/compat/linsysfs/linsysfs.c b/sys/compat/linsysfs/linsysfs.c
+index 5a41c5193..7b3e5c2d9 100644
+--- a/sys/compat/linsysfs/linsysfs.c
++++ b/sys/compat/linsysfs/linsysfs.c
+@@ -34,6 +34,8 @@
+ #include <sys/mount.h>
+ #include <sys/sbuf.h>
+ #include <sys/smp.h>
++#include <sys/proc.h>
++#include <sys/racct.h>
+ #include <sys/bus.h>
+ #include <sys/pciio.h>
+ 
+@@ -491,6 +493,217 @@ linsysfs_listcpus(struct pfs_node *dir)
+ /*
+  * Constructor
+  */
++/*
++ * lincgroupfs: a read-only cgroup v2 view of the limits FreeBSD enforces
++ * on the reading process's jail with rctl(8), so that Linux programs in a
++ * container size themselves to it (JVM heap, Go GOMAXPROCS, .NET GC, Node
++ * heap) instead of to the whole host.  Each file is computed for the reader,
++ * like a cgroup namespace whose root is the container's cgroup.  It is its
++ * own file system (mounted on /sys/fs/cgroup, a directory linsysfs provides)
++ * so that statfs(2) can report the cgroup2 magic and mountinfo the cgroup2
++ * type, which is how the JVM and .NET recognize cgroup v2; linprocfs reports
++ * the matching "0::/" in /proc/<pid>/cgroup.
++ *
++ *	memory.max	memoryuse rule (deny or signal), or "max"
++ *	memory.current	the jail's resident memory (racct memoryuse)
++ *	cpu.max		pcpu rule as "<quota> <period>" (percent of one CPU)
++ *	pids.max	maxproc rule
++ *	cpu.stat	usage_usec from the jail's cputime
++ *
++ * Limits are the lowest of the jail's and its ancestors' rules (with
++ * hierarchical jail rules, a pod's limit applies to its containers).
++ */
++#define	LINSYSFS_CG_PERIOD	100000	/* cpu.max period, microseconds */
++
++static uint64_t
++linsysfs_cg_limit(struct thread *td, int resource)
++{
++
++	return (racct_get_jail_limit(td->td_proc, resource));
++}
++
++static uint64_t
++linsysfs_cg_usage(struct thread *td, int resource)
++{
++
++	return (racct_get_jail_usage(td->td_ucred, resource));
++}
++
++static void
++linsysfs_cg_print(struct sbuf *sb, uint64_t v)
++{
++
++	if (v == UINT64_MAX)
++		sbuf_cat(sb, "max\n");
++	else
++		sbuf_printf(sb, "%ju\n", (uintmax_t)v);
++}
++
++static int
++linsysfs_cg_controllers(PFS_FILL_ARGS)
++{
++
++	sbuf_cat(sb, "cpuset cpu memory pids\n");
++	return (0);
++}
++
++static int
++linsysfs_cg_empty(PFS_FILL_ARGS)
++{
++
++	sbuf_cat(sb, "\n");
++	return (0);
++}
++
++static int
++linsysfs_cg_zero(PFS_FILL_ARGS)
++{
++
++	sbuf_cat(sb, "0\n");
++	return (0);
++}
++
++static int
++linsysfs_cg_unlimited(PFS_FILL_ARGS)
++{
++
++	sbuf_cat(sb, "max\n");
++	return (0);
++}
++
++static int
++linsysfs_cg_memory_max(PFS_FILL_ARGS)
++{
++
++	linsysfs_cg_print(sb, linsysfs_cg_limit(td, RACCT_RSS));
++	return (0);
++}
++
++static int
++linsysfs_cg_memory_current(PFS_FILL_ARGS)
++{
++
++	sbuf_printf(sb, "%ju\n", (uintmax_t)linsysfs_cg_usage(td, RACCT_RSS));
++	return (0);
++}
++
++static int
++linsysfs_cg_memory_stat(PFS_FILL_ARGS)
++{
++	uint64_t rss;
++
++	/* Only the resident total is known; report it as anonymous memory. */
++	rss = linsysfs_cg_usage(td, RACCT_RSS);
++	sbuf_printf(sb, "anon %ju\nfile 0\nkernel 0\nshmem 0\nsock 0\n",
++	    (uintmax_t)rss);
++	return (0);
++}
++
++static int
++linsysfs_cg_cpu_max(PFS_FILL_ARGS)
++{
++	uint64_t pct;
++
++	/* pcpu is in millionths of a percent of one CPU. */
++	pct = linsysfs_cg_limit(td, RACCT_PCTCPU);
++	if (pct == UINT64_MAX)
++		sbuf_printf(sb, "max %d\n", LINSYSFS_CG_PERIOD);
++	else
++		sbuf_printf(sb, "%ju %d\n",
++		    (uintmax_t)MAX(pct / 1000000 * (LINSYSFS_CG_PERIOD / 100),
++		    1000), LINSYSFS_CG_PERIOD);
++	return (0);
++}
++
++static int
++linsysfs_cg_cpu_weight(PFS_FILL_ARGS)
++{
++
++	/* FreeBSD has no CPU weights; report the default. */
++	sbuf_cat(sb, "100\n");
++	return (0);
++}
++
++static int
++linsysfs_cg_cpu_stat(PFS_FILL_ARGS)
++{
++	uint64_t usec;
++
++	/* cputime is in millionths of a second. */
++	usec = linsysfs_cg_usage(td, RACCT_CPU);
++	sbuf_printf(sb, "usage_usec %ju\nuser_usec 0\nsystem_usec 0\n"
++	    "nr_periods 0\nnr_throttled 0\nthrottled_usec 0\n",
++	    (uintmax_t)usec);
++	return (0);
++}
++
++static int
++linsysfs_cg_cpuset_cpus(PFS_FILL_ARGS)
++{
++
++	if (mp_ncpus > 1)
++		sbuf_printf(sb, "0-%d\n", mp_ncpus - 1);
++	else
++		sbuf_cat(sb, "0\n");
++	return (0);
++}
++
++static int
++linsysfs_cg_pids_max(PFS_FILL_ARGS)
++{
++
++	linsysfs_cg_print(sb, linsysfs_cg_limit(td, RACCT_NPROC));
++	return (0);
++}
++
++static int
++linsysfs_cg_pids_current(PFS_FILL_ARGS)
++{
++
++	sbuf_printf(sb, "%ju\n", (uintmax_t)linsysfs_cg_usage(td, RACCT_NPROC));
++	return (0);
++}
++
++static int
++lincgroupfs_init(PFS_INIT_ARGS)
++{
++	static const struct {
++		const char *name;
++		pfs_fill_t fill;
++	} files[] = {
++		{ "cgroup.controllers",		linsysfs_cg_controllers },
++		{ "cgroup.subtree_control",	linsysfs_cg_empty },
++		{ "cgroup.procs",		linsysfs_cg_empty },
++		{ "memory.max",			linsysfs_cg_memory_max },
++		{ "memory.high",		linsysfs_cg_unlimited },
++		{ "memory.low",			linsysfs_cg_zero },
++		{ "memory.min",			linsysfs_cg_zero },
++		{ "memory.swap.max",		linsysfs_cg_zero },
++		{ "memory.swap.current",	linsysfs_cg_zero },
++		{ "memory.current",		linsysfs_cg_memory_current },
++		{ "memory.stat",		linsysfs_cg_memory_stat },
++		{ "cpu.max",			linsysfs_cg_cpu_max },
++		{ "cpu.weight",			linsysfs_cg_cpu_weight },
++		{ "cpu.stat",			linsysfs_cg_cpu_stat },
++		{ "cpuset.cpus.effective",	linsysfs_cg_cpuset_cpus },
++		{ "cpuset.mems.effective",	linsysfs_cg_zero },
++		{ "pids.max",			linsysfs_cg_pids_max },
++		{ "pids.current",		linsysfs_cg_pids_current },
++	};
++
++	for (size_t i = 0; i < nitems(files); i++)
++		pfs_create_file(pi->pi_root, NULL, files[i].name, files[i].fill,
++		    NULL, NULL, NULL, PFS_RD);
++	return (0);
++}
++
++static int
++lincgroupfs_uninit(PFS_INIT_ARGS)
++{
++
++	return (0);
++}
++
+ static int
+ linsysfs_init(PFS_INIT_ARGS)
+ {
+@@ -556,6 +769,10 @@ linsysfs_init(PFS_INIT_ARGS)
+ 
+ 	linsysfs_listcpus(cpu);
+ 
++	/* /sys/fs/cgroup: mount point for lincgroupfs */
++	pfs_create_dir(root, &dir, "fs", NULL, NULL, NULL, 0);
++	pfs_create_dir(dir, NULL, "cgroup", NULL, NULL, NULL, 0);
++
+ 	/* /sys/kernel */
+ 	pfs_create_dir(root, &kernel, "kernel", NULL, NULL, NULL, 0);
+ 	/* /sys/kernel/debug, mountpoint for lindebugfs. */
+@@ -587,6 +804,8 @@ linsysfs_uninit(PFS_INIT_ARGS)
+ }
+ 
+ PSEUDOFS(linsysfs, 1, VFCF_JAIL);
++PSEUDOFS(lincgroupfs, 1, VFCF_JAIL);
++FEATURE(linux_cgroupfs, "Linux cgroup v2 view of jail limits (lincgroupfs)");
+ #if defined(__aarch64__) || defined(__amd64__)
+ MODULE_DEPEND(linsysfs, linux_common, 1, 1, 1);
+ #else
+diff --git a/sys/compat/linux/linux_stats.c b/sys/compat/linux/linux_stats.c
+index 6f96a2190..6b24c6d02 100644
+--- a/sys/compat/linux/linux_stats.c
++++ b/sys/compat/linux/linux_stats.c
+@@ -296,6 +296,7 @@ struct l_statfs {
+ #define	LINUX_DEVFS_SUPER_MAGIC	0x1373L
+ #define	LINUX_SHMFS_MAGIC	0x01021994
+ #define	LINUX_SYSFS_MAGIC	0x62656572
++#define	LINUX_CGROUP2_SUPER_MAGIC	0x63677270
+ 
+ static long
+ bsd_to_linux_ftype(const char *fstypename)
+@@ -316,6 +317,7 @@ bsd_to_linux_ftype(const char *fstypename)
+ 		{"devfs",    LINUX_DEVFS_SUPER_MAGIC},
+ 		{"tmpfs",    LINUX_SHMFS_MAGIC},
+ 		{"linsysfs", LINUX_SYSFS_MAGIC},
++		{"lincgroupfs", LINUX_CGROUP2_SUPER_MAGIC},
+ 		{NULL,       0L}};
+ 
+ 	for (i = 0; b2l_tbl[i].bsd_name != NULL; i++)
+diff --git a/sys/kern/kern_racct.c b/sys/kern/kern_racct.c
+index 2e243db04..eb9eb1e9b 100644
+--- a/sys/kern/kern_racct.c
++++ b/sys/kern/kern_racct.c
+@@ -614,6 +614,55 @@ racct_get_available(struct proc *p, int resource)
+ #endif
+ }
+ 
++/*
++ * Returns the lowest limit that the rules of process 'p''s jail (and, with
++ * hierarchical jail rules, of its ancestors) put on 'resource', whatever
++ * their enforcing action; UINT64_MAX if none.  In the resource's internal
++ * units (see RACCT_IN_MILLIONS).
++ */
++uint64_t
++racct_get_jail_limit(struct proc *p, int resource)
++{
++#ifdef RCTL
++	uint64_t limit;
++
++	if (!racct_enable)
++		return (UINT64_MAX);
++
++	RACCT_LOCK();
++	limit = rctl_get_jail_limit(p, resource);
++	RACCT_UNLOCK();
++
++	return (limit);
++#else
++
++	return (UINT64_MAX);
++#endif
++}
++
++/*
++ * Returns the current usage of 'resource' by the jail of 'cred', in the
++ * resource's internal units.
++ */
++uint64_t
++racct_get_jail_usage(struct ucred *cred, int resource)
++{
++	struct prison_racct *prr;
++	int64_t amount;
++
++	if (!racct_enable)
++		return (0);
++
++	prr = cred->cr_prison->pr_prison_racct;
++	if (prr == NULL)
++		return (0);
++	RACCT_LOCK();
++	amount = prr->prr_racct->r_resources[resource];
++	RACCT_UNLOCK();
++
++	return (amount < 0 ? 0 : amount);
++}
++
+ /*
+  * Returns amount of the %cpu resource that process 'p' can add to its %cpu
+  * utilization.  Adding more than that would lead to the process being
+diff --git a/sys/kern/kern_rctl.c b/sys/kern/kern_rctl.c
+index 682ba86d2..e5ca76bd1 100644
+--- a/sys/kern/kern_rctl.c
++++ b/sys/kern/kern_rctl.c
+@@ -721,6 +721,42 @@ rctl_get_limit(struct proc *p, int resource)
+ 	return (amount);
+ }
+ 
++/*
++ * Return the lowest limit that an enforcing rule (deny or a signal) of the
++ * jail of process 'p' puts on 'resource', or UINT64_MAX if there is none.
++ * With hierarchical jail rules, processes are also linked to the rules of
++ * their jail's ancestors, so this is the effective limit of a container
++ * inside a pod.  Used to show a process its container's limits (the
++ * Linuxulator's cgroup v2 view).
++ */
++uint64_t
++rctl_get_jail_limit(struct proc *p, int resource)
++{
++	struct rctl_rule *rule;
++	struct rctl_rule_link *link;
++	uint64_t amount = UINT64_MAX;
++
++	ASSERT_RACCT_ENABLED();
++	RACCT_LOCK_ASSERT();
++
++	LIST_FOREACH(link, &p->p_racct->r_rule_links, rrl_next) {
++		rule = link->rrl_rule;
++		if (rule->rr_resource != resource)
++			continue;
++		if (rule->rr_subject_type != RCTL_SUBJECT_TYPE_JAIL ||
++		    rule->rr_per != RCTL_SUBJECT_TYPE_JAIL)
++			continue;
++		if (rule->rr_action != RCTL_ACTION_DENY &&
++		    (rule->rr_action < 0 ||
++		    rule->rr_action > RCTL_ACTION_SIGNAL_MAX))
++			continue;
++		if (rule->rr_amount >= 0 && (uint64_t)rule->rr_amount < amount)
++			amount = rule->rr_amount;
++	}
++
++	return (amount);
++}
++
+ uint64_t
+ rctl_get_available(struct proc *p, int resource)
+ {
+diff --git a/sys/sys/racct.h b/sys/sys/racct.h
+index 92b503537..3a14e1f81 100644
+--- a/sys/sys/racct.h
++++ b/sys/sys/racct.h
+@@ -186,6 +186,8 @@ void	racct_sub(struct proc *p, int resource, uint64_t amount);
+ void	racct_sub_cred(struct ucred *cred, int resource, uint64_t amount);
+ uint64_t	racct_get_limit(struct proc *p, int resource);
+ uint64_t	racct_get_available(struct proc *p, int resource);
++uint64_t	racct_get_jail_limit(struct proc *p, int resource);
++uint64_t	racct_get_jail_usage(struct ucred *cred, int resource);
+ 
+ void	racct_create(struct racct **racctp);
+ void	racct_destroy(struct racct **racctp);
+@@ -257,6 +259,20 @@ racct_get_available(struct proc *p, int resource)
+ 	return (UINT64_MAX);
+ }
+ 
++static inline uint64_t
++racct_get_jail_limit(struct proc *p, int resource)
++{
++
++	return (UINT64_MAX);
++}
++
++static inline uint64_t
++racct_get_jail_usage(struct ucred *cred, int resource)
++{
++
++	return (0);
++}
++
+ #define	racct_create(x)
+ #define	racct_destroy(x)
+ 
+diff --git a/sys/sys/rctl.h b/sys/sys/rctl.h
+index 39a859eeb..99b0084e8 100644
+--- a/sys/sys/rctl.h
++++ b/sys/sys/rctl.h
+@@ -143,6 +143,7 @@ int	rctl_enforce(struct proc *p, int resource, uint64_t amount);
+ void	rctl_throttle_decay(struct racct *racct, int resource);
+ int64_t	rctl_pcpu_available(const struct proc *p);
+ uint64_t rctl_get_limit(struct proc *p, int resource);
++uint64_t rctl_get_jail_limit(struct proc *p, int resource);
+ uint64_t rctl_get_available(struct proc *p, int resource);
+ const char *rctl_resource_name(int resource);
+ void	rctl_proc_ucred_changed(struct proc *p, struct ucred *newcred);
+-- 
+2.54.0 (Apple Git-157)
+

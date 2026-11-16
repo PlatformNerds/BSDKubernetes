@@ -1,0 +1,63 @@
+From 9ec045350d5330a3a28c4cbe28c0b498e2683900 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 14:15:42 -0700
+Subject: [PATCH] freebsd: mount lincgroupfs on /sys/fs/cgroup for Linux images
+
+Linux runtimes size themselves from cgroup v2 files: the JVM heap from
+memory.max, Go GOMAXPROCS and the JVM CPU count from cpu.max, .NET and
+Node similarly. Without them a Linux container in a 256Mi pod saw the
+host (12 GB, 8 CPUs) and the JVM picked a 3 GB heap. The kernel's
+lincgroupfs (in the linsysfs module) shows a process its jail's rctl
+limits as cgroup v2 files; mount it read-only on /sys/fs/cgroup when we
+also mount /sys and the kernel advertises kern.features.linux_cgroupfs.
+---
+ server/image_os_freebsd.go | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/server/image_os_freebsd.go b/server/image_os_freebsd.go
+index 03d0d839f..2a078c56a 100644
+--- a/server/image_os_freebsd.go
++++ b/server/image_os_freebsd.go
+@@ -3,6 +3,8 @@ package server
+ import (
+ 	"path/filepath"
+ 
++	"golang.org/x/sys/unix"
++
+ 	rspec "github.com/opencontainers/runtime-spec/specs-go"
+ 	"github.com/opencontainers/runtime-tools/generate"
+ 	types "k8s.io/cri-api/pkg/apis/runtime/v1"
+@@ -66,11 +68,30 @@ func addImageOSMounts(specgen *generate.Generator, img *storage.ImageResult, con
+ 	for _, m := range mounts {
+ 		specgen.AddMount(m)
+ 	}
++	addedSys := false
+ 	for _, m := range linuxImageMounts {
+ 		if !have[m.Destination] {
+ 			specgen.AddMount(m)
++			addedSys = addedSys || m.Destination == "/sys"
+ 		}
+ 	}
++	// A cgroup v2 view of the container's limits, so that Linux runtimes
++	// (JVM, Go, .NET, Node) size themselves to the pod and not to the host.
++	// Only on our /sys (it provides the mount point) and when the kernel
++	// has the file system.
++	if addedSys && !have["/sys/fs/cgroup"] && linuxCgroupfsSupported() {
++		specgen.AddMount(rspec.Mount{
++			Destination: "/sys/fs/cgroup", Type: "lincgroupfs", Source: "cgroup2",
++			Options: []string{"ro", "nodev", "nosuid", "noexec"},
++		})
++	}
++}
++
++// linuxCgroupfsSupported reports whether the kernel provides lincgroupfs
++// (kern.features.linux_cgroupfs, from the linsysfs module).
++func linuxCgroupfsSupported() bool {
++	v, err := unix.SysctlUint32("kern.features.linux_cgroupfs")
++	return err == nil && v == 1
+ }
+ 
+ var linuxImageMounts = []rspec.Mount{
+-- 
+2.54.0 (Apple Git-157)
+

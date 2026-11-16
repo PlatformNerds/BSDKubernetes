@@ -1,5 +1,10 @@
 # 12: Deleted pods lingered: volumes held by stopped containers (2026-11-16)
 
+> **Update (research/15):** the dominant cause turned out to be different. For images with `/var/run → /run` (most
+> Linux images), ocijail unmounted volumes by re-resolving a symlinked path after CRI-O had already unmounted the
+> container root, so the mounts leaked and those pods stayed Terminating *forever*. Fixed in ocijail `aa3e111`. The
+> release-on-stop change below still applies to images without that symlink.
+
 **Symptom.** After a Deployment rollout, deleted pods stayed listed as `Completed`/`Error` for 1–3 minutes. That
 slows anything that waits for a pod to be gone: StatefulSet ordinal replacement, namespace deletion, e2e
 timeouts.

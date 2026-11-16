@@ -1,0 +1,95 @@
+From aa3e1114498cc655afab3fe653da3ab4162a61e9 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 14:36:07 -0700
+Subject: [PATCH] mount: unmount volumes by the path they were mounted on
+
+Volume destinations are resolved within the container root (following
+symlinks) both when mounting and, again, when unmounting. CRI-O
+unmounts the container's root file system when the container stops,
+before it deletes it; by then a symlink on a destination no longer
+resolves. Nearly every Linux image has /var/run -> ../run (Alpine) or
+/run (Debian, Ubuntu), and the kubelet mounts the service account token
+on /var/run/secrets/kubernetes.io/serviceaccount and the termination log
+under /var/run: the second resolution produced ROOT/var/run/..., the
+mount was on ROOT/run/..., unmount(2) failed with EINVAL (taken to mean
+"already gone") and the mount leaked. The kubelet could then never
+unmount the pod's volumes and the pod stayed Terminating. podman deletes
+before unmounting storage, so it never hit this.
+
+Record each mount's resolved destination in the state before mounting
+it (so a failed create's rollback has it too) and unmount by that path;
+state written by older versions still falls back to resolving again.
+
+Tested under CRI-O with node:22-alpine, eclipse-temurin:21-jre and
+nginx:1.27-alpine (all leaked 2 mounts and stayed Terminating before)
+and busybox: no mounts left, pods gone within 1 s.
+---
+ ocijail/mount.cpp | 38 ++++++++++++++++++++++++++++++++++----
+ 1 file changed, 34 insertions(+), 4 deletions(-)
+
+diff --git a/ocijail/mount.cpp b/ocijail/mount.cpp
+index e794cc3..ba0e284 100644
+--- a/ocijail/mount.cpp
++++ b/ocijail/mount.cpp
+@@ -464,8 +464,13 @@ static void unmount_volume(main_app& app,
+                            bool file_mount_supported,
+                            runtime_state& state,
+                            const fs::path& root_path,
+-                           const json& mount) {
+-    auto destination = resolve_container_path(app, root_path, mount);
++                           const json& mount,
++                           const json& recorded) {
++    // Prefer the path recorded at mount time (see mount_volumes); state
++    // written by older versions does not have it.
++    auto destination = recorded.is_string()
++                           ? fs::path{recorded.get<std::string>()}
++                           : resolve_container_path(app, root_path, mount);
+ 
+     std::string type = mount.contains("type") ? mount["type"] : "nullfs";
+     bool is_file_mount =
+@@ -578,6 +583,20 @@ void mount_volumes(main_app& app,
+     // json::type_error and silently do nothing at all.
+     state["file_mount_supported"] = file_mount_supported;
+ 
++    // Record where each mount lands, resolved within the root, before
++    // mounting it. Unmounting must use the same path, and resolving it again
++    // later can give a different one: the runtime may have unmounted the
++    // container's root file system by then (CRI-O does so when the container
++    // stops), so a symlink on the path (e.g. /var/run -> ../run, in nearly
++    // every Linux image) no longer resolves, the computed path does not
++    // match the mount, unmount(2) fails with EINVAL and the mount leaks (and
++    // with it, the kubelet's volume, so the pod stays Terminating).
++    state["mount_points"] = json::array();
++    for (auto& mount : mounts) {
++        state["mount_points"].push_back(
++            resolve_container_path(app, root_path, mount).string());
++    }
++
+     try {
+         for (auto& mount : mounts) {
+             file_mount_supported = mount_volume(app,
+@@ -643,8 +662,19 @@ void unmount_volumes(main_app& app,
+     std::exception_ptr eptr{nullptr};
+     for (std::size_t i = count; i > 0; i--) {
+         try {
+-            unmount_volume(
+-                app, file_mount_supported, state, root_path, mounts[i - 1]);
++            const json none;
++            const json& recorded =
++                state.contains("mount_points") &&
++                        state["mount_points"].is_array() &&
++                        state["mount_points"].size() == mounts.size()
++                    ? state["mount_points"][i - 1]
++                    : none;
++            unmount_volume(app,
++                           file_mount_supported,
++                           state,
++                           root_path,
++                           mounts[i - 1],
++                           recorded);
+         } catch (const std::exception&) {
+             if (!eptr) {
+                 eptr = std::current_exception();
+-- 
+2.54.0 (Apple Git-157)
+

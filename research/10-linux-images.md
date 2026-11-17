@@ -62,7 +62,15 @@ Both nodes boot `kernel.bsdk8s3` = 15.1 + allow.pf + pf sticky + rctl hierarchy 
     implemented.
   - research/04 also lists: unshare/setns, io_uring, signalfd, pidfd, bpf, keyctl, landlock.
 - **Images with FreeBSD twins.** Our FreeBSD test images use upstream names (e.g. `agnhost:2.63.0`). A Linux pod
-  asking for the same tag gets the local FreeBSD image.
-- **Not tested yet:** images that need `unshare`, or Java. cert-manager (admission webhooks): works, see research/11.
+  asking for the same tag gets the local FreeBSD image. CRI-O now refuses this with a clear error (research/17).
+- ~~**Commands found only on the image's `PATH`** failed: `command: ["java", "-version"]` on `eclipse-temurin`
+  gave `'java' not found in $PATH`.~~ **Fixed (ocijail `e3cd4ae`, patch ocijail/0014).** CRI-O builds the spec with
+  runtime-tools, whose env cache is keyed by the whole `KEY=value` string, so the default `PATH` and `TERM` are never
+  deduplicated: the spec carries `PATH` twice, CRI-O's default first and the image's second. runc applies
+  `process.env` with `setenv` in order, so on Linux the last one wins and the duplicate is invisible. ocijail used
+  the first. It now merges duplicate keys the way runc does. Shell-wrapped commands were unaffected, because the
+  shell also keeps the last value.
+- **Not tested yet:** images that need `unshare`. Java works (research/15). cert-manager (admission webhooks):
+  works, see research/11.
 - **bhyve/Kata** for images the Linuxulator can't run still needs bare metal: no nested virtualization in the Mac
   VM.

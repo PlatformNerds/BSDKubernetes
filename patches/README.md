@@ -13,7 +13,7 @@ Outside Kubernetes (the branches are the source of truth; these are exports for 
 
 | Dir | Applies to | Notes |
 |---|---|---|
-| `ocijail/` | `dfr/ocijail` `main` → our `bsdk8s-main` | jail param fix, rctl resource limits, `allow.pf`, file mounts below devfs, `noNewPrivileges` (0009) |
+| `ocijail/` | `dfr/ocijail` `main` → our `bsdk8s-main` | jail param fix, rctl resource limits, `allow.pf`, file mounts below devfs, `noNewPrivileges` (0009), duplicate env keys last-wins like runc (0014) |
 | `cri-o/` | `dfr/cri-o` `freebsd-wip-1.37.0` → our `bsdk8s-1.37` | backport of the containers/storage fix for setuid/setgid bits lost when unpacking layers on FreeBSD |
 
 All patches are Apache-2.0 like Kubernetes itself. dfr's patches are unreviewed upstream WIP. The intent is to

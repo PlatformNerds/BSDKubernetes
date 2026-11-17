@@ -1,0 +1,99 @@
+From e3cd4aee3a18fe6fc14f7a31a6300260f0b26a77 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 23:30:51 -0700
+Subject: [PATCH] process: let a later env entry replace an earlier one with
+ the same key
+
+CRI-O builds the spec with runtime-tools, whose env cache is keyed by the
+whole KEY=value string. Defaults from generate.New (PATH, TERM) are
+therefore not deduplicated, and the spec carries PATH twice: CRI-O's
+default first, the image's second. runc applies process.env with setenv
+in order, so the last entry wins. ocijail took the first one, so a
+command found only on the image's PATH (e.g. java in eclipse-temurin,
+/opt/java/openjdk/bin) failed validation with "'java' not found in
+$PATH", and the process saw two PATH variables.
+
+Merge duplicate keys while parsing process.env: the later value replaces
+the earlier one in place.
+---
+ ocijail/process.cpp | 15 ++++++++++++++-
+ ocijail/process.h   |  4 ++++
+ test/run_test.py    | 14 ++++++++++++++
+ 3 files changed, 32 insertions(+), 1 deletion(-)
+
+diff --git a/ocijail/process.cpp b/ocijail/process.cpp
+index dcc32c2..8b96840 100644
+--- a/ocijail/process.cpp
++++ b/ocijail/process.cpp
+@@ -113,7 +113,7 @@ process::process(const json& process_json,
+             if (!arg.is_string()) {
+                 malformed_config("process.env must be an array of strings");
+             }
+-            env_.push_back(arg.get<std::string>());
++            add_env(arg.get<std::string>());
+         }
+     }
+ 
+@@ -156,6 +156,19 @@ std::optional<std::string_view> process::getenv(std::string_view key) {
+     return std::nullopt;
+ }
+ 
++void process::add_env(std::string keyval) {
++    std::string_view kv{keyval};
++    auto key = kv.substr(0, kv.find('='));
++    for (auto& env : env_) {
++        std::string_view envv{env};
++        if (envv.substr(0, envv.find('=')) == key) {
++            env = std::move(keyval);
++            return;
++        }
++    }
++    env_.push_back(std::move(keyval));
++}
++
+ void process::setenv(std::string_view key, std::string_view val) {
+     std::stringstream ss;
+     ss << key << "=" << val;
+diff --git a/ocijail/process.h b/ocijail/process.h
+index 4c40b50..4af145c 100644
+--- a/ocijail/process.h
++++ b/ocijail/process.h
+@@ -32,6 +32,10 @@ struct process {
+     void reset_signals();
+     void set_uid_gid();
+     void set_no_new_privs();
++    // Add a KEY=value entry to env_. A later entry for the same KEY
++    // replaces the earlier value in place, which matches runc (it
++    // applies process.env with setenv in order).
++    void add_env(std::string keyval);
+ 
+     std::optional<std::filesystem::path> console_socket_;
+     bool detach_;
+diff --git a/test/run_test.py b/test/run_test.py
+index 077bfaa..e8b629b 100644
+--- a/test/run_test.py
++++ b/test/run_test.py
+@@ -537,6 +537,20 @@ class test_run(unittest.TestCase):
+             self.assertEqual(ret, 0)
+             self.assertEqual(out, "Hello World\n")
+ 
++    def test_validate_command_duplicate_path(self):
++        # CRI-O (via runtime-tools) can emit PATH twice: its default
++        # first, then the image's. Like runc, the last entry must win.
++        with tempfile.TemporaryDirectory() as root_dir:
++            random_dir = secrets.token_urlsafe(8)
++            shutil.copytree("/rescue", os.path.join(root_dir, random_dir))
++            c = self.config()
++            c["root"]["path"] = root_dir
++            c["process"]["args"] = ["echo", "Hello World"]
++            c["process"]["env"] = ["PATH=/nonexistent", "FOO=1", f"PATH=/{random_dir}"]
++            ret, out, _ = self.run_with_config(c)
++            self.assertEqual(ret, 0)
++            self.assertEqual(out, "Hello World\n")
++
+     def test_validate_command_abs(self):
+         with tempfile.TemporaryDirectory() as root_dir:
+             random_dir = secrets.token_urlsafe(8)
+-- 
+2.54.0 (Apple Git-157)
+

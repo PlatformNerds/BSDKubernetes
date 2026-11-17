@@ -85,8 +85,44 @@ Measured with a static Linux Go client in a pod writing to a server pod whose `e
 The abort surfaces as `EPIPE` on the next write, where Linux returns `ETIMEDOUT`: FreeBSD's send path checks
 "can't send more" before the pending socket error. Callers (gRPC included) treat both as a dead connection.
 
+## HTTPS listener with a cert-manager certificate (2026-11-17)
+
+**Result [verified]:** an HTTPS listener terminating TLS with a cert-manager certificate works, and in-place
+renewal is picked up live. Nothing FreeBSD-specific was needed.
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata: {name: demo-gw, namespace: default}
+spec:
+  secretName: demo-gw-tls
+  dnsNames: ["demo.bsdk8s.test"]
+  issuerRef: {kind: ClusterIssuer, name: demo-ca}   # CA issuer from research/11
+---
+# added to Gateway "demo" next to the http listener
+  - name: https
+    port: 443
+    protocol: HTTPS
+    hostname: demo.bsdk8s.test
+    tls:
+      mode: Terminate
+      certificateRefs: [{kind: Secret, name: demo-gw-tls}]
+    allowedRoutes: {namespaces: {from: Same}}
+```
+
+- The existing HTTPRoute attached to both listeners (no `sectionName`). `curl --cacert` with the CA from the
+  secret: 200 through **both** node IPs, TLS 1.3 (`TLS_AES_256_GCM_SHA384`), verify OK. A hostname with no
+  listener is refused.
+- **Renewal:** changing the Certificate's `dnsNames` makes cert-manager rewrite the secret in place. The new
+  serial was in the secret after ~1 s, and Envoy served it ~1 s later through both node IPs. **90/90 requests
+  made during the rotation returned 200.**
+- **Gotcha (upstream behaviour, not FreeBSD):** *deleting* the secret makes Envoy Gateway mark the listener
+  invalid and drop port 443 from the proxy Service. When cert-manager recreates the secret, the port comes back
+  with a **new random NodePort** (30362 became 32452 here). Normal renewals don't delete the secret, but anything
+  pointing at a NodePort should pin it, or use a LoadBalancer.
+
 ## Not tested yet
 
-TLS listeners (cert-manager-issued certificates), GRPCRoute/TLSRoute, rate limiting (the `ratelimit` image),
+GRPCRoute/TLSRoute, rate limiting (the `ratelimit` image),
 and other implementations (NGINX Gateway Fabric, Traefik, which also ships FreeBSD binaries, so a native-jail
 data plane is possible).

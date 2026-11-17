@@ -33,8 +33,10 @@
 
 **Node** (demo `build-cluster.sh`, `LINUX_IMAGES=yes` by default):
 - `kld_list` gets `linux64 linprocfs linsysfs fdescfs`.
-- `kern.elf64.fallback_brand=3`: musl binaries carry no Linux ABI note. FreeBSD binaries are always branded, so
-  they're unaffected.
+- `kern.elf64.fallback_brand=3`: static Linux binaries with no ABI note (static Go, static musl) can't be branded any
+  other way. FreeBSD binaries are always branded, so they're unaffected. Re-tested 2026-11-17 with the arm64 brand
+  fixes (research/16): dynamic glibc and musl binaries no longer need it; a static Go binary and `busybox:1.36-musl`
+  still fail without it (`No such file or directory` / `Exec format error`).
 - The CRI-O `linux` handler, the RuntimeClass `linux` (scheduling onto `bsdk8s.io/linux-abi=true`), and the node
   label.
 

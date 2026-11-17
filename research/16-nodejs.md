@@ -55,7 +55,9 @@ Both nodes boot `kernel.bsdk8s9`, which contains all kernel fixes so far.
 
 - The kernel still logs `unsupported FUTEX_REQUEUE` once per process: the message is printed before the brand check.
   It's cosmetic.
-- With the brands fixed, `fallback_brand=3` may no longer be needed for dynamic binaries. It is still needed for
-  static musl binaries that have no interpreter or brand note. Not re-tested yet.
+- With the brands fixed, dynamic binaries no longer need `fallback_brand=3`: alpine, debian, busybox (glibc),
+  node:22-alpine, eclipse-temurin and nginx:alpine all ran with it set to -1. It stays, because static binaries
+  without an ABI note still need it: a static Go binary and `busybox:1.36-musl` both failed with it off
+  (re-tested 2026-11-17, research/10).
 - A fork-side mistake: an empty `bsdk8s/linux-mremap-efault` (main) branch was pushed. It points at an upstream commit
   with no changes of ours, because main already had the fix. Deleting it is a no-op cleanup.

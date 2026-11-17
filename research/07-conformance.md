@@ -16,6 +16,8 @@ Raw results: [`conformance/`](../conformance/) (gzipped JUnit + failure lists).*
 | run 5 (2 nodes, 35-min clock skew) | 420 / 446 | 94.2% | 389 / 400 = 97.3% | 71m |
 | **run 6 (2 nodes)** | **425 / 446** | **95.3%** | **394 / 400 = 98.5%** | 50m |
 | run 7 (2 nodes, regression check) | 425 / 446 | 95.3% | 394 / 400 = 98.5% | 52m |
+| run 8 (2 nodes, Mac slept mid-run) | 424 / 446 | 95.1% | | |
+| run 9 (2 nodes, node 2 froze mid-run) | 420 / 446 | 94.2% | | 1h50m |
 
 Run 2 fixed 34 tests and regressed none. Run 3 (after the kube-proxy session-affinity fix and ocijail file mounts below devfs) fixed 8 more, again with no regressions. The only remaining non-`[LinuxOnly]` failures are in-place pod resize (6) and the two-node requirement (2).
 
@@ -43,6 +45,61 @@ runs. The equivalent number for FreeBSD is the second column. Both are shown so 
    does not redirect host-originated traffic to Service ClusterIPs. So every admission webhook, CRD conversion webhook
    and aggregated API call timed out (21 tests in run 1; the apiserver log had 256× `context deadline exceeded`).
    This resolves those Services to endpoints instead. It's in the demo's kubeadm config.
+
+## Run 9: 420/446, no regressions, but node 2 froze once (2026-11-17)
+
+This run checked everything since run 8:
+- `kernel.bsdk8s9` on both nodes: lincgroupfs (research/15), the arm64 SME SIGILL fix, mremap EFAULT, and the arm64
+  musl brand / glibc interpreter fix (research/16);
+- CRI-O mounting lincgroupfs into Linux containers, and the image-OS fallback;
+- ocijail sysctls and recorded mount points;
+- kubelet's FreeBSD safe sysctls.
+
+Linux workloads (Envoy Gateway, cert-manager, metrics-server, nginx:alpine, node:22-alpine) were left running on
+node 2 during the run.
+
+**Failures compared with run 8** (`conformance/run9-failures.json`):
+- **21 are the known ones from run 7.**
+- **Run 8's rollover failure is gone**, as expected: it was clock skew.
+- **5 are new, and all are Serial tests that ran while node 2 was down.** Each one either waited 18 minutes for
+  "all nodes ready" in cleanup or never saw a schedulable second node. One of them is the trigger itself, `Garbage
+  collector should keep the rc around until all its pods are deleted`.
+
+Corrected for the outage, run 9 matches run 7: **425/446, no regressions.**
+
+### Open: node 2 froze during the garbage-collector test
+
+What happened:
+- **02:16:4x UTC:** the GC test started about 100 nginx pods; node 2 created 78 vnet jails in a few seconds.
+- **02:16:54:** syslog went silent.
+- **02:17:42:** the node controller marked node 2 unreachable.
+- **Until 02:25:** the kubelet stayed alive and kept restarting Linux pods whose probes failed. So process
+  creation still worked, but the 192.168.100.0/24 network was dead in both directions ("Host is down" from node 1).
+- **03:11:** no new process could start. A root login on the serial console was accepted, but the shell never
+  printed a prompt.
+- **Afterwards:** `kern.lastpid` had wrapped (about 26k at 02:25, 3017 at 03:11), so something forked heavily while
+  wedged.
+- **Kernel output:** no panic and no `maxproc` message, so the cause isn't visible in the logs.
+
+**Recovery:** a QEMU `system_reset`. Then CRI-O restore spent about 4 minutes timing out on each stale container's
+exit file before the kubelet could connect. That slow restore is itself worth fixing.
+
+**What did not reproduce it:**
+- 16 cycles of 100 nginx pods created and deleted at once on node 2;
+- 12 cycles of 80 pods, with all the Linux workloads moved onto node 2 and continuous HTTP load on the Node.js pod
+  (the musl `FUTEX_REQUEUE` path);
+- 6 more cycles that took `kern.lastpid` through the 99999 wraparound.
+
+**What did not cause it:** CRI-O's "Pid for infra container not found" errors. Node 1 logs them routinely during
+pod bursts (217 in one hour of run 8).
+
+**Instrumented for next time** (both nodes):
+- `debug.kdb.alt_break_to_debugger=1` (persisted in `sysctl.conf`), so `CR ~ ^B` on the serial console drops into
+  DDB for `ps`, `alltrace` and `show lockedvnods`;
+- a 15-second state line on the console (pids, jails, interfaces, free pages, sockets, files, mbufs), which survives
+  a network and disk wedge because QEMU writes `console.log` on the host.
+
+Not yet re-armed after reboots: the logger lives in `/tmp`.
 
 ## Run 8: 424/446, the one new failure was clock skew (2026-11-16)
 

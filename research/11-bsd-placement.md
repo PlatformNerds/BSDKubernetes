@@ -176,5 +176,7 @@ Still open (low):
   `spec.template.spec.{runtimeClassName,nodeSelector,affinity}`.
 - **Serving certs** come from a self-signed CA made by `deploy/install.sh` (10-year), with no rotation. Using
   cert-manager for them is possible now that it runs.
-- **Windows-style `spec.os.name: linux`** is not rewritten. Pods setting it still reach FreeBSD nodes, and the
-  kubelet admits it, as in research/10.
+- **Windows-style `spec.os.name: linux`** is handled since research/17. The kubelet used to reject such pods
+  (`PodOSNotSupported`); an earlier version of this note wrongly said it admitted them. The webhook now treats the
+  field as a Linux pin and sets the `linux` RuntimeClass. The kubelet admits the pod because that RuntimeClass
+  declares `bsdk8s.io/pod-os: linux`.

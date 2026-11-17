@@ -1,0 +1,225 @@
+From 875310bdad13471c7ccba35c3d03a370cdec32de Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 21:49:43 -0700
+Subject: [PATCH] kubelet: admit spec.os pods whose RuntimeClass runs that OS
+
+rejectPodAdmissionBasedOnOSField rejects every pod whose spec.os.name
+is not runtime.GOOS (its TODO anticipates relaxing this for LCOW). On a
+FreeBSD node with a Linux ABI runtime, a pod with spec.os.name=linux can
+run perfectly well through that runtime's RuntimeClass, but is rejected
+with PodOSNotSupported.
+
+Let a RuntimeClass declare the pod OS its handler runs, with the
+bsdk8s.io/pod-os annotation, and admit a pod whose spec.os.name differs
+from the node OS only when its RuntimeClass declares that OS. Pods
+without a RuntimeClass, or with one that declares nothing, are rejected
+exactly as before.
+---
+ pkg/kubelet/kubelet.go                        |  6 ++-
+ pkg/kubelet/lifecycle/predicate.go            | 49 +++++++++++++++----
+ pkg/kubelet/lifecycle/predicate_test.go       | 40 +++++++++++++--
+ .../runtimeclass/runtimeclass_manager.go      | 21 ++++++++
+ 4 files changed, 101 insertions(+), 15 deletions(-)
+
+diff --git a/pkg/kubelet/kubelet.go b/pkg/kubelet/kubelet.go
+index 5bf378bab58..b408616f7b0 100644
+--- a/pkg/kubelet/kubelet.go
++++ b/pkg/kubelet/kubelet.go
+@@ -1115,7 +1115,11 @@ func NewMainKubelet(ctx context.Context,
+ 	handlers = append(handlers, klet.containerManager.GetAllocateResourcesPodAdmitHandler())
+ 
+ 	criticalPodAdmissionHandler := preemption.NewCriticalPodAdmissionHandler(klet.getAllocatedPods, killPodNow(ctx, klet.podWorkers, kubeDeps.Recorder), kubeDeps.Recorder)
+-	handlers = append(handlers, lifecycle.NewPredicateAdmitHandler(klet.GetCachedNode, criticalPodAdmissionHandler, klet.containerManager.UpdatePluginResources))
++	var predicateOpts []lifecycle.PredicateAdmitOption
++	if klet.runtimeClassManager != nil {
++		predicateOpts = append(predicateOpts, lifecycle.WithRuntimeClassPodOS(klet.runtimeClassManager.LookupPodOS))
++	}
++	handlers = append(handlers, lifecycle.NewPredicateAdmitHandler(klet.GetCachedNode, criticalPodAdmissionHandler, klet.containerManager.UpdatePluginResources, predicateOpts...))
+ 	// apply functional Option's
+ 	for _, opt := range kubeDeps.Options {
+ 		opt(klet)
+diff --git a/pkg/kubelet/lifecycle/predicate.go b/pkg/kubelet/lifecycle/predicate.go
+index 0052a824efe..41532059541 100644
+--- a/pkg/kubelet/lifecycle/predicate.go
++++ b/pkg/kubelet/lifecycle/predicate.go
+@@ -102,18 +102,40 @@ type predicateAdmitHandler struct {
+ 	getNodeAnyWayFunc        getNodeAnyWayFuncType
+ 	pluginResourceUpdateFunc pluginResourceUpdateFuncType
+ 	admissionFailureHandler  AdmissionFailureHandler
++	runtimeClassPodOS        RuntimeClassPodOSFunc
+ }
+ 
+ var _ PodAdmitHandler = &predicateAdmitHandler{}
+ 
++// RuntimeClassPodOSFunc returns the pod OS that the named RuntimeClass runs,
++// or "" if the RuntimeClass does not declare one.
++type RuntimeClassPodOSFunc func(runtimeClassName *string) string
++
++// PredicateAdmitOption configures the handler returned by NewPredicateAdmitHandler.
++type PredicateAdmitOption func(*predicateAdmitHandler)
++
++// WithRuntimeClassPodOS admits a pod whose spec.os differs from the node OS
++// when the pod's RuntimeClass declares that it runs pods of that OS, for
++// example a Linux ABI runtime on a FreeBSD node.
++func WithRuntimeClassPodOS(f RuntimeClassPodOSFunc) PredicateAdmitOption {
++	return func(w *predicateAdmitHandler) {
++		w.runtimeClassPodOS = f
++	}
++}
++
+ // NewPredicateAdmitHandler returns a PodAdmitHandler which is used to evaluates
+ // if a pod can be admitted from the perspective of predicates.
+-func NewPredicateAdmitHandler(getNodeAnyWayFunc getNodeAnyWayFuncType, admissionFailureHandler AdmissionFailureHandler, pluginResourceUpdateFunc pluginResourceUpdateFuncType) PodAdmitHandler {
+-	return &predicateAdmitHandler{
+-		getNodeAnyWayFunc,
+-		pluginResourceUpdateFunc,
+-		admissionFailureHandler,
++func NewPredicateAdmitHandler(getNodeAnyWayFunc getNodeAnyWayFuncType, admissionFailureHandler AdmissionFailureHandler, pluginResourceUpdateFunc pluginResourceUpdateFuncType, opts ...PredicateAdmitOption) PodAdmitHandler {
++	w := &predicateAdmitHandler{
++		getNodeAnyWayFunc:        getNodeAnyWayFunc,
++		pluginResourceUpdateFunc: pluginResourceUpdateFunc,
++		admissionFailureHandler:  admissionFailureHandler,
++	}
++	for _, opt := range opts {
++		opt(w)
+ 	}
++
++	return w
+ }
+ 
+ func (w *predicateAdmitHandler) Admit(attrs *PodAdmitAttributes) PodAdmitResult {
+@@ -140,7 +162,7 @@ func (w *predicateAdmitHandler) Admit(attrs *PodAdmitAttributes) PodAdmitResult
+ 			Message: "Failed to admit pod as the `kubernetes.io/os` label doesn't match node label",
+ 		}
+ 	}
+-	if rejectPodAdmissionBasedOnOSField(admitPod) {
++	if rejectPodAdmissionBasedOnOSField(admitPod, w.runtimeClassPodOS) {
+ 		return PodAdmitResult{
+ 			Admit:   false,
+ 			Reason:  PodOSNotSupported,
+@@ -296,15 +318,22 @@ func rejectPodAdmissionBasedOnOSSelector(pod *v1.Pod, node *v1.Node) bool {
+ 	return false
+ }
+ 
+-// rejectPodAdmissionBasedOnOSField rejects pods if their OS field doesn't match runtime.GOOS.
++// rejectPodAdmissionBasedOnOSField rejects pods if their OS field doesn't match runtime.GOOS,
++// unless the pod's RuntimeClass declares that it runs pods of that OS (runtimeClassPodOS).
+ // TODO: Relax this restriction when we start supporting LCOW in kubernetes where podOS may not match
+ // node's OS.
+-func rejectPodAdmissionBasedOnOSField(pod *v1.Pod) bool {
++func rejectPodAdmissionBasedOnOSField(pod *v1.Pod, runtimeClassPodOS RuntimeClassPodOSFunc) bool {
+ 	if pod.Spec.OS == nil {
+ 		return false
+ 	}
+-	// If the pod OS doesn't match runtime.GOOS return false
+-	return string(pod.Spec.OS.Name) != runtime.GOOS
++	if string(pod.Spec.OS.Name) == runtime.GOOS {
++		return false
++	}
++	if runtimeClassPodOS != nil && pod.Spec.RuntimeClassName != nil &&
++		runtimeClassPodOS(pod.Spec.RuntimeClassName) == string(pod.Spec.OS.Name) {
++		return false
++	}
++	return true
+ }
+ 
+ // rejectPodAdmissionBasedOnSupplementalGroupsPolicy rejects pod only if
+diff --git a/pkg/kubelet/lifecycle/predicate_test.go b/pkg/kubelet/lifecycle/predicate_test.go
+index 8c8902ac71f..3f4f1e283aa 100644
+--- a/pkg/kubelet/lifecycle/predicate_test.go
++++ b/pkg/kubelet/lifecycle/predicate_test.go
+@@ -694,11 +694,43 @@ func TestRejectPodAdmissionBasedOnOSSelector(t *testing.T) {
+ }
+ 
+ func TestRejectPodAdmissionBasedOnOSField(t *testing.T) {
++	linuxABI := "linux-abi"
++	native := "native"
++	runtimeClassPodOS := func(name *string) string {
++		if name != nil && *name == linuxABI {
++			return "dummyOS"
++		}
++		return ""
++	}
+ 	tests := []struct {
+-		name            string
+-		pod             *v1.Pod
+-		expectRejection bool
++		name              string
++		pod               *v1.Pod
++		runtimeClassPodOS RuntimeClassPodOSFunc
++		expectRejection   bool
+ 	}{
++		{
++			name:              "OS field mismatch, RuntimeClass declares that OS",
++			pod:               &v1.Pod{Spec: v1.PodSpec{OS: &v1.PodOS{Name: "dummyOS"}, RuntimeClassName: &linuxABI}},
++			runtimeClassPodOS: runtimeClassPodOS,
++			expectRejection:   false,
++		},
++		{
++			name:              "OS field mismatch, RuntimeClass declares no OS",
++			pod:               &v1.Pod{Spec: v1.PodSpec{OS: &v1.PodOS{Name: "dummyOS"}, RuntimeClassName: &native}},
++			runtimeClassPodOS: runtimeClassPodOS,
++			expectRejection:   true,
++		},
++		{
++			name:              "OS field mismatch, no RuntimeClass",
++			pod:               &v1.Pod{Spec: v1.PodSpec{OS: &v1.PodOS{Name: "dummyOS"}}},
++			runtimeClassPodOS: runtimeClassPodOS,
++			expectRejection:   true,
++		},
++		{
++			name:            "OS field mismatch, RuntimeClass but no lookup",
++			pod:             &v1.Pod{Spec: v1.PodSpec{OS: &v1.PodOS{Name: "dummyOS"}, RuntimeClassName: &linuxABI}},
++			expectRejection: true,
++		},
+ 		{
+ 			name:            "OS field match",
+ 			pod:             &v1.Pod{Spec: v1.PodSpec{OS: &v1.PodOS{Name: v1.OSName(goruntime.GOOS)}}},
+@@ -717,7 +749,7 @@ func TestRejectPodAdmissionBasedOnOSField(t *testing.T) {
+ 	}
+ 	for _, test := range tests {
+ 		t.Run(test.name, func(t *testing.T) {
+-			actualResult := rejectPodAdmissionBasedOnOSField(test.pod)
++			actualResult := rejectPodAdmissionBasedOnOSField(test.pod, test.runtimeClassPodOS)
+ 			if test.expectRejection != actualResult {
+ 				t.Errorf("unexpected result, expected %v but got %v", test.expectRejection, actualResult)
+ 			}
+diff --git a/pkg/kubelet/runtimeclass/runtimeclass_manager.go b/pkg/kubelet/runtimeclass/runtimeclass_manager.go
+index 91e4814f1ae..3aa8c001851 100644
+--- a/pkg/kubelet/runtimeclass/runtimeclass_manager.go
++++ b/pkg/kubelet/runtimeclass/runtimeclass_manager.go
+@@ -25,6 +25,12 @@ import (
+ 	nodev1 "k8s.io/client-go/listers/node/v1"
+ )
+ 
++// PodOSAnnotation on a RuntimeClass names the pod OS (spec.os.name) its
++// handler runs when that differs from the node OS, e.g. "linux" for a Linux
++// ABI runtime on FreeBSD. The kubelet admits pods of that OS only with that
++// RuntimeClass.
++const PodOSAnnotation = "bsdk8s.io/pod-os"
++
+ // Manager caches RuntimeClass API objects, and provides accessors to the Kubelet.
+ type Manager struct {
+ 	informerFactory informers.SharedInformerFactory
+@@ -76,3 +82,18 @@ func (m *Manager) LookupRuntimeHandler(runtimeClassName *string) (string, error)
+ 
+ 	return rc.Handler, nil
+ }
++
++// LookupPodOS returns the pod OS declared by the RuntimeClass's
++// PodOSAnnotation, or "" if it has none or cannot be found.
++func (m *Manager) LookupPodOS(runtimeClassName *string) string {
++	if runtimeClassName == nil || *runtimeClassName == "" {
++		return ""
++	}
++
++	rc, err := m.lister.Get(*runtimeClassName)
++	if err != nil {
++		return ""
++	}
++
++	return rc.Annotations[PodOSAnnotation]
++}
+-- 
+2.54.0 (Apple Git-157)
+

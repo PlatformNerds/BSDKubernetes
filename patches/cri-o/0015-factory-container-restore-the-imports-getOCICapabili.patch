@@ -1,0 +1,31 @@
+From 1718af2e09029c7be747afab989e267aebc07ed1 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 22:16:03 -0700
+Subject: [PATCH 15/17] factory/container: restore the imports
+ getOCICapabilitiesList needs on Linux
+
+57973502a moved getOCICapabilitiesList from container.go into the
+platform files but left its fmt and capability imports behind, so the
+Linux build failed (undefined: capability, fmt).
+---
+ internal/factory/container/container_linux.go | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/internal/factory/container/container_linux.go b/internal/factory/container/container_linux.go
+index 610f0b7d9..0d1e6ee62 100644
+--- a/internal/factory/container/container_linux.go
++++ b/internal/factory/container/container_linux.go
+@@ -1,8 +1,10 @@
+ package container
+ 
+ import (
++	"fmt"
+ 	"strings"
+ 
++	"github.com/moby/sys/capability"
+ 	"github.com/opencontainers/selinux/go-selinux"
+ 
+ 	"github.com/cri-o/cri-o/utils"
+-- 
+2.54.0 (Apple Git-157)
+

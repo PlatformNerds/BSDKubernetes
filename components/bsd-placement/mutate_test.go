@@ -77,6 +77,29 @@ func TestPodNodeSelector(t *testing.T) {
 	}
 }
 
+func TestPodOSField(t *testing.T) {
+	o, why := mustMutate(t, "Pod", `{"metadata":{"name":"p"},"spec":{"os":{"name":"linux"},"containers":[{"name":"c"}]}}`, false)
+	if o == nil {
+		t.Fatal("expected mutation")
+	}
+	spec := o["spec"].(map[string]any)
+	if spec["runtimeClassName"] != "linux" {
+		t.Errorf("runtimeClassName = %v", spec["runtimeClassName"])
+	}
+	if os := spec["os"].(map[string]any); os["name"] != "linux" {
+		t.Errorf("spec.os must be kept, got %v", os)
+	}
+	if ns := spec["nodeSelector"].(map[string]any); ns["bsdk8s.io/linux-abi"] != "true" {
+		t.Errorf("nodeSelector = %v", ns)
+	}
+	if !strings.Contains(why, "spec.os.name=linux") {
+		t.Errorf("why = %q", why)
+	}
+	if o, _ := mustMutate(t, "Pod", `{"spec":{"os":{"name":"windows"},"containers":[]}}`, false); o != nil {
+		t.Errorf("windows pod must not be mutated: %v", o)
+	}
+}
+
 func TestPodUntouched(t *testing.T) {
 	for name, obj := range map[string]string{
 		"no pin":          `{"spec":{"containers":[]}}`,

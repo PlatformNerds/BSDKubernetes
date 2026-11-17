@@ -16,6 +16,10 @@
 //     webhooks and will not add it,
 //   - records what it did in the bsdk8s.io/placement annotation.
 //
+// A pod with spec.os.name=linux gets the same treatment (spec.os itself is
+// kept; the RuntimeClass must carry the bsdk8s.io/pod-os=linux annotation
+// so the kubelet admits it).
+//
 // Pods that already set runtimeClassName are never touched. A namespace can
 // opt every pod in (images with no OS pin at all) via the "force" webhook.
 package main
@@ -104,6 +108,12 @@ func mutate(cfg Config, kind string, obj []byte, m mode, decide decider) ([]patc
 			delete(nodeSelector, l)
 			reasons = append(reasons, "nodeSelector "+l+"=linux")
 		}
+	}
+	// spec.os.name=linux pins the pod to Linux just as firmly. It stays as
+	// is: the pod does need the Linux ABI, and the kubelet admits it on a
+	// FreeBSD node because the RuntimeClass declares bsdk8s.io/pod-os=linux.
+	if podOS := lookup(spec, "os"); podOS != nil && podOS["name"] == "linux" {
+		reasons = append(reasons, "spec.os.name=linux")
 	}
 	affinity, affinityChanged := rewriteAffinity(spec["affinity"], cfg.NodeOS)
 	if affinityChanged {

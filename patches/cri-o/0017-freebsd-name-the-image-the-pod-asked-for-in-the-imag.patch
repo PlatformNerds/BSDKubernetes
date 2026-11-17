@@ -1,0 +1,59 @@
+From 2804e3d13c7065b8336669d900fa3d6502548446 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 22:17:21 -0700
+Subject: [PATCH 17/17] freebsd: name the image the pod asked for in the image
+ OS error
+
+The kubelet passes the resolved image ID, so the error showed a bare
+digest. Use the image name from the pod spec.
+---
+ server/container_create.go | 7 ++++++-
+ server/image_os_freebsd.go | 6 +++---
+ 2 files changed, 9 insertions(+), 4 deletions(-)
+
+diff --git a/server/container_create.go b/server/container_create.go
+index 953d7c03c..28f26232e 100644
+--- a/server/container_create.go
++++ b/server/container_create.go
+@@ -1324,7 +1324,12 @@ func (s *Server) resolveAndVerifyContainerImage(ctx context.Context, ctr contain
+ 		return nil, err
+ 	}
+ 
+-	if err := s.checkImageOS(sb.RuntimeHandler(), userRequestedImage, imgResult); err != nil {
++	imageName := ctr.Config().GetImage().GetUserSpecifiedImage()
++	if imageName == "" {
++		imageName = userRequestedImage
++	}
++
++	if err := s.checkImageOS(sb.RuntimeHandler(), imageName, imgResult); err != nil {
+ 		return nil, err
+ 	}
+ 
+diff --git a/server/image_os_freebsd.go b/server/image_os_freebsd.go
+index cce466eb9..54ab7d02a 100644
+--- a/server/image_os_freebsd.go
++++ b/server/image_os_freebsd.go
+@@ -110,7 +110,7 @@ func imageOSFallbacks() []string { return []string{"linux"} }
+ // whether an image is present by name only, so when the local copy of a tag
+ // is a FreeBSD image, a pod of the Linux handler would otherwise silently run
+ // FreeBSD binaries (and the reverse).
+-func (s *Server) checkImageOS(handler, userRequestedImage string, img *storage.ImageResult) error {
++func (s *Server) checkImageOS(handler, imageName string, img *storage.ImageResult) error {
+ 	h, ok := s.config.Runtimes[handler]
+ 	if !ok || h == nil {
+ 		return nil
+@@ -122,9 +122,9 @@ func (s *Server) checkImageOS(handler, userRequestedImage string, img *storage.I
+ 	}
+ 
+ 	if img.OCIConfig.OS != want {
+-		return fmt.Errorf("image %q (%s) is a %s image, but runtime handler %q runs %s images; "+
++		return fmt.Errorf("image %q is a %s image, but runtime handler %q runs %s images; "+
+ 			"the local copy of this tag is for another OS, remove it or use a %s image",
+-			userRequestedImage, img.ID, img.OCIConfig.OS, handler, want, want)
++			imageName, img.OCIConfig.OS, handler, want, want)
+ 	}
+ 
+ 	return nil
+-- 
+2.54.0 (Apple Git-157)
+

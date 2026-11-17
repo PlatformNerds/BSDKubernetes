@@ -1,0 +1,69 @@
+From c733d4308980dfb465bf1a5dca0c56c5077c9a2c Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 00:09:47 -0700
+Subject: [PATCH 16/16] linux: report the copied length from getsockopt, fix
+ TCP_INFO size
+
+linux_sockopt_copyout() bounded the copy by the caller's buffer but
+still reported the full option length in optlen. Linux reports the
+number of bytes actually copied (min of the two); a caller that passes
+a smaller struct, e.g. an older struct tcp_info, was told more bytes
+were written than its buffer holds.
+
+linux_getsockopt_tcp_info() passed the length of the native struct
+tcp_info (256 bytes on arm64) when copying out the Linux struct
+l_tcp_info (280 bytes), so the Linux struct was truncated and optlen
+was 256 whatever the caller asked for.
+
+Pass sizeof(l_tinfo) and report min(len, optlen).
+
+Tested under the Linuxulator on arm64 with a static Linux Go binary:
+TCP_INFO with 104-, 232- and 512-byte buffers now reports 104, 232 and
+280 bytes and writes nothing past the reported length; SO_RCVBUF still
+reports 4.
+
+Fixes:	925ca9b8355d ("linux: Add TCP_INFO support")
+Fixes:	471fdd91d915 ("linux: Fix sockopt copyout")
+---
+ sys/compat/linux/linux_socket.c | 11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/sys/compat/linux/linux_socket.c b/sys/compat/linux/linux_socket.c
+index c194a6116..65f373b2d 100644
+--- a/sys/compat/linux/linux_socket.c
++++ b/sys/compat/linux/linux_socket.c
+@@ -2211,7 +2211,6 @@ linux_sockopt_copyout(struct thread *td, void *val, socklen_t len,
+ {
+ 	int error;
+ 	l_int loptlen;
+-	socklen_t optlen;
+ 
+ 	error = copyin(PTRIN(args->optlen), &loptlen, sizeof(loptlen));
+ 	if (error != 0)
+@@ -2219,8 +2218,12 @@ linux_sockopt_copyout(struct thread *td, void *val, socklen_t len,
+ 	if (loptlen < 0)
+ 		return (EINVAL);
+ 
+-	optlen = (socklen_t)loptlen;
+-	error = copyout(val, PTRIN(args->optval), min(len, optlen));
++	/*
++	 * Like Linux, copy out at most the caller's buffer size and report
++	 * the number of bytes actually copied.
++	 */
++	len = min(len, (socklen_t)loptlen);
++	error = copyout(val, PTRIN(args->optval), len);
+ 	if (error == 0) {
+ 		loptlen = (l_int)len;
+ 		error = copyout(&loptlen, PTRIN(args->optlen), sizeof(loptlen));
+@@ -2334,7 +2337,7 @@ linux_getsockopt_tcp_info(struct thread *td,
+ 	/* Eqivalent */
+ 	l_tinfo.tcpi_total_retrans = tinfo.tcpi_snd_rexmitpack;
+ 
+-	return (linux_sockopt_copyout(td, &l_tinfo, len, args));
++	return (linux_sockopt_copyout(td, &l_tinfo, sizeof(l_tinfo), args));
+ }
+ 
+ int
+-- 
+2.54.0 (Apple Git-157)
+

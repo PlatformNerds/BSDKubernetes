@@ -1,0 +1,53 @@
+From e50da459c0808ca6238963545d6565aeb034faed Mon Sep 17 00:00:00 2001
+From: Chuck Tuffli <chuck@FreeBSD.org>
+Date: Mon, 8 Jun 2026 14:19:34 -0700
+Subject: [PATCH 14/16] linux: Fix sockopt copyout
+
+The Linux getsockopt did not check the size of the provided buffer when
+copying out the value, leading to buffer overflows (e.g., for TCP_INFO).
+
+Fix is to use the smaller of the option value size and the provided
+buffer.
+
+MFC after:	1 month
+Relnotes:	yes
+Reviewed by:	kib, markj
+Differential Revision:	https://reviews.freebsd.org/D55881
+
+(cherry picked from commit 471fdd91d9156aeab026dc420fb97d97be872d65)
+---
+ sys/compat/linux/linux_socket.c | 17 ++++++++++++++---
+ 1 file changed, 14 insertions(+), 3 deletions(-)
+
+diff --git a/sys/compat/linux/linux_socket.c b/sys/compat/linux/linux_socket.c
+index ff44ad7dc..e09c2aa37 100644
+--- a/sys/compat/linux/linux_socket.c
++++ b/sys/compat/linux/linux_socket.c
+@@ -2212,10 +2212,21 @@ linux_sockopt_copyout(struct thread *td, void *val, socklen_t len,
+     struct linux_getsockopt_args *args)
+ {
+ 	int error;
++	l_int loptlen;
++	socklen_t optlen;
+ 
+-	error = copyout(val, PTRIN(args->optval), len);
+-	if (error == 0)
+-		error = copyout(&len, PTRIN(args->optlen), sizeof(len));
++	error = copyin(PTRIN(args->optlen), &loptlen, sizeof(loptlen));
++	if (error != 0)
++		return (error);
++	if (loptlen < 0)
++		return (EINVAL);
++
++	optlen = (socklen_t)loptlen;
++	error = copyout(val, PTRIN(args->optval), min(len, optlen));
++	if (error == 0) {
++		loptlen = (l_int)len;
++		error = copyout(&loptlen, PTRIN(args->optlen), sizeof(loptlen));
++	}
+ 	return (error);
+ }
+ 
+-- 
+2.54.0 (Apple Git-157)
+

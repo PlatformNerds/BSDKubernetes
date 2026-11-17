@@ -59,11 +59,31 @@ needs it without a switch.
 |---|---|
 | `unsupported prctl option 1398164801` | `PR_SET_VMA` (names anonymous mappings): cosmetic |
 | `unsupported fcntl cmd 36` | `F_OFD_GETLK` probe in etcd's fileutil (research/10) |
-| `unsupported TCP socket option TCP_INFO (11)` | Linux `tcp_info` stats (getsockopt) |
-| `unsupported setsockopt level 6 optname 18` | `TCP_USER_TIMEOUT` (gRPC keepalive); FreeBSD has no direct equivalent |
+| ~~`unsupported TCP socket option TCP_INFO (11)`~~ | Linux `tcp_info` stats (getsockopt). **Fixed**, see below |
+| ~~`unsupported setsockopt level 6 optname 18`~~ | `TCP_USER_TIMEOUT` (gRPC keepalive). **Fixed**, see below |
 
 `TCP_USER_TIMEOUT` is the only one with a behaviour effect: gRPC's keepalive timeout can't abort a connection
 whose peer has silently vanished. That takes longer to detect, but nothing fails.
+
+**Fixed 2026-11-17 (kernel `bsdk8s11`, both nodes).** FreeBSD main already had both options; 15.1 did not.
+- Backported from main: `TCP_USER_TIMEOUT` mapped to `TCP_MAXUNACKTIME` (milliseconds rounded up to seconds;
+  enforced by the default `freebsd` TCP stack), the sockopt copyout fix, and `TCP_INFO` translated to the Linux
+  `struct tcp_info` (freebsd-src/0013-0015, branch `bsdk8s/linux-tcp-sockopts-15.1`).
+- Found while testing the backport, and present in main too: `TCP_INFO` copied out the Linux struct (280 bytes)
+  with the native struct's length (256), and every Linux getsockopt reported the full option length instead of
+  the bytes copied. Fixed in freebsd-src/0016 (main-based branch `bsdk8s/linux-sockopt-copyout-len`).
+
+Measured with a static Linux Go client in a pod writing to a server pod whose `eth0` is then taken down
+(`ifconfig -j <jid> eth0 down`):
+
+| | Old kernel | `bsdk8s11` |
+|---|---|---|
+| `setsockopt(TCP_USER_TIMEOUT, 3000)` | `ENOPROTOOPT` | ok, reads back 3000 |
+| Connection after the peer vanishes, timeout 3 s | writes block (no abort within 40 s) | aborted ~3.5 s after the cut |
+| `TCP_INFO`, 104/232/512-byte buffer | `EINVAL` | length 104/232/280, nothing written past it |
+
+The abort surfaces as `EPIPE` on the next write, where Linux returns `ETIMEDOUT`: FreeBSD's send path checks
+"can't send more" before the pending socket error. Callers (gRPC included) treat both as a dead connection.
 
 ## Not tested yet
 

@@ -1,0 +1,149 @@
+From 941f9d6cdbc75bfdf822d16002724c465c644284 Mon Sep 17 00:00:00 2001
+From: Maxim Sobolev <sobomax@FreeBSD.org>
+Date: Wed, 1 Apr 2026 14:42:50 -0700
+Subject: [PATCH 13/16] compat/linux: map TCP_USER_TIMEOUT sockopt into
+ TCP_MAXUNACKTIME
+
+After reading both manual pages, our TCP_MAXUNACKTIME is fairly
+similar to the TCP_USER_TIMEOUT, the only considerable difference
+is ours is in seconds and linux's in milliseconds.
+
+Round up linux's in setsockopt(2) to a next whole second and
+clamp ours getter to UINT_MAX ms.
+
+Reviewed by:	tuexen, glebius
+Differential Revision: https://reviews.freebsd.org/D56168
+MFC after:	2 weeks
+Sponsored by:	Sippy Software, Inc.
+
+(cherry picked from commit 5d4a39d8ed775d607e0702f317f687491ac0a23d)
+---
+ sys/compat/linux/linux_socket.c | 61 +++++++++++++++++++++++++++++++++
+ sys/compat/linux/linux_socket.h |  1 +
+ 2 files changed, 62 insertions(+)
+
+diff --git a/sys/compat/linux/linux_socket.c b/sys/compat/linux/linux_socket.c
+index 0e07b0a60..ff44ad7dc 100644
+--- a/sys/compat/linux/linux_socket.c
++++ b/sys/compat/linux/linux_socket.c
+@@ -594,10 +594,34 @@ linux_to_bsd_tcp_sockopt(int opt)
+ 		return (-2);
+ 	case LINUX_TCP_MD5SIG:
+ 		return (TCP_MD5SIG);
++	case LINUX_TCP_USER_TIMEOUT:
++		return (TCP_MAXUNACKTIME);
+ 	}
+ 	return (-1);
+ }
+ 
++static u_int
++linux_to_bsd_tcp_user_timeout(l_uint linux_timeout)
++{
++
++	/*
++	 * Linux exposes TCP_USER_TIMEOUT in milliseconds while
++	 * TCP_MAXUNACKTIME uses whole seconds. Round up partial
++	 * seconds so a non-zero Linux timeout never becomes zero.
++	 */
++	return (howmany(linux_timeout, 1000U));
++}
++
++static l_uint
++bsd_to_linux_tcp_user_timeout(u_int bsd_timeout)
++{
++
++	if (bsd_timeout > UINT_MAX / 1000U)
++		return (UINT_MAX);
++
++	return (bsd_timeout * 1000U);
++}
++
+ static int
+ linux_to_bsd_msg_flags(int flags)
+ {
+@@ -2057,8 +2081,10 @@ linux_setsockopt(struct thread *td, struct linux_setsockopt_args *args)
+ 	struct proc *p = td->td_proc;
+ 	struct linux_pemuldata *pem;
+ 	l_timeval linux_tv;
++	l_uint linux_timeout;
+ 	struct sockaddr *sa;
+ 	struct timeval tv;
++	u_int bsd_timeout;
+ 	socklen_t len;
+ 	int error, level, name, val;
+ 
+@@ -2130,6 +2156,24 @@ linux_setsockopt(struct thread *td, struct linux_setsockopt_args *args)
+ 		break;
+ 	case IPPROTO_TCP:
+ 		name = linux_to_bsd_tcp_sockopt(args->optname);
++		switch (name) {
++		case TCP_MAXUNACKTIME:
++			if (args->optlen < sizeof(linux_timeout))
++				return (EINVAL);
++
++			error = copyin(PTRIN(args->optval), &linux_timeout,
++			    sizeof(linux_timeout));
++			if (error != 0)
++				return (error);
++
++			bsd_timeout = linux_to_bsd_tcp_user_timeout(
++			    linux_timeout);
++			return (kern_setsockopt(td, args->s, level, name,
++			    &bsd_timeout, UIO_SYSSPACE,
++			    sizeof(bsd_timeout)));
++		default:
++			break;
++		}
+ 		break;
+ 	case SOL_NETLINK:
+ 		name = args->optname;
+@@ -2251,10 +2295,12 @@ linux_getsockopt_so_linger(struct thread *td,
+ int
+ linux_getsockopt(struct thread *td, struct linux_getsockopt_args *args)
+ {
++	l_uint linux_timeout;
+ 	l_timeval linux_tv;
+ 	struct timeval tv;
+ 	socklen_t tv_len, xulen, len;
+ 	struct sockaddr *sa;
++	u_int bsd_timeout;
+ 	struct xucred xu;
+ 	struct l_ucred lxu;
+ 	int error, level, name, newval;
+@@ -2345,6 +2391,21 @@ linux_getsockopt(struct thread *td, struct linux_getsockopt_args *args)
+ 		break;
+ 	case IPPROTO_TCP:
+ 		name = linux_to_bsd_tcp_sockopt(args->optname);
++		switch (name) {
++		case TCP_MAXUNACKTIME:
++			len = sizeof(bsd_timeout);
++			error = kern_getsockopt(td, args->s, level, name,
++			    &bsd_timeout, UIO_SYSSPACE, &len);
++			if (error != 0)
++				return (error);
++
++			linux_timeout = bsd_to_linux_tcp_user_timeout(
++			    bsd_timeout);
++			return (linux_sockopt_copyout(td, &linux_timeout,
++			    sizeof(linux_timeout), args));
++		default:
++			break;
++		}
+ 		break;
+ 	default:
+ 		name = -1;
+diff --git a/sys/compat/linux/linux_socket.h b/sys/compat/linux/linux_socket.h
+index 68176c3cc..f2a96b3e7 100644
+--- a/sys/compat/linux/linux_socket.h
++++ b/sys/compat/linux/linux_socket.h
+@@ -322,6 +322,7 @@ int linux_accept(struct thread *td, struct linux_accept_args *args);
+ #define	LINUX_TCP_KEEPCNT	6
+ #define	LINUX_TCP_INFO		11
+ #define	LINUX_TCP_MD5SIG	14
++#define	LINUX_TCP_USER_TIMEOUT	18
+ 
+ struct l_ifmap {
+ 	l_ulong		mem_start;
+-- 
+2.54.0 (Apple Git-157)
+

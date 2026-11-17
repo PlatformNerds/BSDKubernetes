@@ -1,0 +1,132 @@
+From c49dd0035b4437a62e074cf2a5eb7cf35f50d694 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 21:32:30 -0700
+Subject: [PATCH 14/14] server: do not wait for exit files when restoring after
+ a reboot
+
+88e8f422b made UpdateContainerStatus wait (exponential backoff, about
+five seconds) for a container's exit file when the runtime's state
+command fails, to avoid reporting exit code 255 for a container whose
+monitor has not written the file yet. During startup after a node
+reboot that is true of every container: no monitor survived, so no exit
+file will ever appear, and CRI-O spends ~5s per container before it
+serves the CRI socket. A node that rebooted with 100 dead containers
+kept the kubelet out for over four minutes.
+
+Detect the reboot the way wipe already does (missing or stale
+VersionFile) before restoring, and restore under a context that skips
+the wait. Containers that are still running are unaffected (their
+state command succeeds), and a container that exited while CRI-O was
+down already has its exit file.
+---
+ internal/oci/exit_file_wait.go               | 23 ++++++++++++++++++
+ internal/oci/exit_file_wait_internal_test.go | 25 ++++++++++++++++++++
+ internal/oci/runtime_oci.go                  |  6 ++++-
+ server/server.go                             | 12 +++++++++-
+ 4 files changed, 64 insertions(+), 2 deletions(-)
+ create mode 100644 internal/oci/exit_file_wait.go
+ create mode 100644 internal/oci/exit_file_wait_internal_test.go
+
+diff --git a/internal/oci/exit_file_wait.go b/internal/oci/exit_file_wait.go
+new file mode 100644
+index 000000000..902a94a78
+--- /dev/null
++++ b/internal/oci/exit_file_wait.go
+@@ -0,0 +1,23 @@
++package oci
++
++import "context"
++
++type skipExitFileWaitKey struct{}
++
++// WithoutExitFileWait returns a context under which UpdateContainerStatus
++// does not wait for the exit file of a container the runtime no longer
++// knows about.
++//
++// The wait exists for a container that is exiting right now: its monitor may
++// not have written the exit file yet. After a node reboot nothing survived to
++// write one, so waiting only delays startup by the full backoff (about five
++// seconds) per container, before the kubelet can connect.
++func WithoutExitFileWait(ctx context.Context) context.Context {
++	return context.WithValue(ctx, skipExitFileWaitKey{}, true)
++}
++
++func exitFileWaitSkipped(ctx context.Context) bool {
++	skip, ok := ctx.Value(skipExitFileWaitKey{}).(bool)
++
++	return ok && skip
++}
+diff --git a/internal/oci/exit_file_wait_internal_test.go b/internal/oci/exit_file_wait_internal_test.go
+new file mode 100644
+index 000000000..a2b988cd7
+--- /dev/null
++++ b/internal/oci/exit_file_wait_internal_test.go
+@@ -0,0 +1,25 @@
++package oci
++
++import (
++	"context"
++	"testing"
++)
++
++func TestExitFileWaitSkipped(t *testing.T) {
++	t.Parallel()
++
++	if exitFileWaitSkipped(context.Background()) {
++		t.Fatal("plain context must not skip the exit file wait")
++	}
++
++	if !exitFileWaitSkipped(WithoutExitFileWait(context.Background())) {
++		t.Fatal("WithoutExitFileWait context must skip the exit file wait")
++	}
++
++	type otherKey struct{}
++
++	derived := context.WithValue(WithoutExitFileWait(context.Background()), otherKey{}, 1)
++	if !exitFileWaitSkipped(derived) {
++		t.Fatal("derived context must keep skipping the exit file wait")
++	}
++}
+diff --git a/internal/oci/runtime_oci.go b/internal/oci/runtime_oci.go
+index 77fd4a901..b5d15d661 100644
+--- a/internal/oci/runtime_oci.go
++++ b/internal/oci/runtime_oci.go
+@@ -1196,7 +1196,11 @@ func (r *runtimeOCI) UpdateContainerStatus(ctx context.Context, c *Container) er
+ 			// Wait for it to appear before defaulting to exit code 255.
+ 			// This prevents a race where fast-exiting containers
+ 			// get a spurious exit code 255.
+-			waitErr := waitForExitFile(c)
++			var waitErr error
++			if !exitFileWaitSkipped(ctx) {
++				waitErr = waitForExitFile(c)
++			}
++
+ 			if waitErr != nil {
+ 				log.Errorf(ctx, "Failed to update container status from exit file for %s: %v", c.ID(), waitErr)
+ 				c.state.Finished = time.Now()
+diff --git a/server/server.go b/server/server.go
+index 607e5ea83..954ce7e7c 100644
+--- a/server/server.go
++++ b/server/server.go
+@@ -502,7 +502,17 @@ func New(
+ 		return nil, fmt.Errorf("close stdin: %w", err)
+ 	}
+ 
+-	deletedImages := s.restore(ctx)
++	restoreCtx := ctx
++	// A missing or stale version file means the node rebooted (it lives on
++	// a filesystem that does not survive one), so no container monitor is
++	// left to write exit files. Do not wait for them while restoring.
++	if rebooted, _ := version.ShouldCrioWipe(config.VersionFile); rebooted {
++		log.Infof(ctx, "Node reboot detected via %s: not waiting for exit files while restoring", config.VersionFile)
++
++		restoreCtx = oci.WithoutExitFileWait(ctx)
++	}
++
++	deletedImages := s.restore(restoreCtx)
+ 	s.wipeIfAppropriate(ctx, deletedImages)
+ 
+ 	var bindAddressStr string
+-- 
+2.54.0 (Apple Git-157)
+

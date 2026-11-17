@@ -82,7 +82,26 @@ What happened:
 - **Kernel output:** no panic and no `maxproc` message, so the cause isn't visible in the logs.
 
 **Recovery:** a QEMU `system_reset`. Then CRI-O restore spent about 4 minutes timing out on each stale container's
-exit file before the kubelet could connect. That slow restore is itself worth fixing.
+exit file before the kubelet could connect.
+
+**Fixed: slow recovery after a reboot.** Same test each time: hard reset of node 2 with 14 live containers, timed
+until the node is Ready.
+
+| CRI-O build | Reset to Ready | Exit-file timeouts |
+|---|---|---|
+| `9ec045350` (before) | about 2 min | 25 |
+| `c49dd0035` (after) | 26 s | 0 |
+
+The two causes and their fixes (`patches/cri-o/0013`–`0014`):
+- **Upstream CRI-O `88e8f422b` (March 2026), not FreeBSD-specific.** It waits about 5 s with backoff for a container's
+  exit file whenever the runtime's `state` command fails. After a reboot that is every container, and no exit file
+  will ever appear. CRI-O now detects the reboot the same way `crio wipe` does (the version file is gone) and skips
+  that wait during restore.
+- **FreeBSD:** `/var/run` lives on the root filesystem. `cleanvar` removes only plain files, so per-container
+  directories and links built up: 140 entries in `/var/run/crio` on a node with 14 containers. The CRI-O rc.d script
+  now mounts `/var/run/containers/storage`, `/var/run/crio` and `/var/run/ocijail` as tmpfs, so a reboot empties
+  them the way `/run` is emptied on Linux. It only does this at boot or on an empty directory, so a live node never
+  hides its running containers' state.
 
 **What did not reproduce it:**
 - 16 cycles of 100 nginx pods created and deleted at once on node 2;

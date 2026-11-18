@@ -67,9 +67,9 @@ reading. On Linux that open also reads from the pipe; don't do it.
 
 ## Remaining differences (honest)
 
-- **Envoy's own HTTP preStop** (`/shutdown/ready` on the shutdown-manager) still logs `EOF`, because the
-  shutdown-manager exits as soon as the drain completes. The drain itself ran. I haven't compared this against
-  Linux.
+- **Envoy's own HTTP preStop** (`/shutdown/ready` on the shutdown-manager) logs `FailedPreStopHook ... EOF`. This
+  is an Envoy Gateway v1.10.0 bug that Linux has too, not a FreeBSD difference (research/14, "preStop EOF"). An
+  earlier note here blamed the shutdown-manager exiting early; that was wrong.
 - **Zero-downtime deletes need two replicas.** With one Envoy replica, requests failed from about 3 s after the delete
   (the draining Envoy fails its readiness probe) until the new pod became Ready at 10 s (its probes run every 5 s and
   10 s). That's upstream behavior: before this fix there was no gap only because Envoy was never drained. Envoy

@@ -105,6 +105,16 @@ failing readiness and the new one passing it. The demo EnvoyProxy now sets
 `provider.kubernetes.envoyDeployment.replicas: 2` (one per node). Deleting an Envoy pod then took 13 s, and
 **160/160** requests through both node IPs returned 200.
 
+**preStop EOF (upstream bug, not FreeBSD).** Every Envoy pod deletion still records `FailedPreStopHook` on the
+`envoy` container; the kubelet logs `Get "http://<pod>:19002/shutdown/ready": EOF`. The shutdown-manager's HTTP
+server sets `WriteTimeout: 10s`, and `/shutdown/ready` can't answer before the 10 s minimum drain period has passed
+and its 1 s poll has seen the ready file: 11.06 s in our trace (request 03:53:01.059, "shutdown readiness detected"
+03:53:12.120, kubelet EOF at the same millisecond). Go's write deadline has expired, so the 200 is never written
+and the connection closes. The drain itself completed ("drain sequence completed" at 03:53:11.246). The bug is
+platform-independent and is fixed upstream by envoyproxy/gateway#10563 (issue #10562, merged 2026-11-09, after
+v1.10.0): the handler extends its own write deadline. Nothing to change on FreeBSD; it goes away with the next
+Envoy Gateway release.
+
 ## Linuxulator noise (non-fatal)
 
 | Message | Meaning |

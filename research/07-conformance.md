@@ -18,6 +18,9 @@ Raw results: [`conformance/`](../conformance/) (gzipped JUnit + failure lists).*
 | run 7 (2 nodes, regression check) | 425 / 446 | 95.3% | 394 / 400 = 98.5% | 52m |
 | run 8 (2 nodes, Mac slept mid-run) | 424 / 446 | 95.1% | | |
 | run 9 (2 nodes, node 2 froze mid-run) | 420 / 446 | 94.2% | | 1h50m |
+| run 10 (2 nodes, regression check) | 425 / 446 | 95.3% | 394 / 400 = 98.5% | 58m |
+| run 11 (2 nodes, node 2 froze, 1h suite timeout) | 414 / 426 run | | | 1h |
+| **run 12 (2 nodes)** | **435 / 446** | **97.5%** | **394 / 400 = 98.5%** | 56m |
 
 Run 2 fixed 34 tests and regressed none. Run 3 (after the kube-proxy session-affinity fix and ocijail file mounts below devfs) fixed 8 more, again with no regressions. The only remaining non-`[LinuxOnly]` failures are in-place pod resize (6) and the two-node requirement (2).
 
@@ -39,12 +42,39 @@ runs. The equivalent number for FreeBSD is the second column. Both are shown so 
    - Fidelity matters. busybox `nc` rejects `nc -v -t -w 2`, which broke 11 Service tests. Use FreeBSD's
      OpenBSD-derived `/usr/bin/nc`, as upstream uses `netcat-openbsd`.
    - Absolute symlinks in the image resolve against the *build host* with `test -e`; use `-L`.
-2. **`agnhost mounttest` reports `f_fstypename` on FreeBSD** (FreeBSD's `f_type` numbers are assigned at boot).
-   `PlatformNerds/kubernetes` `605db4768ec`.
+2. **`agnhost mounttest` reports filesystem type names on FreeBSD** (FreeBSD's `f_type` numbers are assigned at
+   boot). `PlatformNerds/kubernetes` `605db4768ec` used `f_fstypename`; since `dbbe0e5db7d` it names `f_type` through
+   `vfs.conflist`, so a nullfs-mounted tmpfs volume reads `tmpfs` as on Linux (research/20).
 3. **`--enable-aggregator-routing=true` on kube-apiserver.** The apiserver runs in a host-network jail, and pf on 15.x
    does not redirect host-originated traffic to Service ClusterIPs. So every admission webhook, CRD conversion webhook
    and aggregated API call timed out (21 tests in run 1; the apiserver log had 256× `context deadline exceeded`).
    This resolves those Services to endpoints instead. It's in the demo's kubeadm config.
+
+## Runs 10 to 12: 435/446, and the node freezes explained (2026-11-18)
+
+**Run 10** (kube-proxy traffic policies, `loadBalancerSourceRanges` and reject-without-endpoints from research/19,
+kernel `bsdk8s16`): 425/446, with the same 21 failures as run 7. No regressions.
+
+Ten of those 21 were then fixed (research/20). None was a Linux-only test detail:
+- **7 EmptyDir tmpfs:** the mounttest image now reports the filesystem behind nullfs.
+- **2 fsGroup secrets:** the kubelet never applied `fsGroup` to any volume on FreeBSD.
+- **HostPort:** host ports did nothing at all; CRI-O never passed them to the CNI portmap plugin.
+
+**Run 11** was cut short: node 2 froze again 25 minutes in, and the run hit ginkgo's default 1-hour suite timeout
+with 20 Serial tests unrun. This time the hung node was debugged live through QEMU's gdb stub. The cause was a lost
+wakeup in FreeBSD's rmlock, hit when pf's interface handlers write-lock pf's rules inside the network epoch while
+pod churn creates and destroys epairs (research/21, freebsd-src 0032). Run 6's node 1 hang ("logs stop mid
+pod-network setup", no panic) and run 9's freeze fit the same pattern.
+
+**Run 12** (`kernel.bsdk8s18` with the rmlock fix; `--timeout=3h`): **435/446 (97.5%)**. No freeze.
+- **The 6 non-`[LinuxOnly]` failures are in-place resize.** Resize works (research/06), but the tests verify it with
+  `mount -t cgroup2`, Linux cgroup files and `/proc/1/oom_score_adj` inside the container.
+- **The 5 `[LinuxOnly]` failures:**
+  - sample-apiserver (Linux image);
+  - sysctls (Linux `kernel.*` names);
+  - the privileged dummy-device test (Linux netlink);
+  - read-only rootfs (error wording);
+  - ImageVolume (not implemented in CRI-O on FreeBSD).
 
 ## Run 9: 420/446, no regressions, but node 2 froze once (2026-11-17)
 

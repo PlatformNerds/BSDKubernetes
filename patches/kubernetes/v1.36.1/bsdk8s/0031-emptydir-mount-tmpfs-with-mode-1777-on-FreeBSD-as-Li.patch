@@ -1,0 +1,68 @@
+From 826259c9a7a7da2bdf7aadfdd2f8847772b2e8f1 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 09:11:42 -0700
+Subject: [PATCH 31/31] emptydir: mount tmpfs with mode 1777 on FreeBSD, as
+ Linux's default
+
+A Linux tmpfs root defaults to mode 1777; FreeBSD's takes the mode of
+the mount point (0777 here). The kubelet creates a missing subPath
+directory with the volume root's mode, so on FreeBSD it lacked the
+sticky bit Linux gives it (e2e: "nonexistent volume subPath should
+have the correct mode and owner using FSGroup"). Pass mode=1777.
+---
+ pkg/volume/emptydir/empty_dir.go             | 2 +-
+ pkg/volume/emptydir/empty_dir_freebsd.go     | 6 ++++++
+ pkg/volume/emptydir/empty_dir_linux.go       | 3 +++
+ pkg/volume/emptydir/empty_dir_unsupported.go | 3 +++
+ 4 files changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/pkg/volume/emptydir/empty_dir.go b/pkg/volume/emptydir/empty_dir.go
+index 622704495d7..6a94e79e8c6 100644
+--- a/pkg/volume/emptydir/empty_dir.go
++++ b/pkg/volume/emptydir/empty_dir.go
+@@ -581,5 +581,5 @@ func (ed *emptyDir) generateTmpfsMountOptions(noswapSupported bool) (options []s
+ 		options = append(options, swap.TmpfsNoswapOption)
+ 	}
+ 
+-	return options
++	return append(options, platformTmpfsMountOptions...)
+ }
+diff --git a/pkg/volume/emptydir/empty_dir_freebsd.go b/pkg/volume/emptydir/empty_dir_freebsd.go
+index ff457d42df9..82c73b9db95 100644
+--- a/pkg/volume/emptydir/empty_dir_freebsd.go
++++ b/pkg/volume/emptydir/empty_dir_freebsd.go
+@@ -55,3 +55,9 @@ func (m *realMountDetector) GetMountMedium(path string, requestedMedium v1.Stora
+ 	}
+ 	return v1.StorageMediumDefault, !notMnt, nil, nil
+ }
++
++// platformTmpfsMountOptions are added to the tmpfs mount options. FreeBSD's
++// tmpfs root takes the mode of the mount point, Linux's defaults to 1777:
++// ask for Linux's, which directories made from the volume's mode (subPath)
++// inherit.
++var platformTmpfsMountOptions = []string{"mode=1777"}
+diff --git a/pkg/volume/emptydir/empty_dir_linux.go b/pkg/volume/emptydir/empty_dir_linux.go
+index 179b117e044..236b4999fce 100644
+--- a/pkg/volume/emptydir/empty_dir_linux.go
++++ b/pkg/volume/emptydir/empty_dir_linux.go
+@@ -107,3 +107,6 @@ func (m *realMountDetector) GetMountMedium(path string, requestedMedium v1.Stora
+ 	}
+ 	return v1.StorageMediumDefault, !notMnt, nil, nil
+ }
++
++// platformTmpfsMountOptions are added to the tmpfs mount options.
++var platformTmpfsMountOptions []string
+diff --git a/pkg/volume/emptydir/empty_dir_unsupported.go b/pkg/volume/emptydir/empty_dir_unsupported.go
+index 6088d5d2678..34820e23f5b 100644
+--- a/pkg/volume/emptydir/empty_dir_unsupported.go
++++ b/pkg/volume/emptydir/empty_dir_unsupported.go
+@@ -33,3 +33,6 @@ type realMountDetector struct {
+ func (m *realMountDetector) GetMountMedium(path string, requestedMedium v1.StorageMedium) (v1.StorageMedium, bool, *resource.Quantity, error) {
+ 	return v1.StorageMediumDefault, false, nil, nil
+ }
++
++// platformTmpfsMountOptions are added to the tmpfs mount options.
++var platformTmpfsMountOptions []string
+-- 
+2.54.0 (Apple Git-157)
+

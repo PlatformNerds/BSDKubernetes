@@ -1,0 +1,100 @@
+From 622ec974dbd61d5201f10c7dcb3b9bb1e95d5cbe Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 09:05:40 -0700
+Subject: [PATCH] linux: report the filesystem behind nullfs and linprocfs in
+ statfs
+
+Linux's statfs(2) on a bind mount reports the filesystem behind it;
+FreeBSD's equivalent, nullfs, was reported as type 0, so a Linux
+program could not tell that a tmpfs (or ZFS) directory mounted into its
+jail was one: e.g. a Kubernetes emptyDir with medium Memory, which is a
+tmpfs nullfs-mounted into the container. nullfs passes the lower
+filesystem's type number through in f_type; map that to its name and
+translate the name as before.
+
+Also report linprocfs, the /proc of Linux programs, as PROC_SUPER_MAGIC
+like procfs.
+---
+ sys/compat/linux/linux_stats.c | 29 ++++++++++++++++++++++++++---
+ 1 file changed, 26 insertions(+), 3 deletions(-)
+
+diff --git a/sys/compat/linux/linux_stats.c b/sys/compat/linux/linux_stats.c
+index 6f96a2190..34b1eb629 100644
+--- a/sys/compat/linux/linux_stats.c
++++ b/sys/compat/linux/linux_stats.c
+@@ -36,7 +36,9 @@
+ #include <sys/mutex.h>
+ #include <sys/namei.h>
+ #include <sys/proc.h>
++#include <sys/mount.h>
+ #include <sys/stat.h>
++#include <sys/sx.h>
+ #include <sys/syscallsubr.h>
+ #include <sys/tty.h>
+ #include <sys/vnode.h>
+@@ -298,8 +300,10 @@ struct l_statfs {
+ #define	LINUX_SYSFS_MAGIC	0x62656572
+ 
+ static long
+-bsd_to_linux_ftype(const char *fstypename)
++bsd_to_linux_ftype(const struct statfs *sf)
+ {
++	char fstypename[MFSNAMELEN];
++	struct vfsconf *vfsp;
+ 	int i;
+ 	static struct {const char *bsd_name; long linux_type;} b2l_tbl[] = {
+ 		{"ufs",      LINUX_UFS_SUPER_MAGIC},
+@@ -308,6 +312,7 @@ bsd_to_linux_ftype(const char *fstypename)
+ 		{"nfs",      LINUX_NFS_SUPER_MAGIC},
+ 		{"ext2fs",   LINUX_EXT2_SUPER_MAGIC},
+ 		{"procfs",   LINUX_PROC_SUPER_MAGIC},
++		{"linprocfs", LINUX_PROC_SUPER_MAGIC},
+ 		{"msdosfs",  LINUX_MSDOS_SUPER_MAGIC},
+ 		{"ntfs",     LINUX_NTFS_SUPER_MAGIC},
+ 		{"nwfs",     LINUX_NCP_SUPER_MAGIC},
+@@ -318,6 +323,24 @@ bsd_to_linux_ftype(const char *fstypename)
+ 		{"linsysfs", LINUX_SYSFS_MAGIC},
+ 		{NULL,       0L}};
+ 
++	strlcpy(fstypename, sf->f_fstypename, sizeof(fstypename));
++	/*
++	 * nullfs is FreeBSD's bind mount. Linux reports the filesystem
++	 * behind a bind mount, so report the one below nullfs: nullfs passes
++	 * its type number through.
++	 */
++	if (strcmp(fstypename, "nullfs") == 0) {
++		vfsconf_slock();
++		TAILQ_FOREACH(vfsp, &vfsconf, vfc_list) {
++			if (vfsp->vfc_typenum == sf->f_type) {
++				strlcpy(fstypename, vfsp->vfc_name,
++				    sizeof(fstypename));
++				break;
++			}
++		}
++		vfsconf_sunlock();
++	}
++
+ 	for (i = 0; b2l_tbl[i].bsd_name != NULL; i++)
+ 		if (strcmp(b2l_tbl[i].bsd_name, fstypename) == 0)
+ 			return (b2l_tbl[i].linux_type);
+@@ -353,7 +376,7 @@ bsd_to_linux_statfs(struct statfs *bsd_statfs, struct l_statfs *linux_statfs)
+ #if defined(__i386__) || (defined(__amd64__) && defined(COMPAT_LINUX32))
+ 	statfs_scale_blocks(bsd_statfs, INT32_MAX);
+ #endif
+-	linux_statfs->f_type = bsd_to_linux_ftype(bsd_statfs->f_fstypename);
++	linux_statfs->f_type = bsd_to_linux_ftype(bsd_statfs);
+ 	linux_statfs->f_bsize = bsd_statfs->f_bsize;
+ 	linux_statfs->f_blocks = bsd_statfs->f_blocks;
+ 	linux_statfs->f_bfree = bsd_statfs->f_bfree;
+@@ -397,7 +420,7 @@ static void
+ bsd_to_linux_statfs64(struct statfs *bsd_statfs, struct l_statfs64 *linux_statfs)
+ {
+ 
+-	linux_statfs->f_type = bsd_to_linux_ftype(bsd_statfs->f_fstypename);
++	linux_statfs->f_type = bsd_to_linux_ftype(bsd_statfs);
+ 	linux_statfs->f_bsize = bsd_statfs->f_bsize;
+ 	linux_statfs->f_blocks = bsd_statfs->f_blocks;
+ 	linux_statfs->f_bfree = bsd_statfs->f_bfree;
+-- 
+2.54.0 (Apple Git-157)
+

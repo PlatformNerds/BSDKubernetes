@@ -1,0 +1,172 @@
+From 84d432e5ab0daef54e85cce127e4669458e66335 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 07:45:22 -0700
+Subject: [PATCH 29/29] kubelet/stats: report process count and limit on
+ FreeBSD
+
+pidlimit.Stats returned nothing outside Linux, so the node summary had no
+rlimit stats and the pid.available eviction signal and PIDPressure
+condition never fired on FreeBSD. FreeBSD limits processes, not threads:
+report min(kern.maxproc, kern.pid_max) as the limit and the number of
+processes in kern.proc.proc as the count.
+---
+ .../stats/pidlimit/pidlimit_freebsd.go        | 73 +++++++++++++++++++
+ .../stats/pidlimit/pidlimit_freebsd_test.go   | 55 ++++++++++++++
+ .../stats/pidlimit/pidlimit_unsupported.go    |  2 +-
+ 3 files changed, 129 insertions(+), 1 deletion(-)
+ create mode 100644 pkg/kubelet/stats/pidlimit/pidlimit_freebsd.go
+ create mode 100644 pkg/kubelet/stats/pidlimit/pidlimit_freebsd_test.go
+
+diff --git a/pkg/kubelet/stats/pidlimit/pidlimit_freebsd.go b/pkg/kubelet/stats/pidlimit/pidlimit_freebsd.go
+new file mode 100644
+index 00000000000..a1558603d68
+--- /dev/null
++++ b/pkg/kubelet/stats/pidlimit/pidlimit_freebsd.go
+@@ -0,0 +1,73 @@
++//go:build freebsd
++
++/*
++Copyright 2026 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package pidlimit
++
++import (
++	"encoding/binary"
++	"fmt"
++	"time"
++
++	"golang.org/x/sys/unix"
++	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	statsapi "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
++)
++
++// Stats provides basic information about max and current process count.
++// FreeBSD limits processes, not threads: the limit is the smaller of
++// kern.maxproc and kern.pid_max, and the count is the number of processes.
++func Stats() (*statsapi.RlimitStats, error) {
++	rlimit := &statsapi.RlimitStats{}
++
++	taskMax := int64(-1)
++	for _, name := range []string{"kern.maxproc", "kern.pid_max"} {
++		if limit, err := unix.SysctlUint32(name); err == nil {
++			if taskMax == -1 || taskMax > int64(limit) {
++				taskMax = int64(limit)
++			}
++		}
++	}
++	if taskMax >= 0 {
++		rlimit.MaxPID = &taskMax
++	}
++
++	if procs, err := processCount(); err == nil {
++		rlimit.NumOfRunningProcesses = &procs
++	}
++
++	rlimit.Time = v1.NewTime(time.Now())
++
++	return rlimit, nil
++}
++
++// processCount counts the processes in kern.proc.proc, an array of struct
++// kinfo_proc whose first field, ki_structsize, is the element size.
++func processCount() (int64, error) {
++	buf, err := unix.SysctlRaw("kern.proc.proc")
++	if err != nil {
++		return 0, err
++	}
++	if len(buf) < 4 {
++		return 0, nil
++	}
++	size := int(binary.NativeEndian.Uint32(buf))
++	if size <= 0 || len(buf)%size != 0 {
++		return 0, fmt.Errorf("kern.proc.proc: %d bytes with ki_structsize %d", len(buf), size)
++	}
++	return int64(len(buf) / size), nil
++}
+diff --git a/pkg/kubelet/stats/pidlimit/pidlimit_freebsd_test.go b/pkg/kubelet/stats/pidlimit/pidlimit_freebsd_test.go
+new file mode 100644
+index 00000000000..b689e72024c
+--- /dev/null
++++ b/pkg/kubelet/stats/pidlimit/pidlimit_freebsd_test.go
+@@ -0,0 +1,55 @@
++//go:build freebsd
++
++/*
++Copyright 2026 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package pidlimit
++
++import (
++	"os/exec"
++	"testing"
++)
++
++func TestStats(t *testing.T) {
++	s, err := Stats()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if s.MaxPID == nil || *s.MaxPID <= 0 {
++		t.Errorf("MaxPID = %v", s.MaxPID)
++	}
++	if s.NumOfRunningProcesses == nil || *s.NumOfRunningProcesses <= 1 {
++		t.Fatalf("NumOfRunningProcesses = %v", s.NumOfRunningProcesses)
++	}
++	// Starting processes raises the count.
++	var cmds []*exec.Cmd
++	for i := 0; i < 5; i++ {
++		c := exec.Command("sleep", "5")
++		if err := c.Start(); err != nil {
++			t.Fatal(err)
++		}
++		cmds = append(cmds, c)
++	}
++	s2, _ := Stats()
++	if *s2.NumOfRunningProcesses < *s.NumOfRunningProcesses+5 {
++		t.Errorf("count went from %d to %d with 5 more processes", *s.NumOfRunningProcesses, *s2.NumOfRunningProcesses)
++	}
++	for _, c := range cmds {
++		c.Process.Kill()
++		c.Wait()
++	}
++	t.Logf("MaxPID %d, processes %d", *s.MaxPID, *s.NumOfRunningProcesses)
++}
+diff --git a/pkg/kubelet/stats/pidlimit/pidlimit_unsupported.go b/pkg/kubelet/stats/pidlimit/pidlimit_unsupported.go
+index b195a771d15..cbef921dfb7 100644
+--- a/pkg/kubelet/stats/pidlimit/pidlimit_unsupported.go
++++ b/pkg/kubelet/stats/pidlimit/pidlimit_unsupported.go
+@@ -1,4 +1,4 @@
+-//go:build !linux
++//go:build !linux && !freebsd
+ 
+ /*
+ Copyright 2017 The Kubernetes Authors.
+-- 
+2.54.0 (Apple Git-157)
+

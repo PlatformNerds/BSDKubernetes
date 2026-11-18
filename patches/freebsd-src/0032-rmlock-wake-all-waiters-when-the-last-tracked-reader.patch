@@ -1,0 +1,59 @@
+From 08cb92f3ce0b23aca065e4ea8ab8f0782265127e Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 11:02:52 -0700
+Subject: [PATCH] rmlock: wake all waiters when the last tracked reader leaves
+
+A writer waiting for active readers sleeps on the rmlock's turnstile and
+the last reader wakes it with turnstile_signal(), assuming the writer is
+the only waiter. It is not: epoch_block_handler_preempt() puts a thread
+waiting for an epoch to drain on the turnstile of the lock that a thread
+in the epoch section is blocked on. When that thread is an rmlock writer
+waiting for readers, the epoch waiter joins the rmlock's turnstile, and
+only one of the waiters is woken. The other sleeps forever on an
+ownerless turnstile.
+
+Seen on Kubernetes nodes, where pod churn creates and destroys epairs
+while pf filters traffic: pfi_attach_ifnet_event() and
+pfi_detach_ifnet_event() take pf's rules write lock inside the net
+epoch, and if_alloc_domain() and if_detach_internal() wait for the
+epoch while holding ifnet_sx and ifnet_detach_sx. After a burst of pod
+starts and stops two ifconfig processes slept on the turnstile of
+"pf rulesets" with no owner, no readers and no writer left; jail
+removal then blocked on ifnet_detach_sx while holding allprison, and
+every fork and exit queued behind allproc.
+
+Use turnstile_broadcast(). The writer loops while readers remain, and
+epoch waiters return to ck_epoch's scan, so spurious wakeups are
+harmless.
+---
+ sys/kern/kern_rmlock.c | 14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/sys/kern/kern_rmlock.c b/sys/kern/kern_rmlock.c
+index 7206572ff..df64586e0 100644
+--- a/sys/kern/kern_rmlock.c
++++ b/sys/kern/kern_rmlock.c
+@@ -494,7 +494,19 @@ _rm_unlock_hard(struct thread *td,struct rm_priotracker *tracker)
+ 
+ 		ts = turnstile_lookup(&rm->lock_object);
+ 
+-		turnstile_signal(ts, TS_EXCLUSIVE_QUEUE);
++		/*
++		 * Wake every waiter, not just one. The writer waiting for
++		 * this reader is not the only thread that can be on the
++		 * turnstile: epoch_block_handler_preempt() puts threads
++		 * waiting for an epoch to drain on the turnstile of the lock
++		 * an epoch reader is blocked on, here the writer's (e.g.
++		 * pf's rules lock, write-locked inside the net epoch). With
++		 * turnstile_signal() only one of them woke; the others slept
++		 * on an ownerless turnstile forever, holding whatever they
++		 * held (ifnet_sx, ifnet_detach_sx). Every waiter rechecks its
++		 * condition: the writer loops while readers remain.
++		 */
++		turnstile_broadcast(ts, TS_EXCLUSIVE_QUEUE);
+ 		turnstile_unpend(ts);
+ 		turnstile_chain_unlock(&rm->lock_object);
+ 	} else
+-- 
+2.54.0 (Apple Git-157)
+

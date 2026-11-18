@@ -1,0 +1,60 @@
+From 018cdd93c863e0ac3d06c377202b07aa8c8d2b69 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 07:44:21 -0700
+Subject: [PATCH 28/29] volume: apply fsGroup ownership on FreeBSD
+
+SetVolumeOwnership was built for Linux only; elsewhere NewVolumeOwnership
+returned a no-op, so on FreeBSD no volume (secret, configMap, projected,
+emptyDir, PV) was given the pod's fsGroup: a non-root container got
+EACCES on a secret with defaultMode 0440 although fsGroup was among its
+groups. The Linux implementation only uses POSIX calls; build it for
+FreeBSD too (renamed volume_linux.go to volume_ownership_unix.go, since
+the _linux suffix restricts a file to Linux whatever its build tags).
+Its tests pass on FreeBSD.
+---
+ pkg/volume/{volume_linux.go => volume_ownership_unix.go}        | 2 +-
+ .../{volume_linux_test.go => volume_ownership_unix_test.go}     | 2 +-
+ pkg/volume/volume_unsupported.go                                | 2 +-
+ 3 files changed, 3 insertions(+), 3 deletions(-)
+ rename pkg/volume/{volume_linux.go => volume_ownership_unix.go} (99%)
+ rename pkg/volume/{volume_linux_test.go => volume_ownership_unix_test.go} (99%)
+
+diff --git a/pkg/volume/volume_linux.go b/pkg/volume/volume_ownership_unix.go
+similarity index 99%
+rename from pkg/volume/volume_linux.go
+rename to pkg/volume/volume_ownership_unix.go
+index 48e6a8f385e..10c55b5cf24 100644
+--- a/pkg/volume/volume_linux.go
++++ b/pkg/volume/volume_ownership_unix.go
+@@ -1,4 +1,4 @@
+-//go:build linux
++//go:build linux || freebsd
+ 
+ /*
+ Copyright 2016 The Kubernetes Authors.
+diff --git a/pkg/volume/volume_linux_test.go b/pkg/volume/volume_ownership_unix_test.go
+similarity index 99%
+rename from pkg/volume/volume_linux_test.go
+rename to pkg/volume/volume_ownership_unix_test.go
+index bf1d2904114..fc45f21b918 100644
+--- a/pkg/volume/volume_linux_test.go
++++ b/pkg/volume/volume_ownership_unix_test.go
+@@ -1,4 +1,4 @@
+-//go:build linux
++//go:build linux || freebsd
+ 
+ /*
+ Copyright 2020 The Kubernetes Authors.
+diff --git a/pkg/volume/volume_unsupported.go b/pkg/volume/volume_unsupported.go
+index e73bb4a14aa..b65840a8aac 100644
+--- a/pkg/volume/volume_unsupported.go
++++ b/pkg/volume/volume_unsupported.go
+@@ -1,4 +1,4 @@
+-//go:build !linux
++//go:build !linux && !freebsd
+ 
+ /*
+ Copyright 2016 The Kubernetes Authors.
+-- 
+2.54.0 (Apple Git-157)
+

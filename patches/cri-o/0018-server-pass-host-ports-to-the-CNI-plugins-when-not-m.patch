@@ -1,0 +1,65 @@
+From e964b0341d73c370f8f98b2ba0ff790c0234e4c8 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 07:48:46 -0700
+Subject: [PATCH] server: pass host ports to the CNI plugins when not mapping
+ them
+
+With disable_hostport_mapping (the FreeBSD default, as CRI-O's own
+hostport manager needs iptables or nftables) nothing set up a pod's host
+ports: CRI-O skipped them and handed the CNI plugins empty port mappings,
+so a portmap plugin in the network configuration had nothing to do.
+Pass the sandbox's port mappings in the CNI runtime config instead (the
+portMappings capability), so that plugin can.
+---
+ server/sandbox_network.go | 28 ++++++++++++++++++++++++++++
+ 1 file changed, 28 insertions(+)
+
+diff --git a/server/sandbox_network.go b/server/sandbox_network.go
+index c2c75922c..a945d9117 100644
+--- a/server/sandbox_network.go
++++ b/server/sandbox_network.go
+@@ -334,6 +334,7 @@ func (s *Server) newPodNetwork(ctx context.Context, sb *sandbox.Sandbox) (ocicni
+ 		NetNS:     sb.NetNsPath(),
+ 		RuntimeConfig: map[string]ocicni.RuntimeConfig{
+ 			network: {
++				PortMappings:   s.cniPortMappings(sb),
+ 				Bandwidth:      bwConfig,
+ 				CgroupPath:     sb.CgroupParent(),
+ 				PodAnnotations: &podAnnotations,
+@@ -342,6 +343,33 @@ func (s *Server) newPodNetwork(ctx context.Context, sb *sandbox.Sandbox) (ocicni
+ 	}, nil
+ }
+ 
++// cniPortMappings returns the sandbox's host ports for the CNI plugins when
++// CRI-O doesn't map them itself (disable_hostport_mapping, the default where
++// there is no iptables or nftables, e.g. FreeBSD), so that a portmap plugin
++// in the network configuration can.
++func (s *Server) cniPortMappings(sb *sandbox.Sandbox) []ocicni.PortMapping {
++	if !s.config.DisableHostPortMapping {
++		return nil
++	}
++
++	var mappings []ocicni.PortMapping
++
++	for _, pm := range sb.PortMappings() {
++		if pm.HostPort <= 0 {
++			continue
++		}
++
++		mappings = append(mappings, ocicni.PortMapping{
++			HostPort:      pm.HostPort,
++			ContainerPort: pm.ContainerPort,
++			Protocol:      strings.ToLower(string(pm.Protocol)),
++			HostIP:        pm.HostIP,
++		})
++	}
++
++	return mappings
++}
++
+ // networkGC cleans up any resources concerned with stale pods (pods not
+ // included in validPods).
+ func (s *Server) networkGC(ctx context.Context, validPods []*sandbox.Sandbox) error {
+-- 
+2.54.0 (Apple Git-157)
+

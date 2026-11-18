@@ -7,7 +7,7 @@ Applied on top of upstream `kubernetes/kubernetes` tag **v1.36.1**, in this orde
 | `kubernetes/v1.36.1/kubelet/` | `dfr/kubernetes` branch `freebsd-kubelet-v1.36.1` | Doug Rabson | FreeBSD cadvisor (racct), container manager, mount-utils, subpath, emptyDir, security context |
 | `kubernetes/v1.36.1/proxy/` | `dfr/kubernetes` branch `freebsd-proxy-v1.36.1` | Doug Rabson | kube-proxy `pf` mode |
 | `kubernetes/v1.36.1/kubeadm/` | `dfr/kubernetes` branch `freebsd-kubeadm-v1.36.1` | Doug Rabson | kubeadm on FreeBSD |
-| `kubernetes/v1.36.1/bsdk8s/` | this project | BSDKubernetes | cgo-free kubelet build (enables cross-compile) + rctl racct parsing fixes, ..., 0022 node identity (`kernelVersion`, `osImage`, `bootID` from `kern.boot_id`, `systemUUID`, `machineID`), 0023 pf proxier honours `externalTrafficPolicy`/`internalTrafficPolicy: Local` (research/19) |
+| `kubernetes/v1.36.1/bsdk8s/` | this project | BSDKubernetes | cgo-free kubelet build (enables cross-compile) + rctl racct parsing fixes, ..., 0022 node identity (`kernelVersion`, `osImage`, `bootID` from `kern.boot_id`, `systemUUID`, `machineID`), 0023 pf proxier honours `externalTrafficPolicy`/`internalTrafficPolicy: Local`, 0024 pf proxier `/healthz`, `healthCheckNodePort`, `externalIPs` and LoadBalancer IPs (research/19) |
 
 Outside Kubernetes (the branches are the source of truth; these are exports for review):
 

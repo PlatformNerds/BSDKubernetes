@@ -70,9 +70,36 @@ spreads the replicas: `topologySpreadConstraints` on `kubernetes.io/hostname`, `
 replicas landed on one node), and `nodeTaintsPolicy: Honor` (a cordoned node doesn't keep a replica Pending during a
 drain). 211/212 requests returned 200 during that rollout (old kube-proxy).
 
+## Health, `healthCheckNodePort`, external and LoadBalancer IPs (patch 0024, b4ce4a26065 → 67a12b4950a)
+
+Found while checking `healthCheckNodePort`:
+
+- **`/healthz` and `/livez` returned 503 on both nodes.** The proxier only marked itself updated at startup, while
+  every Service change queued an update, so the health server reported kube-proxy stale from the first change
+  on. A liveness probe would restart kube-proxy forever; a load balancer using `/healthz` would take every node
+  out. It now marks each completed sync, as the iptables proxier does: 200 on both nodes, still 200 100 s after the
+  last change.
+- **`healthCheckNodePort` wasn't served.** The per-service health server was created but never synced. Now, for a
+  `type: LoadBalancer`, `externalTrafficPolicy: Local` Service backed by two pods on node 1: node 1 answers 200
+  (`"localEndpoints": 2`), node 2 answers 503.
+- **`externalIPs` and LoadBalancer ingress IPs had no rules**, so MetalLB-style bare-metal load balancers couldn't
+  work. They now take traffic on the service port with the same rules as NodePorts: external policy, pod and
+  node short-circuit, masquerading to remote endpoints, `block drop` with Local and no local endpoint. The node's
+  own connections use an outbound `rdr-to`, since the address needn't be on `lo0`.
+
+Verified with an external IP (`192.168.100.200`) and an LB ingress IP set by hand in the Service status
+(`192.168.100.201`), both host-routed from node 2 to node 1: 200, and nginx logged the real client `192.168.100.2`.
+Node 1's host and a pod on node 2 also got 200. On node 2 (no local endpoint) the anchor holds the pod
+short-circuit, the host `rdr-to` and the `block drop`. I couldn't send truly external traffic to node 2's LB IP:
+the only other host is node 1, whose own rules short-circuit it, as on Linux.
+
+Upstream e2e (traffic policy, externalIP, health-check focus; LoadBalancer, Serial and Disruptive tests skipped):
+**10/10 passed**, including "should be possible to connect to a service via ExternalIP when the external IP is not
+assigned to a node". "should implement NodePort and HealthCheckNodePort correctly when ExternalTrafficPolicy
+changes" skips itself without a LoadBalancer provider.
+
 ## Not done
 
-- **`healthCheckNodePort`**: kube-proxy's per-service health server for load balancers. Not checked in pf mode (the
-  LoadBalancer e2e tests need a cloud provider).
+- **`loadBalancerSourceRanges`**: not enforced (no firewall rules for LB IPs).
 - **Rebalancing**: after a drained node comes back, both Envoy replicas stay on the other node until the next
   rollout (as on Linux; that's the descheduler's job). Meanwhile the returning node drops Gateway NodePort traffic.

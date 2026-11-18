@@ -29,7 +29,12 @@ sed -i '' -e 's|\([[:<:]]\)sed\([[:blank:]]-n\)|\1gsed\2|' "$src/scripts/gen_bui
 find "$src" -name '*.c' -print0 | xargs -0 sed -i '' -e 's|<alloca.h>|<stdlib.h>|; s|<malloc.h>|<stdlib.h>|'
 find "$src" -name '*.[ch]' -print0 | xargs -0 sed -i '' -e 's|"/proc|"/compat/linux/proc|'
 cp "$port/files/data-.config" "$src/.config"
-mk() { gmake -C "$src" CC=cc HOSTCC=cc CXX=c++ HOSTCXX=c++ CFLAGS="-O2 -pipe" SKIP_STRIP=y "$@"; }
+# CFLAGS: the ports framework's defaults, plus BB_GLOBAL_CONST='' (the port sets it for armv6
+# only). BusyBox declares the pointer to each applet's globals const and fills it in through a
+# cast, and clang optimizes on the const: 1.37.0's awk dereferenced a stale pointer and
+# crashed on any program on arm64 (`echo x | awk '{print $1}'` -> SIGSEGV).
+cflags="-O2 -pipe -fstack-protector-strong -fno-strict-aliasing -DBB_GLOBAL_CONST="
+mk() { gmake -C "$src" CC=cc HOSTCC=cc CXX=c++ HOSTCXX=c++ CFLAGS="$cflags" SKIP_STRIP=y "$@"; }
 mk oldconfig </dev/null >/dev/null
 # Only the binary: the default target also builds the docs, which need perl.
 mk -j"$(sysctl -n hw.ncpu)" busybox >/dev/null

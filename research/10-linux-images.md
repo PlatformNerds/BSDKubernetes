@@ -65,6 +65,12 @@ Both nodes boot `kernel.bsdk8s3` = 15.1 + allow.pf + pf sticky + rctl hierarchy 
   - research/04 also lists: unshare/setns, io_uring, signalfd, pidfd, bpf, keyctl, landlock.
   - ~~Abstract Unix sockets.~~ **Supported (kernel `bsdk8s12`, patch freebsd-src/0017, research/14).**
   - ~~No `/proc/1`, no `/proc/<pid>/fd` for other processes.~~ **Supported (kernel `bsdk8s13`, patch freebsd-src/0018, research/18).**
+  - ~~`membarrier(2)` (Node.js, .NET JITs) and `prctl` `PR_SET_VMA`, `PR_GET_NO_NEW_PRIVS`, `PR_GET_CHILD_SUBREAPER`,
+    `PR_{G,S}ET_THP_DISABLE` missing on 15.1.~~ **Backported from main (kernel `bsdk8s15`, patches freebsd-src/0021-0028,
+    branch `bsdk8s/linux-prctl-membarrier-15.1`):** seven upstream commits with `(cherry picked from commit …)` trailers,
+    plus a syscall-table regen for the three-argument `membarrier`. Since then, Go/Envoy's `PR_SET_VMA` and Node's
+    `membarrier` log nothing; the only Linuxulator message left on the nodes is `io_uring_setup not implemented`,
+    which is Linux's own ENOSYS when io_uring is disabled, so libuv falls back.
 - **Images with FreeBSD twins.** Our FreeBSD test images use upstream names (e.g. `agnhost:2.63.0`). A Linux pod
   asking for the same tag gets the local FreeBSD image. CRI-O now refuses this with a clear error (research/17).
 - ~~**Commands found only on the image's `PATH`** failed: `command: ["java", "-version"]` on `eclipse-temurin`

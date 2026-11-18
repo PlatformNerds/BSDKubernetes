@@ -1,0 +1,56 @@
+From 1622b85e2c17bd6fce9098b8ce89b1089badd2d3 Mon Sep 17 00:00:00 2001
+From: Ricardo Branco <rbranco@suse.de>
+Date: Sun, 19 Apr 2026 23:06:52 +0200
+Subject: [PATCH 21/28] linux: Support PR_GET_CHILD_SUBREAPER prctl(2)
+
+PR: 294651
+Signed-off-by: Ricardo Branco <rbranco@suse.de>
+Reviewed by: kib, pouria
+Pull-Request: https://github.com/freebsd/freebsd-src/pull/2151
+
+(cherry picked from commit 50ff71e956b631b56a878bd723a9b32dfbdac60f)
+---
+ sys/compat/linux/linux_misc.c | 12 ++++++++++++
+ sys/compat/linux/linux_misc.h |  3 ++-
+ 2 files changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/sys/compat/linux/linux_misc.c b/sys/compat/linux/linux_misc.c
+index d35429e17..6beb539df 100644
+--- a/sys/compat/linux/linux_misc.c
++++ b/sys/compat/linux/linux_misc.c
+@@ -1804,6 +1804,18 @@ linux_prctl(struct thread *td, struct linux_prctl_args *args)
+ 
+ 		return (kern_procctl(td, P_PID, 0, PROC_REAP_ACQUIRE,
+ 		    NULL));
++	case LINUX_PR_GET_CHILD_SUBREAPER: {
++		struct procctl_reaper_status rs;
++		l_int val;
++
++		error = kern_procctl(td, P_PID, 0, PROC_REAP_STATUS, &rs);
++		if (error != 0)
++			return (error);
++		val = rs.rs_reaper == p->p_pid ? 1 : 0;
++		error = copyout(&val, (void *)(register_t)args->arg2,
++		    sizeof(val));
++		break;
++	}
+ 	case LINUX_PR_SET_NO_NEW_PRIVS:
+ 		arg = args->arg2 == 1 ?
+ 		    PROC_NO_NEW_PRIVS_ENABLE : PROC_NO_NEW_PRIVS_DISABLE;
+diff --git a/sys/compat/linux/linux_misc.h b/sys/compat/linux/linux_misc.h
+index 63ed914af..4412ff5b0 100644
+--- a/sys/compat/linux/linux_misc.h
++++ b/sys/compat/linux/linux_misc.h
+@@ -57,7 +57,8 @@
+ #define	LINUX_PR_GET_SECCOMP	21
+ #define	LINUX_PR_SET_SECCOMP	22
+ #define	LINUX_PR_CAPBSET_READ	23
+-#define LINUX_PR_SET_CHILD_SUBREAPER 36
++#define	LINUX_PR_SET_CHILD_SUBREAPER	36 /* Get child subreaper status */
++#define	LINUX_PR_GET_CHILD_SUBREAPER	37 /* Set child subreaper status */
+ #define	LINUX_PR_SET_NO_NEW_PRIVS	38
+ #define	LINUX_PR_SET_PTRACER	1499557217
+ 
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,49 @@
+From 2db0f4da79e821b637b0134dc68f7e8b26bbe833 Mon Sep 17 00:00:00 2001
+From: Pawel Biernacki <kaktus@FreeBSD.org>
+Date: Sat, 30 May 2026 12:15:21 +0000
+Subject: [PATCH 25/28] linux: Add support for PR_SET_VMA to prctl(2)
+
+Implement dummy support for PR_SET_VMA with PR_SET_VMA_ANON_NAME in
+prctl(2).  This prevents applications from receiving EINVAL when
+attempting to name anonymous memory regions.
+
+(cherry picked from commit a64148e21bb4ac976345cbedbd32942f97f07cc1)
+---
+ sys/compat/linux/linux_misc.c | 7 +++++++
+ sys/compat/linux/linux_misc.h | 2 ++
+ 2 files changed, 9 insertions(+)
+
+diff --git a/sys/compat/linux/linux_misc.c b/sys/compat/linux/linux_misc.c
+index 18731341b..53360d91b 100644
+--- a/sys/compat/linux/linux_misc.c
++++ b/sys/compat/linux/linux_misc.c
+@@ -1835,6 +1835,13 @@ linux_prctl(struct thread *td, struct linux_prctl_args *args)
+ 		linux_msg(td, "unsupported prctl PR_SET_PTRACER");
+ 		error = EINVAL;
+ 		break;
++	case LINUX_PR_SET_VMA:
++		if (args->arg2 != LINUX_PR_SET_VMA_ANON_NAME) {
++			linux_msg(td, "unsupported prctl PR_SET_VMA attr %ju",
++			    (uintmax_t)args->arg2);
++			error = EINVAL;
++		}
++		break;
+ 	default:
+ 		linux_msg(td, "unsupported prctl option %d", args->option);
+ 		error = EINVAL;
+diff --git a/sys/compat/linux/linux_misc.h b/sys/compat/linux/linux_misc.h
+index 2044f23f3..196f9372d 100644
+--- a/sys/compat/linux/linux_misc.h
++++ b/sys/compat/linux/linux_misc.h
+@@ -62,6 +62,8 @@
+ #define	LINUX_PR_SET_NO_NEW_PRIVS	38 /* Set no_new_privs attribute */
+ #define	LINUX_PR_GET_NO_NEW_PRIVS	39 /* Get no_new_privs attribute */
+ #define	LINUX_PR_SET_PTRACER	1499557217
++#define	LINUX_PR_SET_VMA	1398164801
++#define	LINUX_PR_SET_VMA_ANON_NAME	0
+ 
+ #define	LINUX_MAX_COMM_LEN	16	/* Maximum length of the process name. */
+ 
+-- 
+2.54.0 (Apple Git-157)
+

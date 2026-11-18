@@ -1,0 +1,181 @@
+From a6c66348305fda279adcdc08fda0d6e6d38cb4bc Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 19:23:08 -0700
+Subject: [PATCH 28/28] linux: Regenerate system call definitions
+
+After the membarrier(2) backport changed syscalls.master: the
+three-argument form (cmd, flags, cpu_id).
+---
+ sys/amd64/linux/linux_proto.h             | 3 ++-
+ sys/amd64/linux/linux_systrace_args.c     | 8 ++++++--
+ sys/amd64/linux32/linux32_proto.h         | 3 ++-
+ sys/amd64/linux32/linux32_systrace_args.c | 8 ++++++--
+ sys/arm64/linux/linux_proto.h             | 3 ++-
+ sys/arm64/linux/linux_systrace_args.c     | 8 ++++++--
+ sys/i386/linux/linux_proto.h              | 3 ++-
+ sys/i386/linux/linux_systrace_args.c      | 8 ++++++--
+ 8 files changed, 32 insertions(+), 12 deletions(-)
+
+diff --git a/sys/amd64/linux/linux_proto.h b/sys/amd64/linux/linux_proto.h
+index f1d9c96a7..2373eff31 100644
+--- a/sys/amd64/linux/linux_proto.h
++++ b/sys/amd64/linux/linux_proto.h
+@@ -1276,7 +1276,8 @@ struct linux_userfaultfd_args {
+ };
+ struct linux_membarrier_args {
+ 	char cmd_l_[PADL_(l_int)]; l_int cmd; char cmd_r_[PADR_(l_int)];
+-	char flags_l_[PADL_(l_int)]; l_int flags; char flags_r_[PADR_(l_int)];
++	char flags_l_[PADL_(l_uint)]; l_uint flags; char flags_r_[PADR_(l_uint)];
++	char cpu_id_l_[PADL_(l_int)]; l_int cpu_id; char cpu_id_r_[PADR_(l_int)];
+ };
+ struct linux_mlock2_args {
+ 	char start_l_[PADL_(l_ulong)]; l_ulong start; char start_r_[PADR_(l_ulong)];
+diff --git a/sys/amd64/linux/linux_systrace_args.c b/sys/amd64/linux/linux_systrace_args.c
+index 1dc4de019..902a0c161 100644
+--- a/sys/amd64/linux/linux_systrace_args.c
++++ b/sys/amd64/linux/linux_systrace_args.c
+@@ -2539,8 +2539,9 @@ systrace_args(int sysnum, void *params, uint64_t *uarg, int *n_args)
+ 	case 324: {
+ 		struct linux_membarrier_args *p = params;
+ 		iarg[a++] = p->cmd; /* l_int */
+-		iarg[a++] = p->flags; /* l_int */
+-		*n_args = 2;
++		iarg[a++] = p->flags; /* l_uint */
++		iarg[a++] = p->cpu_id; /* l_int */
++		*n_args = 3;
+ 		break;
+ 	}
+ 	/* linux_mlock2 */
+@@ -6948,6 +6949,9 @@ systrace_entry_setargdesc(int sysnum, int ndx, char *desc, size_t descsz)
+ 			p = "l_int";
+ 			break;
+ 		case 1:
++			p = "l_uint";
++			break;
++		case 2:
+ 			p = "l_int";
+ 			break;
+ 		default:
+diff --git a/sys/amd64/linux32/linux32_proto.h b/sys/amd64/linux32/linux32_proto.h
+index 57a303271..3f13c6df5 100644
+--- a/sys/amd64/linux32/linux32_proto.h
++++ b/sys/amd64/linux32/linux32_proto.h
+@@ -1420,7 +1420,8 @@ struct linux_userfaultfd_args {
+ };
+ struct linux_membarrier_args {
+ 	char cmd_l_[PADL_(l_int)]; l_int cmd; char cmd_r_[PADR_(l_int)];
+-	char flags_l_[PADL_(l_int)]; l_int flags; char flags_r_[PADR_(l_int)];
++	char flags_l_[PADL_(l_uint)]; l_uint flags; char flags_r_[PADR_(l_uint)];
++	char cpu_id_l_[PADL_(l_int)]; l_int cpu_id; char cpu_id_r_[PADR_(l_int)];
+ };
+ struct linux_mlock2_args {
+ 	char start_l_[PADL_(l_ulong)]; l_ulong start; char start_r_[PADR_(l_ulong)];
+diff --git a/sys/amd64/linux32/linux32_systrace_args.c b/sys/amd64/linux32/linux32_systrace_args.c
+index cbd1641c2..0bfbca2a0 100644
+--- a/sys/amd64/linux32/linux32_systrace_args.c
++++ b/sys/amd64/linux32/linux32_systrace_args.c
+@@ -2782,8 +2782,9 @@ systrace_args(int sysnum, void *params, uint64_t *uarg, int *n_args)
+ 	case 375: {
+ 		struct linux_membarrier_args *p = params;
+ 		iarg[a++] = p->cmd; /* l_int */
+-		iarg[a++] = p->flags; /* l_int */
+-		*n_args = 2;
++		iarg[a++] = p->flags; /* l_uint */
++		iarg[a++] = p->cpu_id; /* l_int */
++		*n_args = 3;
+ 		break;
+ 	}
+ 	/* linux_mlock2 */
+@@ -7857,6 +7858,9 @@ systrace_entry_setargdesc(int sysnum, int ndx, char *desc, size_t descsz)
+ 			p = "l_int";
+ 			break;
+ 		case 1:
++			p = "l_uint";
++			break;
++		case 2:
+ 			p = "l_int";
+ 			break;
+ 		default:
+diff --git a/sys/arm64/linux/linux_proto.h b/sys/arm64/linux/linux_proto.h
+index 82f57f77f..ad0146b85 100644
+--- a/sys/arm64/linux/linux_proto.h
++++ b/sys/arm64/linux/linux_proto.h
+@@ -1083,7 +1083,8 @@ struct linux_userfaultfd_args {
+ };
+ struct linux_membarrier_args {
+ 	char cmd_l_[PADL_(l_int)]; l_int cmd; char cmd_r_[PADR_(l_int)];
+-	char flags_l_[PADL_(l_int)]; l_int flags; char flags_r_[PADR_(l_int)];
++	char flags_l_[PADL_(l_uint)]; l_uint flags; char flags_r_[PADR_(l_uint)];
++	char cpu_id_l_[PADL_(l_int)]; l_int cpu_id; char cpu_id_r_[PADR_(l_int)];
+ };
+ struct linux_mlock2_args {
+ 	char start_l_[PADL_(l_ulong)]; l_ulong start; char start_r_[PADR_(l_ulong)];
+diff --git a/sys/arm64/linux/linux_systrace_args.c b/sys/arm64/linux/linux_systrace_args.c
+index 1b946a940..3d480b31b 100644
+--- a/sys/arm64/linux/linux_systrace_args.c
++++ b/sys/arm64/linux/linux_systrace_args.c
+@@ -2156,8 +2156,9 @@ systrace_args(int sysnum, void *params, uint64_t *uarg, int *n_args)
+ 	case 283: {
+ 		struct linux_membarrier_args *p = params;
+ 		iarg[a++] = p->cmd; /* l_int */
+-		iarg[a++] = p->flags; /* l_int */
+-		*n_args = 2;
++		iarg[a++] = p->flags; /* l_uint */
++		iarg[a++] = p->cpu_id; /* l_int */
++		*n_args = 3;
+ 		break;
+ 	}
+ 	/* linux_mlock2 */
+@@ -6015,6 +6016,9 @@ systrace_entry_setargdesc(int sysnum, int ndx, char *desc, size_t descsz)
+ 			p = "l_int";
+ 			break;
+ 		case 1:
++			p = "l_uint";
++			break;
++		case 2:
+ 			p = "l_int";
+ 			break;
+ 		default:
+diff --git a/sys/i386/linux/linux_proto.h b/sys/i386/linux/linux_proto.h
+index 49f002a63..255c2ec74 100644
+--- a/sys/i386/linux/linux_proto.h
++++ b/sys/i386/linux/linux_proto.h
+@@ -1414,7 +1414,8 @@ struct linux_userfaultfd_args {
+ };
+ struct linux_membarrier_args {
+ 	char cmd_l_[PADL_(l_int)]; l_int cmd; char cmd_r_[PADR_(l_int)];
+-	char flags_l_[PADL_(l_int)]; l_int flags; char flags_r_[PADR_(l_int)];
++	char flags_l_[PADL_(l_uint)]; l_uint flags; char flags_r_[PADR_(l_uint)];
++	char cpu_id_l_[PADL_(l_int)]; l_int cpu_id; char cpu_id_r_[PADR_(l_int)];
+ };
+ struct linux_mlock2_args {
+ 	char start_l_[PADL_(l_ulong)]; l_ulong start; char start_r_[PADR_(l_ulong)];
+diff --git a/sys/i386/linux/linux_systrace_args.c b/sys/i386/linux/linux_systrace_args.c
+index 563d1a795..739d417bc 100644
+--- a/sys/i386/linux/linux_systrace_args.c
++++ b/sys/i386/linux/linux_systrace_args.c
+@@ -2813,8 +2813,9 @@ systrace_args(int sysnum, void *params, uint64_t *uarg, int *n_args)
+ 	case 375: {
+ 		struct linux_membarrier_args *p = params;
+ 		iarg[a++] = p->cmd; /* l_int */
+-		iarg[a++] = p->flags; /* l_int */
+-		*n_args = 2;
++		iarg[a++] = p->flags; /* l_uint */
++		iarg[a++] = p->cpu_id; /* l_int */
++		*n_args = 3;
+ 		break;
+ 	}
+ 	/* linux_mlock2 */
+@@ -7913,6 +7914,9 @@ systrace_entry_setargdesc(int sysnum, int ndx, char *desc, size_t descsz)
+ 			p = "l_int";
+ 			break;
+ 		case 1:
++			p = "l_uint";
++			break;
++		case 2:
+ 			p = "l_int";
+ 			break;
+ 		default:
+-- 
+2.54.0 (Apple Git-157)
+

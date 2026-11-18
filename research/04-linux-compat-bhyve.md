@@ -51,7 +51,7 @@ The SDT probe is useful. A runtime can watch `dtrace -n 'linuxulator:dummy::not_
 | `statx` | Implemented | `linux_stats.c:751` | glibc ≥2.28 `stat` path and coreutils: OK. |
 | `close_range` | Implemented | `linux_file.c:1890` | Python subprocess, systemd: OK. |
 | `pidfd_open/send_signal/getfd` | **ENOSYS** | `linux_dummy.c:115,127,130` | Go 1.23+ os/exec and Python asyncio probe and fall back. systemd ≥253 is degraded. |
-| `membarrier` | Implemented (maps to native `membarrier(2)`) | `linux_misc.c:3296` | Important for .NET and some JITs: OK. |
+| `membarrier` | Implemented on main (maps to native `membarrier(2)`); **15.1 had only a stub**, backported in kernel `bsdk8s15` (research/10) | `linux_misc.c:3296` | Important for .NET and some JITs: OK. |
 | `rseq` | ENOSYS (`linux_rseq.c:80`) | — | glibc ≥2.35 disables rseq on ENOSYS: OK. tcmalloc-rseq is slower. |
 | `bpf`, `perf_event_open` | ENOSYS | `linux_dummy.c:86,101` | Observability agents (Cilium, Pixie, Parca, Datadog system-probe) fail completely. |
 | `landlock_*` | ENOSYS | `linux_dummy.c:136-138` | Apps degrade gracefully. |

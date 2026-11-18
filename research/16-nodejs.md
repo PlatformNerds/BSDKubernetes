@@ -53,8 +53,8 @@ Both nodes boot `kernel.bsdk8s9`, which contains all kernel fixes so far.
 
 ## Notes
 
-- The kernel still logs `unsupported FUTEX_REQUEUE` once per process: the message is printed before the brand check.
-  It's cosmetic.
+- ~~The kernel still logs `unsupported FUTEX_REQUEUE` once per process: the message is printed before the brand check.~~
+  **Fixed (kernel `bsdk8s15`, patch freebsd-src/0029, main too):** it is logged only where the operation is rejected.
 - With the brands fixed, dynamic binaries no longer need `fallback_brand=3`: alpine, debian, busybox (glibc),
   node:22-alpine, eclipse-temurin and nginx:alpine all ran with it set to -1. It stays, because static binaries
   without an ABI note still need it: a static Go binary and `busybox:1.36-musl` both failed with it off

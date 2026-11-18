@@ -86,8 +86,10 @@ its four hot-restart datagram sockets, and the Gateway returns 200 over HTTP and
 `@envoy_domain_socket_…`, as Linux `ss` does.
 
 **Not done:**
-- **FreeBSD main.** main has reworked `unp_connectat()` into `unp_connectat_peer()`/`unp_vnode_peer()`, so the
-  15.1 patch doesn't cherry-pick. A main version needs its own port and a main kernel to test it on.
+- ~~**FreeBSD main.**~~ **Ported (branch `bsdk8s/linux-abstract-unix`).** main reworked `unp_connectat()` into
+  `unp_connectat_peer()`/`unp_vnode_peer()`, which take a reference on the peer socket. The main version looks the name
+  up under the table mutex and takes the same reference, with no vnode-mutex stand-in. It was built and booted on node 2
+  (see patches/README.md): all `abstest` checks, VNET isolation and the churn stress test pass.
 - **Other Linux behavior.** Linux also autobinds on `connect`/`sendto` with `SO_PASSCRED`; that isn't done.
 - ~~`getsockname` on an unbound socket returns length 16, where Linux returns 2.~~ **Fixed (kernel `bsdk8s14`,
   patch freebsd-src/0019).** Unnamed addresses now have Linux's lengths: 2 from `getsockname`/`getpeername`/`accept`,
@@ -107,7 +109,7 @@ failing readiness and the new one passing it. The demo EnvoyProxy now sets
 
 | Message | Meaning |
 |---|---|
-| `unsupported prctl option 1398164801` | `PR_SET_VMA` (names anonymous mappings): cosmetic |
+| ~~`unsupported prctl option 1398164801`~~ | `PR_SET_VMA` (names anonymous mappings; Go and Envoy). **Fixed**: backported from main, see research/10 |
 | `unsupported fcntl cmd 36` | `F_OFD_GETLK` probe in etcd's fileutil (research/10) |
 | ~~`unsupported TCP socket option TCP_INFO (11)`~~ | Linux `tcp_info` stats (getsockopt). **Fixed**, see below |
 | ~~`unsupported setsockopt level 6 optname 18`~~ | `TCP_USER_TIMEOUT` (gRPC keepalive). **Fixed**, see below |

@@ -1,7 +1,7 @@
 # 18: `/proc/1` and `/proc/<pid>/fd` for Linux containers (2026-11-17)
 
 *Kernel `kernel.bsdk8s13` (now `bsdk8s14`, which adds research/14's unnamed-address fix) on both nodes. Patch freebsd-src/0018, fork branches `bsdk8s/linux-proc-pid1-fd-15.1`
-(tested) and `bsdk8s/linux-proc-pid1-fd` (main, not built).*
+(tested) and `bsdk8s/linux-proc-pid1-fd` (main; built and booted, see patches/README.md).*
 
 **Result [verified]:** inside a Linux container, `/proc/1` is the container's first process, and
 `/proc/<pid>/fd` lists, resolves and opens another process's descriptors as on Linux. `echo x > /proc/1/fd/1`

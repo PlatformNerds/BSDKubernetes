@@ -1,0 +1,66 @@
+From 5fc8b1613f107a8fac4a6ad66dcdde02d32fd930 Mon Sep 17 00:00:00 2001
+From: Warner Losh <imp@FreeBSD.org>
+Date: Thu, 10 Sep 2026 23:42:34 -0600
+Subject: [PATCH 26/28] linux: implement prctl PR_{G,S}ET_THP_DISABLE
+
+Since we don't have THP in FreeBSD, return that it's disabled. Linux
+applications use this to get around the weird latency spikes THP in
+Linux creates. Since FreeBSD superpages don't suffer from this issue,
+just say it's disabled.
+
+This removes the noisiest noise from the linux claude running on
+FreeBSD.
+
+Sponsored by:		Netflix
+
+(cherry picked from commit a8a6eac570917825d947020775d8f1962b396fd7)
+---
+ sys/compat/linux/linux_misc.c | 18 ++++++++++++++++++
+ sys/compat/linux/linux_misc.h |  2 ++
+ 2 files changed, 20 insertions(+)
+
+diff --git a/sys/compat/linux/linux_misc.c b/sys/compat/linux/linux_misc.c
+index 53360d91b..4e0fa6309 100644
+--- a/sys/compat/linux/linux_misc.c
++++ b/sys/compat/linux/linux_misc.c
+@@ -1842,6 +1842,24 @@ linux_prctl(struct thread *td, struct linux_prctl_args *args)
+ 			error = EINVAL;
+ 		}
+ 		break;
++	case LINUX_PR_GET_THP_DISABLE:
++		/*
++		 * THP not in play, since FreeBSD doesn't have THP. Although
++		 * similar, superpages don't have the crazy issues THP does, so
++		 * tell the best lie possible: there's no problems with crazy
++		 * latency spikes: this feature is disabled.
++		 */
++
++		td->td_retval[0] = 1;
++		break;
++	case LINUX_PR_SET_THP_DISABLE:
++		/*
++		 * Accept anything that's valid.
++		 */
++		if (args->arg2 != 0 && args->arg2 != 1)
++			return (EINVAL);
++		td->td_retval[0] = 0;
++		break;
+ 	default:
+ 		linux_msg(td, "unsupported prctl option %d", args->option);
+ 		error = EINVAL;
+diff --git a/sys/compat/linux/linux_misc.h b/sys/compat/linux/linux_misc.h
+index 196f9372d..fb77784dd 100644
+--- a/sys/compat/linux/linux_misc.h
++++ b/sys/compat/linux/linux_misc.h
+@@ -61,6 +61,8 @@
+ #define	LINUX_PR_GET_CHILD_SUBREAPER	37 /* Get child subreaper status */
+ #define	LINUX_PR_SET_NO_NEW_PRIVS	38 /* Set no_new_privs attribute */
+ #define	LINUX_PR_GET_NO_NEW_PRIVS	39 /* Get no_new_privs attribute */
++#define LINUX_PR_SET_THP_DISABLE	41 /* Disable / enable THP */
++#define LINUX_PR_GET_THP_DISABLE	42 /* Get THP state */
+ #define	LINUX_PR_SET_PTRACER	1499557217
+ #define	LINUX_PR_SET_VMA	1398164801
+ #define	LINUX_PR_SET_VMA_ANON_NAME	0
+-- 
+2.54.0 (Apple Git-157)
+

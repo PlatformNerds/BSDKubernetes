@@ -1,0 +1,33 @@
+From 7c1277a2afe4163674ee56edbf63c67225059079 Mon Sep 17 00:00:00 2001
+From: Pouria Mousavizadeh Tehrani <pouria@FreeBSD.org>
+Date: Wed, 22 Apr 2026 13:47:50 +0330
+Subject: [PATCH 23/28] linux: Fix a typo in a header comment
+
+PR:		294651
+Reported by:	Dmitry Lukhtionov <dmitryluhtionov@gmail.com>
+Fixes:		50ff71e956b6 ("linux: Support PR_GET_CHILD_SUBREAPER prctl(2)")
+Pull-Request:	https://github.com/freebsd/freebsd-src/pull/2151
+
+(cherry picked from commit 45827f9ad2e32ec8e4cdde62cbf722a48fb1b396)
+---
+ sys/compat/linux/linux_misc.h | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/sys/compat/linux/linux_misc.h b/sys/compat/linux/linux_misc.h
+index abd3a6df7..269fb734a 100644
+--- a/sys/compat/linux/linux_misc.h
++++ b/sys/compat/linux/linux_misc.h
+@@ -57,8 +57,8 @@
+ #define	LINUX_PR_GET_SECCOMP	21
+ #define	LINUX_PR_SET_SECCOMP	22
+ #define	LINUX_PR_CAPBSET_READ	23
+-#define	LINUX_PR_SET_CHILD_SUBREAPER	36 /* Get child subreaper status */
+-#define	LINUX_PR_GET_CHILD_SUBREAPER	37 /* Set child subreaper status */
++#define	LINUX_PR_SET_CHILD_SUBREAPER	36 /* Set child subreaper status */
++#define	LINUX_PR_GET_CHILD_SUBREAPER	37 /* Get child subreaper status */
+ #define	LINUX_PR_SET_NO_NEW_PRIVS	38 /* Set no_new_privs attribute */
+ #define	LINUX_PR_GET_NO_NEW_PRIVS	39 /* Get no_new_privs attribute */
+ #define	LINUX_PR_SET_PTRACER	1499557217
+-- 
+2.54.0 (Apple Git-157)
+

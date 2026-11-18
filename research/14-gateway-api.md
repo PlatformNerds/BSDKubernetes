@@ -105,6 +105,11 @@ failing readiness and the new one passing it. The demo EnvoyProxy now sets
 `provider.kubernetes.envoyDeployment.replicas: 2` (one per node). Deleting an Envoy pod then took 13 s, and
 **160/160** requests through both node IPs returned 200.
 
+The two replicas were one per node only by chance. Since kube-proxy honours `externalTrafficPolicy: Local`
+(research/19), a node without an Envoy drops Gateway NodePort traffic, so the EnvoyProxy now also sets
+`envoyDeployment.pod.topologySpreadConstraints` (hostname, `maxSkew: 1`, `DoNotSchedule`,
+`matchLabelKeys: [pod-template-hash]`, `nodeTaintsPolicy: Honor`). Each Envoy now logs the real client address.
+
 **preStop EOF (upstream bug, not FreeBSD).** Every Envoy pod deletion still records `FailedPreStopHook` on the
 `envoy` container; the kubelet logs `Get "http://<pod>:19002/shutdown/ready": EOF`. The shutdown-manager's HTTP
 server sets `WriteTimeout: 10s`, and `/shutdown/ready` can't answer before the 10 s minimum drain period has passed

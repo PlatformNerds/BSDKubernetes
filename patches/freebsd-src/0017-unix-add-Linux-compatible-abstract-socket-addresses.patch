@@ -1,0 +1,348 @@
+From d956307dd87379f64621b35171035641fe6063f3 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 18:09:02 -0700
+Subject: [PATCH 17/17] unix: add Linux-compatible abstract socket addresses
+
+A sun_path that starts with a NUL byte now names a socket in an abstract
+namespace instead of the file system, as on Linux.  The name is all
+sun_len - offsetof(sun_path) bytes, NULs included.  Names are scoped to
+the socket's VNET, which matches Linux's per-network-namespace scope: jails
+sharing a VNET share names, VNET jails have their own.  A name is released
+when its socket is closed and has no permission checks, as on Linux.
+
+Before this, such addresses were looked up as an empty path and bind(2)
+and connect(2) failed with ENOENT.  Linux programs that use them (Envoy's
+hot restart, D-Bus, systemd notify, X11, gRPC unix-abstract:) failed
+under the Linuxulator.
+
+The table's mutex plays the role the vnode mutex plays for file system
+sockets in unp_connectat(), so a socket found in the table cannot go away
+before it is locked.  listen(2) and the rebind/chmod checks accept
+abstract-bound sockets.
+
+linux(4): keep embedded NULs of abstract names when translating
+addresses, stripping only the trailing padding of names passed with
+sizeof(struct sockaddr_un), and implement Linux autobind: bind(2) with
+only the address family picks a unique five-hex-digit abstract name.
+---
+ sys/compat/linux/linux.c        |  10 +-
+ sys/compat/linux/linux_socket.c |  29 ++++++
+ sys/kern/uipc_usrreq.c          | 157 +++++++++++++++++++++++++++++++-
+ sys/sys/unpcb.h                 |   1 +
+ 4 files changed, 191 insertions(+), 6 deletions(-)
+
+diff --git a/sys/compat/linux/linux.c b/sys/compat/linux/linux.c
+index 61b207070..019b96ad5 100644
+--- a/sys/compat/linux/linux.c
++++ b/sys/compat/linux/linux.c
+@@ -661,10 +661,14 @@ linux_to_bsd_sockaddr(const struct l_sockaddr *osa, struct sockaddr **sap,
+ 		name = ((struct sockaddr_un *)kosa)->sun_path;
+ 		if (*name == '\0') {
+ 			/*
+-			 * Linux abstract namespace starts with a NULL byte.
+-			 * XXX We do not support abstract namespace yet.
++			 * Linux abstract namespace starts with a NUL byte and
++			 * the name is all of the remaining bytes.  Linux's
++			 * sun_path is longer than ours, so a name padded to
++			 * sizeof(struct sockaddr_un) loses its trailing NULs.
+ 			 */
+-			namelen = strnlen(name + 1, salen - hdrlen - 1) + 1;
++			namelen = salen - hdrlen;
++			while (namelen > 1 && name[namelen - 1] == '\0')
++				namelen--;
+ 		} else
+ 			namelen = strnlen(name, salen - hdrlen);
+ 		salen = hdrlen + namelen;
+diff --git a/sys/compat/linux/linux_socket.c b/sys/compat/linux/linux_socket.c
+index 0e07b0a60..3a42c87ee 100644
+--- a/sys/compat/linux/linux_socket.c
++++ b/sys/compat/linux/linux_socket.c
+@@ -952,6 +952,30 @@ linux_socket(struct thread *td, struct linux_socket_args *args)
+ 	return (retval_socket);
+ }
+ 
++/*
++ * Linux binds an AF_UNIX socket given only the address family to a unique
++ * abstract name of five hex digits.
++ */
++static int
++linux_unix_autobind(struct thread *td, int s)
++{
++	static u_int ordernum;
++	struct sockaddr_un sun;
++	u_int tries;
++	int error;
++
++	error = EADDRINUSE;
++	for (tries = 0; tries <= 0xfffff && error == EADDRINUSE; tries++) {
++		memset(&sun, 0, sizeof(sun));
++		sun.sun_family = AF_UNIX;
++		snprintf(sun.sun_path + 1, sizeof(sun.sun_path) - 1, "%05x",
++		    atomic_fetchadd_int(&ordernum, 1) & 0xfffff);
++		sun.sun_len = offsetof(struct sockaddr_un, sun_path) + 6;
++		error = kern_bindat(td, AT_FDCWD, s, (struct sockaddr *)&sun);
++	}
++	return (error);
++}
++
+ int
+ linux_bind(struct thread *td, struct linux_bind_args *args)
+ {
+@@ -963,6 +987,11 @@ linux_bind(struct thread *td, struct linux_bind_args *args)
+ 	if (error != 0)
+ 		return (error);
+ 
++	if (sa->sa_family == AF_UNIX &&
++	    sa->sa_len == offsetof(struct sockaddr_un, sun_path)) {
++		free(sa, M_SONAME);
++		return (linux_unix_autobind(td, args->s));
++	}
+ 	error = kern_bindat(td, AT_FDCWD, args->s, sa);
+ 	free(sa, M_SONAME);
+ 
+diff --git a/sys/kern/uipc_usrreq.c b/sys/kern/uipc_usrreq.c
+index ccc02c98e..39cadebc5 100644
+--- a/sys/kern/uipc_usrreq.c
++++ b/sys/kern/uipc_usrreq.c
+@@ -65,6 +65,7 @@
+ #include <sys/fcntl.h>
+ #include <sys/file.h>
+ #include <sys/filedesc.h>
++#include <sys/hash.h>
+ #include <sys/jail.h>
+ #include <sys/kernel.h>
+ #include <sys/lock.h>
+@@ -563,6 +564,141 @@ uipc_attach(struct socket *so, int proto, struct thread *td)
+ 	return (0);
+ }
+ 
++/*
++ * Abstract socket addresses, as on Linux: a sun_path that starts with a NUL
++ * byte names a socket in a namespace that is not the file system.  The name
++ * is all sun_len - offsetof(sun_path) bytes, NULs included.  Linux scopes the
++ * namespace to the network namespace; here it is scoped to the VNET, so jails
++ * sharing a VNET share names.  A name is released when its socket is closed.
++ * There are no permission checks, as on Linux.
++ *
++ * unp_abs_mtx protects the table and plays the role the vnode mutex plays for
++ * file system sockets: a socket found under it cannot go away before
++ * unp_connectat() has locked it.
++ */
++struct unp_absent {
++	LIST_ENTRY(unp_absent)	ua_link;
++	struct vnet		*ua_vnet;
++	struct unpcb		*ua_unp;
++};
++#define	UNP_ABS_HASHSIZE	64
++static LIST_HEAD(, unp_absent) unp_abs_hash[UNP_ABS_HASHSIZE];
++static struct mtx unp_abs_mtx;
++MTX_SYSINIT(unp_abs, &unp_abs_mtx, "unp_abstract", MTX_DEF);
++
++static bool
++unp_is_abstract(const struct sockaddr_un *soun)
++{
++
++	return (soun->sun_len > offsetof(struct sockaddr_un, sun_path) &&
++	    soun->sun_path[0] == '\0');
++}
++
++static struct vnet *
++unp_abs_vnet(struct socket *so)
++{
++
++#ifdef VIMAGE
++	return (so->so_vnet);
++#else
++	return (NULL);
++#endif
++}
++
++static u_int
++unp_abs_bucket(struct vnet *vnet, const struct sockaddr_un *soun)
++{
++
++	return (hash32_buf(soun->sun_path,
++	    soun->sun_len - offsetof(struct sockaddr_un, sun_path),
++	    (uint32_t)(uintptr_t)vnet) & (UNP_ABS_HASHSIZE - 1));
++}
++
++static struct unpcb *
++unp_abs_lookup(struct vnet *vnet, const struct sockaddr_un *soun)
++{
++	struct unp_absent *ua;
++	const struct sockaddr_un *name;
++
++	mtx_assert(&unp_abs_mtx, MA_OWNED);
++	LIST_FOREACH(ua, &unp_abs_hash[unp_abs_bucket(vnet, soun)], ua_link) {
++		name = ua->ua_unp->unp_addr;
++		if (ua->ua_vnet == vnet && name->sun_len == soun->sun_len &&
++		    memcmp(name->sun_path, soun->sun_path, soun->sun_len -
++		    offsetof(struct sockaddr_un, sun_path)) == 0)
++			return (ua->ua_unp);
++	}
++	return (NULL);
++}
++
++/*
++ * Called by uipc_bindat() with UNP_BINDING set.
++ */
++static int
++unp_abs_bind(struct socket *so, struct unpcb *unp, struct sockaddr *nam)
++{
++	struct sockaddr_un *soun;
++	struct unp_absent *ua;
++	struct vnet *vnet;
++	int error;
++
++	vnet = unp_abs_vnet(so);
++	soun = (struct sockaddr_un *)sodupsockaddr(nam, M_WAITOK);
++	ua = malloc(sizeof(*ua), M_PCB, M_WAITOK);
++	ua->ua_vnet = vnet;
++	ua->ua_unp = unp;
++	error = 0;
++	mtx_lock(&unp_abs_mtx);
++	if (unp_abs_lookup(vnet, soun) != NULL)
++		error = EADDRINUSE;
++	else {
++		UNP_PCB_LOCK(unp);
++		unp->unp_addr = soun;
++		unp->unp_flags |= UNP_ABSTRACT;
++		unp->unp_flags &= ~UNP_BINDING;
++		UNP_PCB_UNLOCK(unp);
++		LIST_INSERT_HEAD(&unp_abs_hash[unp_abs_bucket(vnet, soun)], ua,
++		    ua_link);
++	}
++	mtx_unlock(&unp_abs_mtx);
++	if (error != 0) {
++		free(soun, M_SONAME);
++		free(ua, M_PCB);
++		UNP_PCB_LOCK(unp);
++		unp->unp_flags &= ~UNP_BINDING;
++		UNP_PCB_UNLOCK(unp);
++	}
++	return (error);
++}
++
++/*
++ * Release the socket's abstract name, if it has one.  The address itself
++ * stays in unp_addr for getsockname() until the socket is freed.
++ */
++static void
++unp_abs_release(struct socket *so, struct unpcb *unp)
++{
++	struct unp_absent *ua;
++
++	UNP_PCB_UNLOCK_ASSERT(unp);
++	ua = NULL;
++	mtx_lock(&unp_abs_mtx);
++	if ((unp->unp_flags & UNP_ABSTRACT) != 0) {
++		LIST_FOREACH(ua, &unp_abs_hash[unp_abs_bucket(unp_abs_vnet(so),
++		    unp->unp_addr)], ua_link) {
++			if (ua->ua_unp == unp)
++				break;
++		}
++		KASSERT(ua != NULL, ("%s: unp %p not in table", __func__, unp));
++		LIST_REMOVE(ua, ua_link);
++		UNP_PCB_LOCK(unp);
++		unp->unp_flags &= ~UNP_ABSTRACT;
++		UNP_PCB_UNLOCK(unp);
++	}
++	mtx_unlock(&unp_abs_mtx);
++	free(ua, M_PCB);
++}
++
+ static int
+ uipc_bindat(int fd, struct socket *so, struct sockaddr *nam, struct thread *td)
+ {
+@@ -599,7 +735,7 @@ uipc_bindat(int fd, struct socket *so, struct sockaddr *nam, struct thread *td)
+ 	 * implementation and avoids a great many possible failure modes.
+ 	 */
+ 	UNP_PCB_LOCK(unp);
+-	if (unp->unp_vnode != NULL) {
++	if (unp->unp_vnode != NULL || (unp->unp_flags & UNP_ABSTRACT) != 0) {
+ 		UNP_PCB_UNLOCK(unp);
+ 		return (EINVAL);
+ 	}
+@@ -611,6 +747,9 @@ uipc_bindat(int fd, struct socket *so, struct sockaddr *nam, struct thread *td)
+ 	mode = unp->unp_mode & ~td->td_proc->p_pd->pd_cmask;
+ 	UNP_PCB_UNLOCK(unp);
+ 
++	if (unp_is_abstract(soun))
++		return (unp_abs_bind(so, unp, nam));
++
+ 	buf = malloc(namelen + 1, M_TEMP, M_WAITOK);
+ 	bcopy(soun->sun_path, buf, namelen);
+ 	buf[namelen] = 0;
+@@ -729,6 +868,7 @@ uipc_close(struct socket *so)
+ 	unp = sotounpcb(so);
+ 	KASSERT(unp != NULL, ("uipc_close: unp == NULL"));
+ 
++	unp_abs_release(so, unp);
+ 	vplock = NULL;
+ 	if ((vp = unp->unp_vnode) != NULL) {
+ 		vplock = mtx_pool_find(unp_vp_mtxpool, vp);
+@@ -766,7 +906,8 @@ uipc_chmod(struct socket *so, mode_t mode, struct ucred *cred __unused,
+ 	error = 0;
+ 	unp = sotounpcb(so);
+ 	UNP_PCB_LOCK(unp);
+-	if (unp->unp_vnode != NULL || (unp->unp_flags & UNP_BINDING) != 0)
++	if (unp->unp_vnode != NULL ||
++	    (unp->unp_flags & (UNP_BINDING | UNP_ABSTRACT)) != 0)
+ 		error = EINVAL;
+ 	else
+ 		unp->unp_mode = mode;
+@@ -825,6 +966,7 @@ uipc_detach(struct socket *so)
+ 	UNP_LINK_WUNLOCK();
+ 
+ 	UNP_PCB_UNLOCK_ASSERT(unp);
++	unp_abs_release(so, unp);
+  restart:
+ 	if ((vp = unp->unp_vnode) != NULL) {
+ 		vplock = mtx_pool_find(unp_vp_mtxpool, vp);
+@@ -935,7 +1077,8 @@ uipc_listen(struct socket *so, int backlog, struct thread *td)
+ 	UNP_PCB_LOCK(unp);
+ 	if (unp->unp_conn != NULL || (unp->unp_flags & UNP_CONNECTING) != 0)
+ 		error = EINVAL;
+-	else if (unp->unp_vnode == NULL)
++	else if (unp->unp_vnode == NULL &&
++	    (unp->unp_flags & UNP_ABSTRACT) == 0)
+ 		error = EDESTADDRREQ;
+ 	if (error != 0) {
+ 		UNP_PCB_UNLOCK(unp);
+@@ -2953,6 +3096,13 @@ unp_connectat(int fd, struct socket *so, struct sockaddr *nam,
+ 		sa = malloc(sizeof(struct sockaddr_un), M_SONAME, M_WAITOK);
+ 	else
+ 		sa = NULL;
++	if (unp_is_abstract(soun)) {
++		vp = NULL;
++		vplock = &unp_abs_mtx;
++		mtx_lock(vplock);
++		unp2 = unp_abs_lookup(unp_abs_vnet(so), soun);
++		goto found;
++	}
+ 	NDINIT_ATRIGHTS(&nd, LOOKUP, FOLLOW | LOCKSHARED | LOCKLEAF,
+ 	    UIO_SYSSPACE, buf, fd, cap_rights_init_one(&rights, CAP_CONNECTAT));
+ 	error = namei(&nd);
+@@ -2984,6 +3134,7 @@ unp_connectat(int fd, struct socket *so, struct sockaddr *nam,
+ 	vplock = mtx_pool_find(unp_vp_mtxpool, vp);
+ 	mtx_lock(vplock);
+ 	VOP_UNP_CONNECT(vp, &unp2);
++found:
+ 	if (unp2 == NULL) {
+ 		error = ECONNREFUSED;
+ 		goto bad2;
+diff --git a/sys/sys/unpcb.h b/sys/sys/unpcb.h
+index 87611fd9a..d4975a4f4 100644
+--- a/sys/sys/unpcb.h
++++ b/sys/sys/unpcb.h
+@@ -118,6 +118,7 @@ struct unpcb {
+ #define	UNP_CONNECTING			0x010	/* Currently connecting. */
+ #define	UNP_BINDING			0x020	/* Currently binding. */
+ #define	UNP_WAITING			0x040	/* Peer state is changing. */
++#define	UNP_ABSTRACT			0x080	/* Bound to an abstract address. */
+ 
+ /*
+  * Flags in unp_gcflag.
+-- 
+2.54.0 (Apple Git-157)
+

@@ -23,23 +23,23 @@ RuntimeClass `linux`. This included the Envoy proxies, which the controller crea
 
     runtimeClassName=linux (linux-only image: envoyproxy/gateway:v1.10.0)
 
-## The one blocker: abstract Unix sockets
+## The one blocker: abstract Unix sockets (fixed 2026-11-17)
 
 Envoy crash-looped with:
 
     unable to bind domain socket with base_id=0, id=0, errno=2 (see --base-id option)
 
 Envoy's hot restart uses Linux **abstract-namespace** Unix sockets: `sun_path` starts with NUL and has no
-filesystem entry. FreeBSD has no abstract namespace, so the Linuxulator treats the name as a path and gets ENOENT.
-Hot restart is useless in Kubernetes, where pods are replaced rather than hot-restarted, and it can be disabled
-through Envoy Gateway's own API without touching the manifest:
+filesystem entry. FreeBSD had no abstract namespace, so the Linuxulator treated the name as a path and got ENOENT.
+
+~~**Workaround:** `extraArgs: ["--disable-hot-restart"]` in the EnvoyProxy.~~ No longer needed. The EnvoyProxy is
+now just:
 
 ```yaml
 apiVersion: gateway.envoyproxy.io/v1alpha1
 kind: EnvoyProxy
 metadata: {name: bsd, namespace: envoy-gateway-system}
 spec:
-  extraArgs: ["--disable-hot-restart"]
   provider: {type: Kubernetes, kubernetes: {envoyService: {type: NodePort}}}   # no LoadBalancer on bare metal
 ```
 
@@ -47,11 +47,47 @@ The GatewayClass's `parametersRef` points at it. `NodePort` is only there becaus
 implementation. With the default `LoadBalancer` type, traffic worked the same and the Gateway reported "No
 addresses have been assigned", as on bare-metal Linux without MetalLB.
 
-**Should the kernel support abstract sockets?** Other users: D-Bus, systemd notify, X11, Chromium, gRPC's
-`unix-abstract:` scheme. It would need a per-vnet name table in the Unix-domain socket layer (`uipc_usrreq.c`)
-for bind/connect/getsockname, plus Linuxulator sockaddr translation. Linux scopes the names to the network
-namespace, which here is the pod's vnet. That's a real kernel feature, not a shim. It's deferred until a workload
-needs it without a switch.
+### The kernel fix: abstract socket addresses
+
+Kernel `bsdk8s/linux-abstract-unix-15.1`, patch freebsd-src/0017; both nodes boot `kernel.bsdk8s12`. It is done
+in the Unix-domain socket layer, not as a Linuxulator shim, so native FreeBSD programs get the same behavior:
+
+- **Names.** A `sun_path` starting with NUL is looked up in a table in `uipc_usrreq.c`, not in the file system. The
+  name is all `sun_len - offsetof(sun_path)` bytes, NULs included. `bind` on a taken name gives EADDRINUSE; the name
+  is released when the socket is closed; there are no permission checks. All of this is as on Linux.
+- **Scope.** Names are per **VNET**, the counterpart of Linux's per-network-namespace scope. Containers of one pod
+  share the pod's VNET, so they see each other's names; other pods and the host don't.
+- **Locking.** The table's mutex plays the role the vnode mutex plays for file-system sockets in
+  `unp_connectat()`, so a socket found in the table can't be freed before it is locked.
+- **Linuxulator.** Address translation keeps embedded NULs and strips only the padding of names passed with
+  Linux's longer `sizeof(struct sockaddr_un)`. Linux **autobind** (`bind` with only the family) picks a unique
+  five-hex-digit name.
+
+Verified with a static Linux Go test (`abstest`), on the host and in pods:
+
+| Check | Before (bsdk8s11) | After (bsdk8s12) |
+|---|---|---|
+| `net.Listen("unix", "@name")`, dial, data, `LocalAddr`/`RemoteAddr` | bind: ENOENT | pass |
+| second bind of the same name | - | EADDRINUSE |
+| dial after the listener closes; rebind | - | ECONNREFUSED; rebind works |
+| `SOCK_DGRAM` sendto/recvfrom, sender address | bind: ENOENT | pass |
+| names that differ after an embedded NUL; `getsockname` length | ENOENT | distinct; length 6 for `"\0a\0b"` |
+| 110-byte padded bind, exact-length connect | ENOENT | pass |
+| autobind (`addrlen` 2) | EINVAL | `"\0" + 5 hex`, length 8 |
+| file-system Unix sockets | pass | pass |
+| host vs. non-VNET jail vs. VNET jail (same name) | - | shared, shared, separate |
+| container → container in one pod; pod → other pod; host → pod | - | pong; ECONNREFUSED; ECONNREFUSED |
+| 8 dialers x 200 against a listener restarted every 50 ms | - | no panic; only ECONNREFUSED while unbound |
+
+**Envoy with hot restart on:** with `extraArgs` removed, the new Envoy pod starts without the `base_id` error, holds
+its four hot-restart datagram sockets, and the Gateway returns 200 over HTTP and HTTPS through both node IPs.
+`sockstat` prints these sockets' local address as empty, because it prints `sun_path` as a C string.
+
+**Not done:**
+- **FreeBSD main.** main has reworked `unp_connectat()` into `unp_connectat_peer()`/`unp_vnode_peer()`, so the
+  15.1 patch doesn't cherry-pick. A main version needs its own port and a main kernel to test it on.
+- **Other Linux behavior.** Linux also autobinds on `connect`/`sendto` with `SO_PASSCRED`; that isn't done.
+  `getsockname` on an unbound socket still returns length 16, where Linux returns 2.
 
 ## Linuxulator noise (non-fatal)
 

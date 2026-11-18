@@ -1,0 +1,58 @@
+From 909e1df865d2fbb4329d1149829219bcfb6962e4 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 23:02:02 -0700
+Subject: [PATCH] pf: accept unfinished offloaded checksums when sending a
+ reset
+
+A TCP packet sent by this host, or by a VNET jail on it over an epair,
+with the checksum left to offload carries CSUM_IP_TCP (CSUM_IP6_TCP) and
+only the pseudo-header sum in th_sum. pf_check_proto_cksum() computed the
+checksum in software, found it wrong and counted proto-cksum, so a
+"block return" rule matching it sent no RST: a jail connecting to a
+rejected address waited for the connect timeout instead of failing at
+once. tcp_input() and udp_input() accept such packets ("Packet from
+local host (maybe from a VM)"); do the same.
+
+Seen with Kubernetes pods (VNET jails) connecting to a Service without
+endpoints, which kube-proxy rejects with block return.
+---
+ sys/netpfil/pf/pf.c | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/sys/netpfil/pf/pf.c b/sys/netpfil/pf/pf.c
+index 7aee28e7b..412258912 100644
+--- a/sys/netpfil/pf/pf.c
++++ b/sys/netpfil/pf/pf.c
+@@ -9735,6 +9735,14 @@ pf_check_proto_cksum(struct mbuf *m, int off, int len, u_int8_t p, sa_family_t a
+ 			}
+ 			sum ^= 0xffff;
+ 			++hw_assist;
++		} else if (m->m_pkthdr.csum_flags & (CSUM_IP_TCP | CSUM_IP6_TCP)) {
++			/*
++			 * Sent by this host or a VNET jail on it with the
++			 * checksum left to offload, as tcp_input() and
++			 * udp_input() accept: the checksum field isn't
++			 * filled in yet.
++			 */
++			++hw_assist;
+ 		}
+ 		break;
+ 	case IPPROTO_UDP:
+@@ -9749,6 +9757,14 @@ pf_check_proto_cksum(struct mbuf *m, int off, int len, u_int8_t p, sa_family_t a
+ 			}
+ 			sum ^= 0xffff;
+ 			++hw_assist;
++		} else if (m->m_pkthdr.csum_flags & (CSUM_IP_UDP | CSUM_IP6_UDP)) {
++			/*
++			 * Sent by this host or a VNET jail on it with the
++			 * checksum left to offload, as tcp_input() and
++			 * udp_input() accept: the checksum field isn't
++			 * filled in yet.
++			 */
++			++hw_assist;
+ 		}
+ 		break;
+ 	case IPPROTO_ICMP:
+-- 
+2.54.0 (Apple Git-157)
+

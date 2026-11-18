@@ -89,6 +89,13 @@ its four hot-restart datagram sockets, and the Gateway returns 200 over HTTP and
 - **Other Linux behavior.** Linux also autobinds on `connect`/`sendto` with `SO_PASSCRED`; that isn't done.
   `getsockname` on an unbound socket still returns length 16, where Linux returns 2.
 
+## Graceful shutdown (fixed 2026-11-17)
+
+Envoy Gateway's preStop hook panicked on `open /proc/1/fd/1`, so Envoy never drained and each Envoy pod deletion
+took the full 360 s grace period. It's fixed in the kernel (research/18): deletion now takes 12 s and the drain runs.
+With one replica, expect a gap of a few seconds during a delete, between the draining Envoy failing readiness and the
+new one passing it. Use `replicas >= 2` for zero-downtime rollouts.
+
 ## Linuxulator noise (non-fatal)
 
 | Message | Meaning |

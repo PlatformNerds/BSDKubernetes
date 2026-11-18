@@ -1,0 +1,57 @@
+# bsd-netpol: NetworkPolicy enforcement with pf on FreeBSD nodes (research/22).
+# Needs `anchor "kube-np/*"` in each node's pf.conf, before kube-proxy's `anchor "cni-rdr/*"`.
+# Usage: sed "s|\${IMAGE}|localhost/bsd-netpol:dev|" bsd-netpol.yaml | kubectl apply -f -
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: bsd-netpol, namespace: kube-system}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: bsd-netpol}
+rules:
+- apiGroups: [""]
+  resources: [pods, namespaces]
+  verbs: [get, list, watch]
+- apiGroups: [networking.k8s.io]
+  resources: [networkpolicies]
+  verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: bsd-netpol}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: bsd-netpol}
+subjects:
+- {kind: ServiceAccount, name: bsd-netpol, namespace: kube-system}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: bsd-netpol
+  namespace: kube-system
+  labels: {app: bsd-netpol}
+spec:
+  selector:
+    matchLabels: {app: bsd-netpol}
+  updateStrategy:
+    rollingUpdate: {maxUnavailable: 1}
+  template:
+    metadata:
+      labels: {app: bsd-netpol}
+    spec:
+      serviceAccountName: bsd-netpol
+      priorityClassName: system-node-critical
+      # pf is the host's: host network, and privileged so CRI-O gives the jail allow.pf.
+      hostNetwork: true
+      nodeSelector: {kubernetes.io/os: freebsd}
+      tolerations:
+      - operator: Exists
+      containers:
+      - name: bsd-netpol
+        image: ${IMAGE}
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: NODE_NAME
+          valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+        securityContext: {privileged: true}
+        resources:
+          requests: {cpu: 10m, memory: 32Mi}

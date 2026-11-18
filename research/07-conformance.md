@@ -20,7 +20,8 @@ Raw results: [`conformance/`](../conformance/) (gzipped JUnit + failure lists).*
 | run 9 (2 nodes, node 2 froze mid-run) | 420 / 446 | 94.2% | | 1h50m |
 | run 10 (2 nodes, regression check) | 425 / 446 | 95.3% | 394 / 400 = 98.5% | 58m |
 | run 11 (2 nodes, node 2 froze, 1h suite timeout) | 414 / 426 run | | | 1h |
-| **run 12 (2 nodes)** | **435 / 446** | **97.5%** | **394 / 400 = 98.5%** | 56m |
+| run 12 (2 nodes) | 435 / 446 | 97.5% | 394 / 400 = 98.5% | 56m |
+| **run 13 (2 nodes)** | **437 / 446** | **98.0%** | **394 / 400 = 98.5%** | 54m |
 
 Run 2 fixed 34 tests and regressed none. Run 3 (after the kube-proxy session-affinity fix and ocijail file mounts below devfs) fixed 8 more, again with no regressions. The only remaining non-`[LinuxOnly]` failures are in-place pod resize (6) and the two-node requirement (2).
 
@@ -77,6 +78,45 @@ pod-network setup", no panic) and run 9's freeze fit the same pattern.
   - the privileged dummy-device test (Linux netlink);
   - read-only rootfs (error wording);
   - ImageVolume (not implemented in CRI-O on FreeBSD).
+
+## After run 12: test images and image volumes (2026-11-18)
+
+Three of the five `[LinuxOnly]` failures were worth reopening.
+
+**Read-only rootfs: the busybox image held the wrong BusyBox.** The image is tagged `busybox:1.37.0-1`, but it
+contained the FreeBSD package, BusyBox 1.38.0. In 1.38, ash prefixes `sh -c` errors with the line number
+(`/bin/sh: line 0: can't create /file: ...`); 1.37 prints `/bin/sh: can't create /file: ...`, which the test
+expects. `scripts/busybox-freebsd/build.sh` builds 1.37.0 from the FreeBSD port's recipe at its last 1.37.0 commit,
+and the image script takes it as `BUSYBOX=` (it warns when the binary's version doesn't match the tag).
+Two lessons:
+- Applet sets differ between releases (1.37 lacks `vmstat`, `uuidgen`, `sha384sum`, `ssl_server`), so the image has
+  to be rebuilt from the script, not patched with a new binary.
+- Build with the ports framework's CFLAGS and `BB_GLOBAL_CONST=''`. With plain `-O2`, 1.37.0's `awk` crashed on
+  every program on arm64, which broke the PreStop and "container that exits" conformance tests in a sig-node rerun
+  (95/106). With the flags, both pass again.
+
+**sample-apiserver: build the images.** The aggregator test deploys `sample-apiserver:1.29.2` and
+`registry.k8s.io/etcd:3.6.8-0`, which have no FreeBSD variants. FreeBSD builds from the same sources
+(`k8s.io/sample-apiserver` v0.29.2, the tag that image was built from according to the history of
+`test/images/sample-apiserver`; etcd v3.6.8) pass it unchanged in 34 s (`SAMPLE_APISERVER=`/`ETCD=` in
+`scripts/build-e2e-images-freebsd.sh`).
+
+**ImageVolume: implemented, but the test checks for Alpine.** CRI-O had no FreeBSD image-volume code (a literal
+`TODO`). Patch `cri-o/0019` mounts the image read-only from containers/storage and gives the jail a read-only nullfs
+mount of it (`ro,noexec,nosuid`), with `subPath` resolved inside the image. The test also uses `pullPolicy: Always`,
+which goes to registry.k8s.io, where kitten has no FreeBSD image. So the nodes now use a registry mirror for
+`registry.k8s.io/e2e-test-images`: `docker-registry` on node 1, filled by `scripts/e2e-image-mirror.sh` with indexes
+holding our `freebsd/arm64` build and upstream's `linux/arm64` image. FreeBSD pods get the FreeBSD build, and
+`linux`-handler pods still get upstream's. With both, the test's pod pulls, starts and reads `data.json` from the
+volume. It then fails on `cat /volume/etc/os-release` expecting `Alpine Linux`: the volume is the FreeBSD variant,
+the platform a FreeBSD node selects. That check is Linux-specific, so the test stays `[LinuxOnly]`-red.
+
+Still red, for reasons that hold: sysctls (Linux `kernel.*` names) and the privileged dummy-device test (busybox
+`ip`, Linux rtnetlink code the FreeBSD port leaves out).
+
+**Run 13** (all of the above, `kernel.bsdk8s18`): **437/446 (98.0%)**, no regressions, no freeze. The 9 failures:
+the 6 in-place resize tests (research/17) and 3 `[LinuxOnly]` (ImageVolume's Alpine check, sysctls, dummy device).
+Excluding `[LinuxOnly]` the count is unchanged at 394/400; the two new passes are both `[LinuxOnly]` tests.
 
 ## Run 9: 420/446, no regressions, but node 2 froze once (2026-11-17)
 

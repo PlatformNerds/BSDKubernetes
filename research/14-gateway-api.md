@@ -81,13 +81,18 @@ Verified with a static Linux Go test (`abstest`), on the host and in pods:
 
 **Envoy with hot restart on:** with `extraArgs` removed, the new Envoy pod starts without the `base_id` error, holds
 its four hot-restart datagram sockets, and the Gateway returns 200 over HTTP and HTTPS through both node IPs.
-`sockstat` prints these sockets' local address as empty, because it prints `sun_path` as a C string.
+~~`sockstat` prints these sockets' local address as empty, because it prints `sun_path` as a C string.~~ Fixed
+(patch freebsd-src/0020, installed on both nodes; the original is kept as `/usr/bin/sockstat.orig`): it now shows
+`@envoy_domain_socket_…`, as Linux `ss` does.
 
 **Not done:**
 - **FreeBSD main.** main has reworked `unp_connectat()` into `unp_connectat_peer()`/`unp_vnode_peer()`, so the
   15.1 patch doesn't cherry-pick. A main version needs its own port and a main kernel to test it on.
 - **Other Linux behavior.** Linux also autobinds on `connect`/`sendto` with `SO_PASSCRED`; that isn't done.
-  `getsockname` on an unbound socket still returns length 16, where Linux returns 2.
+- ~~`getsockname` on an unbound socket returns length 16, where Linux returns 2.~~ **Fixed (kernel `bsdk8s14`,
+  patch freebsd-src/0019).** Unnamed addresses now have Linux's lengths: 2 from `getsockname`/`getpeername`/`accept`,
+  0 from `recvfrom`/`recvmsg`. Before, Python's `getsockname()` returned 14 NUL bytes instead of `''`. `abstest`
+  checks all three cases.
 
 ## Graceful shutdown (fixed 2026-11-17)
 

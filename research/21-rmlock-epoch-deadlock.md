@@ -62,7 +62,28 @@ traffic. FreeBSD main has the same code.
 readers remain, and epoch waiters go back to ck_epoch's scan. rwlock unlocks use the same broadcast + unpend
 pattern. Both nodes boot `kernel.bsdk8s18` (= `bsdk8s17` + this). The main twin builds on the main test rig.
 
-**Not reproduced on demand.** A synthetic stress on a drained node (8 epair create/destroy loops, flood pings
-through pf on lo0, pf anchor loads, `pfctl -sr`, 8 CPU hogs; `scripts/kdebug/rmstress*.sh`) ran 30 minutes on the
-unfixed kernel without hanging. The real trigger probably also needs the VNET jail lifecycle. The fix rests on
-the post-mortem above; full conformance runs on `bsdk8s18` are the ongoing check.
+## Reproducing it deterministically
+
+A system-level stress didn't hit the window: on a drained node, 8 epair create/destroy loops, flood pings through
+pf on lo0, pf anchor loads, `pfctl -sr` and 8 CPU hogs (`scripts/kdebug/rmstress*.sh`) ran 30 minutes on the
+unfixed kernel without hanging.
+
+A small kernel module does hit it every time: `scripts/kdebug/rmepoch/rmepoch_test.c`, run with
+`sysctl debug.rmepoch_test.run=1`. It builds the exact pattern with its own rmlock and preemptible epoch:
+
+1. A kernel thread takes a tracked read lock and spins.
+2. A second thread enters the epoch and calls `rm_wlock()`. The test waits until it's on a turnstile.
+3. Two threads call `epoch_wait_preempt()`. The test waits until both are on a turnstile too.
+4. The reader unlocks.
+
+| Kernel | Result (5 runs each, node 2) |
+|---|---|
+| `bsdk8s17` (unfixed) | 5 × `STUCK: writer done, 0 of 2 epoch waiters finished 3s after the last reader left` |
+| `bsdk8s18` (patch 0032) | 5 × `ok: writer and 2 epoch waiters finished` |
+
+The stuck state matches the post-mortem exactly: the writer was woken and finished, and both epoch waiters stayed
+asleep on the rmlock's turnstile. To clean up after a stuck run, the module does what the fix does, a
+`turnstile_broadcast()` on that turnstile. The waiters then finish, which shows that a missing wakeup was all
+that held them, and the module unloads.
+
+Conformance run 12 (`bsdk8s18`, research/07) ran the full suite without a freeze.

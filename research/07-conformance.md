@@ -67,8 +67,10 @@ pod churn creates and destroys epairs (research/21, freebsd-src 0032). Run 6's n
 pod-network setup", no panic) and run 9's freeze fit the same pattern.
 
 **Run 12** (`kernel.bsdk8s18` with the rmlock fix; `--timeout=3h`): **435/446 (97.5%)**. No freeze.
-- **The 6 non-`[LinuxOnly]` failures are in-place resize.** Resize works (research/06), but the tests verify it with
-  `mount -t cgroup2`, Linux cgroup files and `/proc/1/oom_score_adj` inside the container.
+- **The 6 non-`[LinuxOnly]` failures are in-place resize.** Resize works (research/06). The tests hard-code
+  `spec.os.name: linux`, so their pods run under the `linux` handler. On this cluster the busybox tag is the
+  FreeBSD build, and CRI-O refuses it (`... is a freebsd image, but runtime handler "linux" runs linux images`).
+  Even with a Linux busybox they would check `cpu.weight`, which FreeBSD can't enforce (research/17).
 - **The 5 `[LinuxOnly]` failures:**
   - sample-apiserver (Linux image);
   - sysctls (Linux `kernel.*` names);

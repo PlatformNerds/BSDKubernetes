@@ -12,8 +12,25 @@
 #     <k8s-src>         kubernetes source tree (for test/images/* assets)
 #     <agnhost-binary>  FreeBSD build of test/images/agnhost for this host's arch
 #     <nnp-binary>      FreeBSD build of test/images/nonewprivs (optional)
+#   Environment:
+#     BUSYBOX=<binary>  BusyBox for the busybox and nonroot images, built by
+#                       scripts/busybox-freebsd/build.sh at the version the busybox tag names
+#                       (tests compare its messages; the FreeBSD package may be a newer
+#                       release). Without it the package is used, with a warning on a mismatch.
+#     SAMPLE_APISERVER=<binary>, ETCD=<binary>
+#                       FreeBSD builds for the aggregator test's sample-apiserver Deployment. Use
+#                       the sources upstream's images were built from: sample-apiserver tag 1.29.2
+#                       is k8s.io/sample-apiserver v0.29.2 (git history of
+#                       test/images/sample-apiserver), etcd 3.6.8-0 is etcd v3.6.8:
+#                         (sample-apiserver) go mod tidy && GOOS=freebsd CGO_ENABLED=0 go build .
+#                         (etcd/server)      GOOS=freebsd CGO_ENABLED=0 go build -o etcd .
+#                       Images are only built when these are set.
+#     ONLY="<names>"    build only these images (agnhost kitten nautilus busybox nonroot
+#                       glibc-dns-testing nonewprivs nginx sample-apiserver etcd pause)
 set -eu
 src=$(cd "$1" && pwd); agnhost=$2; nnp=${3:-}
+busybox=${BUSYBOX:-}; sampleapiserver=${SAMPLE_APISERVER:-}; etcd=${ETCD:-}
+want() { [ -z "${ONLY:-}" ] && return 0; case " $ONLY " in *" $1 "*) return 0;; esac; return 1; }
 img=$src/test/images
 reg=registry.k8s.io/e2e-test-images
 rel=$(freebsd-version -u | sed 's/-p[0-9]*$//')
@@ -81,6 +98,7 @@ commit() {
 }
 
 # --- agnhost: test/images/agnhost/Dockerfile (alpine + network tools + /agnhost) -------------
+if want agnhost; then
 new "$base"
 pkgs curl bash bind-tools iperf iperf3 busybox
 hostbin /usr/bin/nc /usr/bin/getent   # e2e runs `nc -v -t -w 2` (OpenBSD nc, like netcat-openbsd)
@@ -94,10 +112,12 @@ pw -R "$m" useradd -n user-defined-in-image -u 1000 -G group-defined-in-image -s
 buildah config --entrypoint '["/agnhost"]' --cmd pause --port 80 --port 8080 --port 8081 --port 9376 --port 5000 "$c"
 commit "$reg/agnhost:$(mtag Agnhost)" "$reg/agnhost:$(mtag AgnhostPrev)"
 echo "built agnhost"
+fi
 
 # --- kitten / nautilus: agnhost + html + test-webserver --------------------------------------
 for k in Kitten Nautilus; do
   d=$(echo $k | tr A-Z a-z)
+  want $d || continue
   new "$reg/agnhost:$(mtag Agnhost)"
   cp "$img/$d/html/"* "$m/"
   buildah config --cmd test-webserver "$c"
@@ -106,8 +126,22 @@ for k in Kitten Nautilus; do
 done
 
 # --- busybox: FreeBSD runtime base + busybox applets (wget, nslookup, ... missing from base) --
+if want busybox; then
 new "$base"
-pkgs busybox
+if [ -n "$busybox" ]; then
+  mkdir -p "$m/usr/local/bin"
+  install -m 755 "$busybox" "$m/usr/local/bin/busybox"
+else
+  pkgs busybox
+fi
+# The tag names the BusyBox release (1.37.0-1 -> 1.37.0), and tests compare its messages: 1.38
+# prefixes `sh -c` errors with "line 0:", which upstream's 1.37.0 image doesn't.
+bbver=$(chroot "$m" /usr/local/bin/busybox | sed -n '1s/^BusyBox v\([0-9.]*\).*/\1/p')
+case "$(mtag BusyBox)" in
+  "$bbver"|"$bbver"-*) ;;
+  *) echo "WARNING: busybox image $(mtag BusyBox) contains BusyBox $bbver;" \
+       "build the matching release with scripts/busybox-freebsd/build.sh and pass BUSYBOX=" ;;
+esac
 # Upstream's busybox image *is* busybox: make its applets win over FreeBSD's (tests compare e.g.
 # busybox sh error text "can't create"), then fill the rest.
 for a in $(chroot "$m" /usr/local/bin/busybox --list); do
@@ -116,24 +150,29 @@ done
 bbfill
 buildah config --cmd sh "$c"
 commit "$reg/busybox:$(mtag BusyBox)"
-echo "built busybox"
+echo "built busybox (BusyBox $bbver)"
+fi
 
 # --- nonroot: busybox + USER 1234 -----------------------------------------------------------
+if want nonroot; then
 new "$reg/busybox:$(mtag BusyBox)"
 buildah config --user 1234 "$c"
 commit "$reg/nonroot:$(mtag NonRoot)"
 echo "built nonroot"
+fi
 
 # --- glibc-dns-testing (formerly jessie-dnsutils): dig/host/nslookup + getent + nc ----------
+if want glibc-dns-testing; then
 new "$base"
 pkgs bind-tools busybox
 hostbin /usr/bin/getent /usr/bin/nc
 bbfill
 commit "$reg/glibc-dns-testing:$(mtag GlibcDnsTesting)"
 echo "built glibc-dns-testing"
+fi
 
 # --- nonewprivs: setuid nnp helper on busybox --------------------------------------------------
-if [ -n "$nnp" ]; then
+if [ -n "$nnp" ] && want nonewprivs; then
   new "$reg/busybox:$(mtag BusyBox)"
   install -m 4755 "$nnp" "$m/usr/local/bin/nnp"
   buildah config --cmd nnp "$c"
@@ -153,6 +192,7 @@ if [ -n "$nnp" ]; then
 fi
 
 # --- nginx (both versions conformance uses) --------------------------------------------------
+if want nginx; then
 new "$base"
 pkgs nginx
 # the package's post-install script creates this symlink; `pkg -r` into an image root doesn't
@@ -160,9 +200,29 @@ pkgs nginx
 buildah config --entrypoint '["/usr/local/sbin/nginx", "-g", "daemon off;"]' --cmd '' --port 80 "$c"
 commit "$reg/nginx:$(mtag NginxNew)" "$reg/nginx:$(mtag Nginx)"
 echo "built nginx"
+fi
+
+# --- sample-apiserver + etcd: the aggregator test's Deployment (test/e2e/apimachinery) --------
+# The test runs `/usr/local/bin/etcd` in the etcd container and the image entrypoint
+# (/sample-apiserver) in the other, like upstream's images.
+if [ -n "$sampleapiserver" ] && want sample-apiserver; then
+  new "$base"
+  install -m 755 "$sampleapiserver" "$m/sample-apiserver"
+  buildah config --entrypoint '["/sample-apiserver"]' --cmd '' "$c"
+  commit "$reg/sample-apiserver:$(mtag APIServer)"
+  echo "built sample-apiserver"
+fi
+if [ -n "$etcd" ] && want etcd; then
+  new "$base"
+  mkdir -p "$m/usr/local/bin"
+  install -m 755 "$etcd" "$m/usr/local/bin/etcd"
+  buildah config --cmd /usr/local/bin/etcd "$c"
+  commit "registry.k8s.io/etcd:$(mtag Etcd)"
+  echo "built etcd"
+fi
 
 # --- pause: reuse the control-plane pause image (scripts/build-images-freebsd.sh) -------------
-if buildah inspect --type image ghcr.io/platformnerds/pause:3.10.2 >/dev/null 2>&1; then
+if want pause && buildah inspect --type image ghcr.io/platformnerds/pause:3.10.2 >/dev/null 2>&1; then
   buildah tag ghcr.io/platformnerds/pause:3.10.2 registry.k8s.io/pause:$(mtag Pause)
   echo "tagged pause"
 fi

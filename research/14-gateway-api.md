@@ -98,8 +98,10 @@ its four hot-restart datagram sockets, and the Gateway returns 200 over HTTP and
 
 Envoy Gateway's preStop hook panicked on `open /proc/1/fd/1`, so Envoy never drained and each Envoy pod deletion
 took the full 360 s grace period. It's fixed in the kernel (research/18): deletion now takes 12 s and the drain runs.
-With one replica, expect a gap of a few seconds during a delete, between the draining Envoy failing readiness and the
-new one passing it. Use `replicas >= 2` for zero-downtime rollouts.
+With one replica there was a gap during a delete: 26 of 80 requests per node IP failed, between the draining Envoy
+failing readiness and the new one passing it. The demo EnvoyProxy now sets
+`provider.kubernetes.envoyDeployment.replicas: 2` (one per node). Deleting an Envoy pod then took 13 s, and
+**160/160** requests through both node IPs returned 200.
 
 ## Linuxulator noise (non-fatal)
 

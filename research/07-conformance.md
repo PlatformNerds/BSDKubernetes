@@ -118,6 +118,15 @@ Still red, for reasons that hold: sysctls (Linux `kernel.*` names) and the privi
 the 6 in-place resize tests (research/17) and 3 `[LinuxOnly]` (ImageVolume's Alpine check, sysctls, dummy device).
 Excluding `[LinuxOnly]` the count is unchanged at 394/400; the two new passes are both `[LinuxOnly]` tests.
 
+**`[NodeConformance]` beyond the conformance set** (94 tests: NodeConformance, not Conformance, not
+Serial/Slow/Disruptive): 87/94, then **91/94**. The 4 probe-while-terminating tests (2 for regular containers, 2 for
+sidecars) failed with `CreateContainerError: /bin/bash: No such file or directory`. They run `/bin/bash`, which
+Alpine's bash package provides, while FreeBSD's bash lives in `/usr/local/bin`. The agnhost image (and kitten and
+nautilus, built on it) now links `/bin/bash`, and all 4 pass. The 3 left:
+- the memory-backed EmptyDir `df` test (research/20, `MNT_IGNORE`);
+- sysctls with slashes (`[LinuxOnly]`, Linux `kernel.*` names);
+- PrivilegedPod (`[LinuxOnly]`, `ip link add ... type dummy`; FreeBSD has no dummy interface type).
+
 ## Run 9: 420/446, no regressions, but node 2 froze once (2026-11-17)
 
 This run checked everything since run 8:

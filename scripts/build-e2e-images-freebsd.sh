@@ -101,6 +101,9 @@ commit() {
 if want agnhost; then
 new "$base"
 pkgs curl bash bind-tools iperf iperf3 busybox
+# Tests run `/bin/bash` by absolute path (Alpine's bash package installs it there; FreeBSD's
+# lives in /usr/local/bin): the probe-while-terminating tests failed with CreateContainerError.
+ln -sf /usr/local/bin/bash "$m/bin/bash"
 hostbin /usr/bin/nc /usr/bin/getent   # e2e runs `nc -v -t -w 2` (OpenBSD nc, like netcat-openbsd)
 bbfill
 install -m 755 "$agnhost" "$m/agnhost"

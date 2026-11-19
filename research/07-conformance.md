@@ -174,6 +174,8 @@ Not Conformance, Serial, Slow, Disruptive, Flaky, Feature or LinuxOnly:
 | sig-apps | 48/48 |
 | sig-network | 67/68 (the known CLOSE_WAIT test, which reads Linux conntrack) |
 | sig-node | 27/28 without the pod-level resize tests (decided, research/17) and DRA |
+| sig-scheduling Serial | 14/14 |
+| Serial tests of sig-node, apps, network, api-machinery, cli | 17/19, then 18/19 |
 | volumes (`HostPath\|Subpath\|EmptyDir\|Projected\|ConfigMap\|Secrets\|Downward API`) | 78/79 |
 
 - **`kubectl port-forward` crashed CRI-O (fixed).**
@@ -209,6 +211,13 @@ Not Conformance, Serial, Slow, Disruptive, Flaky, Feature or LinuxOnly:
   file systems below a host path too, like Linux's recursive bind, except those of the node stack (research/20).
 - **Volumes:** the one failure is a CSI mock driver test that `Secrets` matched. Its CSI sidecar images aren't built
   for FreeBSD.
+- **Serial:**
+  - `RuntimeClass ... scheduling with taints` needs a runtime handler named `test-handler` on the nodes, as
+    upstream CI configures. `build-cluster.sh` now adds one with `E2E_TEST_HANDLER=yes` (demo fork). After that,
+    all 8 RuntimeClass tests pass, including the `[Feature:RuntimeHandler]` ones.
+  - `DNS configMap ... Change stubDomain` works: the stub domain answers `1.1.1.1`, `2.2.2.2` and `3.3.3.3`
+    within 3 seconds. The test's last check expects `abc.acme.local` to have no answer once the ConfigMap is
+    restored, but this network's resolver answers every name (below).
 - **Not FreeBSD:** "should handle in-cluster config" expects `kubectl --server=invalid` to fail name resolution.
   This network's DNS answers for `invalid` (`192.168.160.1`, from the Mac too), so the request reaches an HTML page.
 

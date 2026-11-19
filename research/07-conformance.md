@@ -171,6 +171,10 @@ Not Conformance, Serial, Slow, Disruptive, Flaky, Feature or LinuxOnly:
 | sig-instrumentation | 4/6, then **6/6** |
 | sig-api-machinery | 63/63 |
 | sig-scheduling | none in this set |
+| sig-apps | 48/48 |
+| sig-network | 67/68 (the known CLOSE_WAIT test, which reads Linux conntrack) |
+| sig-node | 27/28 without the pod-level resize tests (decided, research/17) and DRA |
+| volumes (`HostPath\|Subpath\|EmptyDir\|Projected\|ConfigMap\|Secrets\|Downward API`) | 78/79 |
 
 - **`kubectl port-forward` crashed CRI-O (fixed).**
   - The FreeBSD runtime had no `PortForwardContainer`. The generic one called itself until the goroutine stack
@@ -192,6 +196,19 @@ Not Conformance, Serial, Slow, Disruptive, Flaky, Feature or LinuxOnly:
     than the host's see each other's sockets.
   - Checked: one pod's containers see each other's listeners, but not another pod's or the host's. Both nodes
     boot `kernel.bsdk8s21` with it set.
+- **sig-node:**
+  - The 32 `PLR Pod InPlace Resize` tests (pod-level resources, beta) fail like the six container resize tests
+    (research/17). Their pods set `spec.os.name: linux`, so they run under the Linuxulator. There the FreeBSD busybox
+    tag is refused, and they check `cpu.weight`, which FreeBSD doesn't enforce. Each waits five minutes, so they
+    also push a full sig-node run past its one-hour limit.
+  - `[DRA] control plane` tests deploy a test driver whose kubelet plugin isn't built for FreeBSD. Not looked at
+    further.
+  - `Mount propagation` can't pass: FreeBSD has no shared subtrees (research/20).
+- **Host paths didn't show the file systems below them (fixed).** No test checks this; it came up while looking at
+  mount propagation. With the default ZFS layout, hostPath `/var` showed an empty `/var/log`. CRI-O 0023 mounts the
+  file systems below a host path too, like Linux's recursive bind, except those of the node stack (research/20).
+- **Volumes:** the one failure is a CSI mock driver test that `Secrets` matched. Its CSI sidecar images aren't built
+  for FreeBSD.
 - **Not FreeBSD:** "should handle in-cluster config" expects `kubectl --server=invalid` to fail name resolution.
   This network's DNS answers for `invalid` (`192.168.160.1`, from the Mac too), so the request reaches an HTML page.
 

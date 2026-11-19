@@ -115,3 +115,62 @@ then a reader pod. **The writer never started:** `MountVolume.SetUp failed ... m
   (`f_mntfromname`) names the directory they show, so the references are the nullfs mounts that share the path's
   source, from `getfsstat(2)`. Unit test: `mount_freebsd_test.go`.
 - **Result:** the writer's file is owned by group 1234 on the node, and the reader reads it back.
+
+## Host paths didn't show the file systems below them (CRI-O 153946dd0, patch 0023)
+
+*2026-11-19.* On Linux a hostPath volume is a recursive bind (`rbind`). The container also sees the file systems
+mounted below the path when it starts. A FreeBSD nullfs mount shows only the file system the path itself is on.
+With the default ZFS layout, `/var/log`, `/tmp`, `/home`, `/usr/src` ... are separate datasets, so:
+
+- a pod with hostPath `/var` saw an **empty** `/var/log` (36 files on the node; a log shipper would read nothing);
+- a pod with hostPath `/` (node-exporter style) saw none of `/tmp`, `/home`, `/var/log`, ...
+
+No e2e test caught it. They mount host directories that have nothing mounted below them.
+
+**Fix:** for each directory host path, CRI-O adds a nullfs mount for every file system mounted strictly below it, at
+the same place below the destination. Parents go first, and ocijail unmounts them in reverse. Each one is
+read-only when the host path is. That is stricter than Linux, where only the top mount is read-only unless
+`recursiveReadOnly` is requested.
+
+Two things differ from Linux, both on purpose:
+
+- **Mounts of the node stack are skipped.** FreeBSD has no mount namespaces, and a nullfs mount keeps the file
+  system below it busy: unmounting a tmpfs with a nullfs on top fails with `Device busy`. Copying a pod's secret or
+  emptyDir tmpfs into another container (a log agent with hostPath `/var`) would therefore stop the kubelet from
+  unmounting it when that pod is deleted, which is the old Linux "mount leak". Skipped trees:
+  - the kubelet's directory (`/var/db/kubelet`, `/var/lib/kubelet`);
+  - container storage (CRI-O's root and runroot);
+  - `/var/run/ocijail` and `/var/run/crio`.
+  A hostPath of the kubelet's directory therefore shows the pod directories but not the volumes mounted inside them.
+- **Pseudo file systems are skipped** (`devfs`, `fdescfs`, `procfs`, `linprocfs`, `linsysfs`, `mqueuefs`). A
+  nullfs view of the host's devfs bypasses the jail's devfs ruleset: a container would get the host's device
+  nodes, and a read-only mount doesn't stop writes to a device. On Linux the device cgroup restricts that; jails
+  have only the ruleset.
+
+Verified on both nodes:
+
+| Check | Before | After |
+|---|---|---|
+| hostPath `/var`, `ls /host/var/log` | 0 entries | 36 (as on the node) |
+| hostPath `/` (read-only): `/var/log`, `/tmp`, `/home` ... | empty | 10 datasets mounted, all `ro`; a write fails with "Read-only file system" |
+| ... `/rootfs/dev` | empty | empty (devfs skipped) |
+| delete a pod with a memory emptyDir while the hostPath `/` pod runs | | 1.5 s, all 6 of its mounts gone |
+| delete the hostPath `/` pod | | its 10 extra mounts gone (301 → 278 mounts) |
+| volume e2e (`HostPath\|Subpath\|EmptyDir\|Projected\|ConfigMap\|Secrets\|Downward API`, 79 tests) | | 78 pass; the failure is a CSI mock driver test (no FreeBSD CSI sidecar images) |
+
+Unit test: `server/submounts_freebsd_test.go` (6 cases).
+
+## Mount propagation: not available
+
+`[sig-node] Mount propagation should propagate mounts within defined scopes` fails, and can't pass on FreeBSD:
+
+- The test drives the node through the hostexec pod (`nsenter`, see above).
+- More fundamentally, FreeBSD has no shared subtrees. Checked by hand on node 2: with `/a` nullfs-mounted at `/b`,
+  a tmpfs mounted later at `/a/sub` doesn't appear at `/b/sub`, and one mounted at `/b/sub2` doesn't appear at
+  `/a/sub2`.
+- So `HostToContainer` and `Bidirectional` behave like `None`: a snapshot taken at container start (above), with no
+  later propagation either way.
+- The kubelet already treats propagation that way on Windows, which has none either (`translateMountPropagation`
+  maps every mode to private).
+- The practical cost: CSI node plugins rely on `Bidirectional` to make their mounts visible to the kubelet, so a
+  CSI node plugin can't run as a pod on FreeBSD. It would have to run on the host.

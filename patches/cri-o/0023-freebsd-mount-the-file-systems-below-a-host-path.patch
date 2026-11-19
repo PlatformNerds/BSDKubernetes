@@ -1,0 +1,293 @@
+From 153946dd047ceb933782b64b0722bc6c4fb0439a Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 00:33:00 -0700
+Subject: [PATCH] server: mount the file systems below a host path on FreeBSD
+
+Linux binds hostPath volumes recursively (rbind), so a container also sees
+the file systems mounted below the path when it starts. A FreeBSD nullfs
+mount shows only the file system the path is on: with the default ZFS
+layout, a pod with hostPath /var saw an empty /var/log, and hostPath / saw
+none of /tmp, /home, /var/log.
+
+Add a nullfs mount for each file system mounted below a directory host
+path, parents first, read-only when the host path is. FreeBSD has no
+mount namespaces and a nullfs mount keeps the file system below it busy
+(its unmount fails with EBUSY), so the trees whose mounts come and go
+under the node stack are skipped: container storage, runtime state and
+the kubelet's directory. Pseudo file systems are skipped as well: a
+nullfs view of the host's devfs would bypass the jail's devfs ruleset.
+---
+ server/container_create_freebsd.go |   9 ++
+ server/submounts_freebsd.go        | 143 +++++++++++++++++++++++++++++
+ server/submounts_freebsd_test.go   |  89 ++++++++++++++++++
+ 3 files changed, 241 insertions(+)
+ create mode 100644 server/submounts_freebsd.go
+ create mode 100644 server/submounts_freebsd_test.go
+
+diff --git a/server/container_create_freebsd.go b/server/container_create_freebsd.go
+index be6d9ccb5..75fbc5800 100644
+--- a/server/container_create_freebsd.go
++++ b/server/container_create_freebsd.go
+@@ -192,6 +192,15 @@ func (s *Server) addOCIBindMounts(ctx context.Context, ctr ctrfactory.Container,
+ 			Destination: dest,
+ 			Options:     options,
+ 		})
++
++		// Linux binds host paths recursively; see hostSubmounts.
++		if fi, err := os.Stat(src); err == nil && fi.IsDir() {
++			subs := hostSubmounts(src, dest, m.Readonly, s.submountExcludes(), mountSet)
++			if len(subs) > 0 {
++				log.Debugf(ctx, "Host path %s: also mounting %d file systems below it", src, len(subs))
++			}
++			ociMounts = append(ociMounts, subs...)
++		}
+ 	}
+ 
+ 	return volumes, ociMounts, nil, nil
+diff --git a/server/submounts_freebsd.go b/server/submounts_freebsd.go
+new file mode 100644
+index 000000000..4f71d6017
+--- /dev/null
++++ b/server/submounts_freebsd.go
+@@ -0,0 +1,143 @@
++package server
++
++import (
++	"path/filepath"
++	"sort"
++	"strings"
++
++	rspec "github.com/opencontainers/runtime-spec/specs-go"
++	"golang.org/x/sys/unix"
++)
++
++// Recursive host path mounts.
++//
++// On Linux a hostPath volume is an rbind: the container also sees the file
++// systems mounted below the path when it starts (with propagation None they
++// are a snapshot; later mounts don't appear). A FreeBSD nullfs mount shows
++// only the file system the path is on, so a pod with hostPath /var saw an
++// empty /var/log when /var/log is its own ZFS dataset (the default layout),
++// and hostPath / saw none of /tmp, /home, /var/log, ...
++//
++// hostSubmounts returns a nullfs mount for each file system mounted strictly
++// below source, at the same place below destination, parents first.
++//
++// FreeBSD has no mount namespaces: a nullfs mount on top of a file system
++// keeps it busy, and its own unmount then fails with EBUSY. Mounts that the
++// node stack creates and removes while containers run are therefore skipped:
++// the kubelet's pod volumes and plugin mounts, container root file systems,
++// and runtime state. Pseudo file systems are skipped too; a nullfs view of
++// the host's devfs would bypass the jail's devfs ruleset.
++func hostSubmounts(source, destination string, readOnly bool, exclude []string, taken map[string]struct{}) []rspec.Mount {
++	n, err := unix.Getfsstat(nil, unix.MNT_NOWAIT)
++	if err != nil || n == 0 {
++		return nil
++	}
++	buf := make([]unix.Statfs_t, n)
++	if n, err = unix.Getfsstat(buf, unix.MNT_NOWAIT); err != nil {
++		return nil
++	}
++	found := make([]hostMount, 0, n)
++	for i := range buf[:n] {
++		found = append(found, hostMount{
++			path:   unix.ByteSliceToString(buf[i].Mntonname[:]),
++			fstype: unix.ByteSliceToString(buf[i].Fstypename[:]),
++		})
++	}
++	return selectSubmounts(source, destination, readOnly, exclude, taken, found)
++}
++
++type hostMount struct{ path, fstype string }
++
++var skippedSubmountTypes = map[string]bool{
++	"devfs": true, "fdescfs": true, "procfs": true, "linprocfs": true,
++	"linsysfs": true, "mqueuefs": true,
++}
++
++func selectSubmounts(source, destination string, readOnly bool, exclude []string, taken map[string]struct{}, found []hostMount) []rspec.Mount {
++	source = filepath.Clean(source)
++	destination = filepath.Clean(destination)
++	seen := map[string]bool{}
++	var paths []string
++	for _, m := range found {
++		p := filepath.Clean(m.path)
++		if !isStrictlyUnder(p, source) || skippedSubmountTypes[m.fstype] || seen[p] {
++			continue
++		}
++		skip := false
++		for _, e := range exclude {
++			if e != "" && (p == filepath.Clean(e) || isStrictlyUnder(p, filepath.Clean(e))) {
++				skip = true
++				break
++			}
++		}
++		if skip {
++			continue
++		}
++		seen[p] = true
++		paths = append(paths, p)
++	}
++	// Parents before children; a stable order otherwise.
++	sort.Slice(paths, func(i, j int) bool {
++		di, dj := strings.Count(paths[i], "/"), strings.Count(paths[j], "/")
++		if di != dj {
++			return di < dj
++		}
++		return paths[i] < paths[j]
++	})
++
++	opt := "rw"
++	if readOnly {
++		opt = "ro"
++	}
++	var mounts []rspec.Mount
++	for _, p := range paths {
++		rel, err := filepath.Rel(source, p)
++		if err != nil {
++			continue
++		}
++		dest := filepath.Join(destination, rel)
++		// The pod mounts something of its own there or above it (below
++		// this host path): that mount hides the submount.
++		covered := false
++		for t := range taken {
++			t = filepath.Clean(t)
++			if t == dest || (isStrictlyUnder(t, destination) && isStrictlyUnder(dest, t)) {
++				covered = true
++				break
++			}
++		}
++		if covered {
++			continue
++		}
++		mounts = append(mounts, rspec.Mount{
++			Type:        "nullfs",
++			Source:      p,
++			Destination: dest,
++			Options:     []string{opt},
++		})
++	}
++	return mounts
++}
++
++func isStrictlyUnder(p, dir string) bool {
++	if dir == "/" {
++		return p != "/" && strings.HasPrefix(p, "/")
++	}
++	return strings.HasPrefix(p, dir+"/")
++}
++
++// submountExcludes are the trees whose mounts come and go under the node
++// stack: container storage, runtime state and the kubelet's directory.
++func (s *Server) submountExcludes() []string {
++	ex := []string{
++		"/var/run/ocijail", "/var/run/crio", "/var/run/containers",
++		"/var/db/kubelet", "/var/lib/kubelet",
++	}
++	if s.config.Root != "" {
++		ex = append(ex, s.config.Root)
++	}
++	if s.config.RunRoot != "" {
++		ex = append(ex, s.config.RunRoot)
++	}
++	return ex
++}
+diff --git a/server/submounts_freebsd_test.go b/server/submounts_freebsd_test.go
+new file mode 100644
+index 000000000..5b65c7261
+--- /dev/null
++++ b/server/submounts_freebsd_test.go
+@@ -0,0 +1,89 @@
++package server
++
++import (
++	"reflect"
++	"testing"
++)
++
++func TestSelectSubmounts(t *testing.T) {
++	host := []hostMount{
++		{"/", "zfs"},
++		{"/dev", "devfs"},
++		{"/tmp", "zfs"},
++		{"/var/log", "zfs"},
++		{"/var/tmp", "zfs"},
++		{"/var/db/containers", "zfs"},
++		{"/var/db/containers/storage/zfs/graph/abc", "zfs"},
++		{"/var/db/kubelet/pods/u1/volumes/kubernetes.io~secret/s", "tmpfs"},
++		{"/var/run/ocijail/c1/readonly_root", "nullfs"},
++		{"/var/log/deep/er", "tmpfs"},
++		{"/usr/home", "zfs"},
++	}
++	exclude := []string{"/var/db/kubelet", "/var/db/containers/storage", "/var/run/ocijail"}
++
++	type want struct{ src, dst, opt string }
++	cases := []struct {
++		name         string
++		source, dest string
++		readOnly     bool
++		taken        []string
++		want         []want
++	}{
++		{
++			name: "hostPath /var, read-only", source: "/var", dest: "/host/var", readOnly: true,
++			want: []want{
++				{"/var/log", "/host/var/log", "ro"},
++				{"/var/tmp", "/host/var/tmp", "ro"},
++				{"/var/db/containers", "/host/var/db/containers", "ro"},
++				{"/var/log/deep/er", "/host/var/log/deep/er", "ro"},
++			},
++		},
++		{
++			name: "hostPath / skips devfs and node-stack trees", source: "/", dest: "/rootfs",
++			want: []want{
++				{"/tmp", "/rootfs/tmp", "rw"},
++				{"/usr/home", "/rootfs/usr/home", "rw"},
++				{"/var/log", "/rootfs/var/log", "rw"},
++				{"/var/tmp", "/rootfs/var/tmp", "rw"},
++				{"/var/db/containers", "/rootfs/var/db/containers", "rw"},
++				{"/var/log/deep/er", "/rootfs/var/log/deep/er", "rw"},
++			},
++		},
++		{
++			name: "a pod mount covers a submount", source: "/var", dest: "/v",
++			taken: []string{"/v", "/v/log"},
++			want: []want{
++				{"/var/tmp", "/v/tmp", "rw"},
++				{"/var/db/containers", "/v/db/containers", "rw"},
++			},
++		},
++		{
++			name: "the mount point itself is not a submount", source: "/var/log", dest: "/l",
++			want: []want{{"/var/log/deep/er", "/l/deep/er", "rw"}},
++		},
++		{name: "nothing below", source: "/etc", dest: "/etc-host"},
++		{name: "prefix is not a parent", source: "/var/lo", dest: "/x"},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			taken := map[string]struct{}{}
++			for _, p := range tc.taken {
++				taken[p] = struct{}{}
++			}
++			got := []want{}
++			for _, m := range selectSubmounts(tc.source, tc.dest, tc.readOnly, exclude, taken, host) {
++				if m.Type != "nullfs" || len(m.Options) != 1 {
++					t.Fatalf("unexpected mount %+v", m)
++				}
++				got = append(got, want{m.Source, m.Destination, m.Options[0]})
++			}
++			w := tc.want
++			if w == nil {
++				w = []want{}
++			}
++			if !reflect.DeepEqual(got, w) {
++				t.Errorf("got  %v\nwant %v", got, w)
++			}
++		})
++	}
++}
+-- 
+2.54.0 (Apple Git-157)
+

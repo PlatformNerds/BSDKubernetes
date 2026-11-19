@@ -33,6 +33,7 @@
 #                       0036: reads TCP with bpf(4), as FreeBSD gives raw sockets no TCP; the
 #                       pod needs CAP_NET_RAW, which CRI-O maps to /dev/bpf); the conntrack
 #                       invalid-state test.
+#   Also needs skopeo (agnhost's fake registry, from ghcr.io/platformnerds/pause:3.10.2).
 #     ONLY="<names>"    build only these images (agnhost kitten nautilus busybox nonroot
 #                       glibc-dns-testing nonewprivs nginx sample-apiserver etcd
 #                       regression-issue-74839 pause)
@@ -96,6 +97,29 @@ hostbin() {
     for l in $(ldd -f '%p\n' "$b"); do [ -e "$m$l" ] || install -m 444 "$l" "$m$l"; done
   done
 }
+# fake_registry_pause <dir>: lay out the FreeBSD pause image the way `agnhost
+# fake-registry-server` serves it: <dir>/pause/manifests/testing holds the manifest digest,
+# manifests and blobs live at <kind>/sha256/<xx>/<hash>/data. Needs skopeo.
+fake_registry_pause() {
+  _img=ghcr.io/platformnerds/pause:3.10.2
+  if ! buildah inspect --type image "$_img" >/dev/null 2>&1; then
+    echo "WARNING: no $_img; agnhost's fake registry is empty (private-registry pull tests fail)"
+    return 0
+  fi
+  _t=$(mktemp -d); _r=$1/pause
+  skopeo copy -q "containers-storage:$_img" "dir:$_t/p"
+  _put() { _h=${2#sha256:}; _f=$_r/$1/sha256/$(echo "$_h" | cut -c1-2)/$_h/data
+           mkdir -p "$(dirname "$_f")"; cp "$3" "$_f"; }
+  _md=sha256:$(sha256 -q "$_t/p/manifest.json")
+  _put manifests "$_md" "$_t/p/manifest.json"
+  echo "$_md" > "$_r/manifests/testing"
+  for _b in "$_t"/p/*; do
+    case ${_b##*/} in manifest.json|version) continue ;; esac
+    _put blobs "sha256:${_b##*/}" "$_b"
+  done
+  rm -rf "$_t"
+}
+
 # commit <name:tag> [extra tags...]: label, commit, tag
 commit() {
   buildah config --os freebsd --arch "$arch" \
@@ -128,6 +152,10 @@ install -m 755 "$agnhost" "$m/agnhost"
 ln -sf agnhost "$m/agnhost-2"
 mkdir -p "$m/uploads"
 install -m 644 "$img/agnhost/porter/localhost.crt" "$img/agnhost/porter/localhost.key" "$m/"
+# `agnhost fake-registry-server` (the private-registry pull tests) serves /var/registry. Upstream
+# bakes registry.k8s.io/pause:3.10.2 into it as pause:testing (fakeregistryserver/prepare_registry.sh);
+# serve the FreeBSD pause image instead, so the pod the test pulls it for runs on this node.
+fake_registry_pause "$m/var/registry"
 pw -R "$m" groupadd -n group-defined-in-image -g 50000
 pw -R "$m" useradd -n user-defined-in-image -u 1000 -G group-defined-in-image -s /bin/sh
 buildah config --entrypoint '["/agnhost"]' --cmd pause --port 80 --port 8080 --port 8081 --port 9376 --port 5000 "$c"

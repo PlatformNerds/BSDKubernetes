@@ -176,6 +176,7 @@ Not Conformance, Serial, Slow, Disruptive, Flaky, Feature or LinuxOnly:
 | sig-node | 27/28 without the pod-level resize tests (decided, research/17) and DRA |
 | sig-scheduling Serial | 14/14 |
 | Serial tests of sig-node, apps, network, api-machinery, cli | 17/19, then 18/19 |
+| HostPathType + in-tree hostPath/hostPathSymlink/emptydir drivers | 41/57, then **43/57** (socket mounts, research/20); the other 14 are block/character devices, which need `mknod` |
 | volumes (`HostPath\|Subpath\|EmptyDir\|Projected\|ConfigMap\|Secrets\|Downward API`) | 78/79 |
 
 - **`kubectl port-forward` crashed CRI-O (fixed).**
@@ -213,11 +214,22 @@ Not Conformance, Serial, Slow, Disruptive, Flaky, Feature or LinuxOnly:
   for FreeBSD.
 - **Serial:**
   - `RuntimeClass ... scheduling with taints` needs a runtime handler named `test-handler` on the nodes, as
-    upstream CI configures. `build-cluster.sh` now adds one with `E2E_TEST_HANDLER=yes` (demo fork). After that,
+    upstream CI configures. `build-cluster.sh` now adds one with `E2E_NODE_CONFIG=yes` (demo fork). After that,
     all 8 RuntimeClass tests pass, including the `[Feature:RuntimeHandler]` ones.
   - `DNS configMap ... Change stubDomain` works: the stub domain answers `1.1.1.1`, `2.2.2.2` and `3.3.3.3`
     within 3 seconds. The test's last check expects `abc.acme.local` to have no answer once the ConfigMap is
     restored, but this network's resolver answers every name (below).
+- **NodeConformance on `kernel.bsdk8s22`, 250 tests including the Serial ones: 246 pass.** The 4 failures are
+  the known `[LinuxOnly]` ones (sysctls ×2, privileged ×2). The full run hit its one-hour limit four tests short,
+  so the Serial `when running a container with a new image` group was run separately: 4/4. Two things were
+  missing for it, both test setup:
+  - The tests run an HTTP registry on the node's `localhost:5000`. containerd pulls from localhost over HTTP;
+    CRI-O only does for registries marked insecure. `E2E_NODE_CONFIG=yes` now adds that.
+  - The registry is `agnhost fake-registry-server`, which serves `/var/registry`. Upstream's agnhost image bakes
+    `pause:3.10.2` in as `pause:testing`; ours had nothing there (404). `build-e2e-images-freebsd.sh` now bakes in
+    the FreeBSD pause image the same way (`fake_registry_pause`). The images on both nodes were updated in place
+    (originals `*-prev-registry`), and the mirror was refreshed. "should be able to pull image" uses
+    `PullAlways`, which replaced the patched tag with the mirror's old copy until the mirror had the new one.
 - **Not FreeBSD:** "should handle in-cluster config" expects `kubectl --server=invalid` to fail name resolution.
   This network's DNS answers for `invalid` (`192.168.160.1`, from the Mac too), so the request reaches an HTML page.
 

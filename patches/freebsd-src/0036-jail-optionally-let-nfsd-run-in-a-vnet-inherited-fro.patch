@@ -1,0 +1,110 @@
+From 88a508602661bdd2c8d6a326307a2fdbab9c7d8d Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 10:21:00 -0700
+Subject: [PATCH] jail: optionally let nfsd run in a vnet inherited from a jail
+
+allow.nfsd lets mountd(8) and nfsd(8) run in a jail, but only in one
+that owns its vnet: prison_check_nfsd() refuses a jail without a vnet of
+its own, and the NFS privileges are granted only to PR_VNET jails.
+
+Container runtimes put each container of a pod in its own jail below the
+pod's vnet jail, sharing (inheriting) its network stack, so even a
+privileged container cannot serve NFS, as a privileged Linux container
+can (NFS servers and provisioners in Kubernetes).
+
+Add security.jail.nfsd_inherited_vnet (default 0). When set, a jail with
+allow.nfsd may also run the daemons in a vnet inherited from a jail
+ancestor. The NFS server's state is per vnet, so such a jail is isolated
+from the host's NFS server as a vnet jail is; a jail on the host's
+network stack never qualifies. The other requirements (its root a file
+system mount point, enforce_statfs not 0) are unchanged.
+
+The NFS privilege cases now return directly once prison_check_nfsd()
+passes; before, they fell through to the vnet case, which granted them
+to PR_VNET jails only, a condition prison_check_nfsd() implied.
+
+Tested: nfsd and mountd in a child jail of a vnet jail export a nullfs
+file system; the host mounts it over NFSv3 and v4 with the sysctl set,
+and gets "Program not registered" without it.
+---
+ sys/kern/kern_jail.c | 29 ++++++++++++++++++++++++++++-
+ usr.sbin/jail/jail.8 |  5 +++++
+ 2 files changed, 33 insertions(+), 1 deletion(-)
+
+diff --git a/sys/kern/kern_jail.c b/sys/kern/kern_jail.c
+index dd420f868..ed90737c9 100644
+--- a/sys/kern/kern_jail.c
++++ b/sys/kern/kern_jail.c
+@@ -3925,11 +3925,13 @@ prison_check(struct ucred *cred1, struct ucred *cred2)
+  * - The prison's enforce_statfs cannot be 0, so that
+  *   mountd(8) can do exports.
+  */
++static bool	prison_nfsd_inherited_vnet(struct ucred *cred);
++
+ bool
+ prison_check_nfsd(struct ucred *cred)
+ {
+ 
+-	if (jailed_without_vnet(cred))
++	if (jailed_without_vnet(cred) && !prison_nfsd_inherited_vnet(cred))
+ 		return (false);
+ 	if (!prison_allow(cred, PR_ALLOW_NFSD))
+ 		return (false);
+@@ -4163,6 +4165,30 @@ prison_enforce_statfs(struct ucred *cred, struct mount *mp, struct statfs *sp)
+ 	}
+ }
+ 
++/*
++ * 'nfsd_inherited_vnet' also lets a jail run nfsd(8) and mountd(8) in a
++ * network stack it inherits from a jail ancestor (vnet=inherit below a vnet
++ * jail), as when a privileged container of a pod serves NFS: the containers
++ * of a pod are sibling jails sharing the pod jail's vnet. The NFS server's
++ * state is per vnet, so such a jail is still isolated from the host's NFS
++ * server. A jail on the host's network stack never qualifies.
++ */
++static int	nfsd_inherited_vnet = 0;
++SYSCTL_INT(_security_jail, OID_AUTO, nfsd_inherited_vnet, CTLFLAG_RW,
++    &nfsd_inherited_vnet, 0,
++    "Jails with allow.nfsd may run nfsd in a vnet inherited from a jail");
++
++static bool
++prison_nfsd_inherited_vnet(struct ucred *cred)
++{
++#ifdef VIMAGE
++	return (nfsd_inherited_vnet != 0 &&
++	    cred->cr_prison->pr_vnet != prison0.pr_vnet);
++#else
++	return (false);
++#endif
++}
++
+ /*
+  * Check with permission for a specific privilege is granted within jail.  We
+  * have a specific list of accepted privileges; the rest are denied.
+@@ -4202,6 +4228,7 @@ prison_priv_check(struct ucred *cred, int priv)
+ 	case PRIV_VFS_MOUNT_EXPORTED:
+ 		if (!prison_check_nfsd(cred))
+ 			return (EPERM);
++		return (0);
+ #ifdef notyet
+ 	case PRIV_NFS_LOCKD:
+ #endif
+diff --git a/usr.sbin/jail/jail.8 b/usr.sbin/jail/jail.8
+index aab3f9003..f8e98c6b3 100644
+--- a/usr.sbin/jail/jail.8
++++ b/usr.sbin/jail/jail.8
+@@ -662,6 +662,11 @@ jail's file system need to be exported by
+ .Xr mount 8 .
+ For exporting only the jail's file system, a setting of 2
+ is sufficient.
++A jail that inherits its network stack from a vnet jail
++.Pq Va vnet Ns = Ns Dq inherit
++may run these daemons too when the
++.Va security.jail.nfsd_inherited_vnet
++sysctl is set to 1; a jail sharing the host's network stack never may.
+ If the kernel configuration does not include the
+ .Sy NFSD
+ option,
+-- 
+2.54.0 (Apple Git-157)
+

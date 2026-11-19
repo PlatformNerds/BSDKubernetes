@@ -1,0 +1,77 @@
+From a90bf43d405dc4fd732d0e8f34465275e906c2ec Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 10:15:32 -0700
+Subject: [PATCH] freebsd: allow.nfsd for privileged pods with their own
+ network
+
+A privileged Linux container can run the kernel NFS server (the e2e NFS
+server, NFS provisioners). On FreeBSD that is allow.nfsd. Request it for
+the sandbox jail and the privileged containers of a privileged pod that
+has its own network; a child jail cannot have permissions its parent
+lacks. The containers inherit the pod jail's vnet, so the kernel lets
+them run nfsd only with security.jail.nfsd_inherited_vnet=1
+(freebsd-src patch 0036); without it the parameter changes nothing.
+---
+ internal/factory/container/namespaces_freebsd.go |  5 +++++
+ internal/jailparam/jailparam_freebsd.go          | 15 +++++++++++++++
+ server/sandbox_run_freebsd.go                    |  5 +++++
+ 3 files changed, 25 insertions(+)
+
+diff --git a/internal/factory/container/namespaces_freebsd.go b/internal/factory/container/namespaces_freebsd.go
+index 9637542f9..733029d90 100644
+--- a/internal/factory/container/namespaces_freebsd.go
++++ b/internal/factory/container/namespaces_freebsd.go
+@@ -25,6 +25,11 @@ func (c *container) SpecAddNamespaces(sb SandboxIFace, targetCtr *oci.Container,
+ 	if jailparam.HostNetworkPFAllowed(hostNetwork, c.Privileged()) {
+ 		c.Spec().AddAnnotation(jailparam.AllowPFAnnotation, "true")
+ 	}
++	// Privileged containers of a pod with its own network may serve NFS;
++	// the sandbox jail got the same permission.
++	if jailparam.PodNFSDAllowed(hostNetwork, c.Privileged()) {
++		c.Spec().AddAnnotation(jailparam.AllowNFSDAnnotation, "true")
++	}
+ 
+ 	return nil
+ }
+diff --git a/internal/jailparam/jailparam_freebsd.go b/internal/jailparam/jailparam_freebsd.go
+index 31338b07f..e9775dc52 100644
+--- a/internal/jailparam/jailparam_freebsd.go
++++ b/internal/jailparam/jailparam_freebsd.go
+@@ -23,3 +23,18 @@ func Supported(name string) bool {
+ func HostNetworkPFAllowed(hostNetwork, privileged bool) bool {
+ 	return hostNetwork && privileged && Supported("allow.pf")
+ }
++
++// AllowNFSDAnnotation asks ocijail to set the allow.nfsd jail parameter:
++// mountd(8) and nfsd(8) may run in the jail.
++const AllowNFSDAnnotation = "org.freebsd.jail.allow.nfsd"
++
++// PodNFSDAllowed reports whether a privileged jail of a pod with its own
++// network should get allow.nfsd, so that a privileged container can serve NFS
++// as a privileged Linux container can run the kernel NFS server (e.g. the
++// Kubernetes e2e NFS server, NFS provisioners). The pod's containers inherit
++// the pod jail's vnet; the kernel lets them run nfsd only with
++// security.jail.nfsd_inherited_vnet=1 (freebsd-src patch 0036). Without it
++// the parameter is harmless: the daemons fail as before.
++func PodNFSDAllowed(hostNetwork, privileged bool) bool {
++	return !hostNetwork && privileged && Supported("allow.nfsd")
++}
+diff --git a/server/sandbox_run_freebsd.go b/server/sandbox_run_freebsd.go
+index 75fdd0e8d..8f9416367 100644
+--- a/server/sandbox_run_freebsd.go
++++ b/server/sandbox_run_freebsd.go
+@@ -379,6 +379,11 @@ func (s *Server) runPodSandbox(ctx context.Context, req *types.RunPodSandboxRequ
+ 	if jailparam.HostNetworkPFAllowed(hostNetwork, req.GetConfig().GetLinux().GetSecurityContext().GetPrivileged()) {
+ 		g.AddAnnotation(jailparam.AllowPFAnnotation, "true")
+ 	}
++	// A privileged pod with its own network may run an NFS server in a
++	// privileged container (allow.nfsd); the sandbox jail needs it too.
++	if jailparam.PodNFSDAllowed(hostNetwork, req.GetConfig().GetLinux().GetSecurityContext().GetPrivileged()) {
++		g.AddAnnotation(jailparam.AllowNFSDAnnotation, "true")
++	}
+ 	// We want to cleanup after ourselves if we are managing any namespaces and fail in this function.
+ 	// However, we don't immediately register this func with resourceCleaner because we need to pair the
+ 	// ns cleanup with networkStop. Otherwise, we could try to cleanup the namespace before the network stop runs,
+-- 
+2.54.0 (Apple Git-157)
+

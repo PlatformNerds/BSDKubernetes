@@ -208,3 +208,43 @@ for exactly this container use. The mount point must be a socket too.
 The other 14 `HostPathType` failures are block and character devices. The test creates them with `mknod(2)`
 on the node, and FreeBSD has device nodes only in devfs. It has no block devices at all; disks are character
 devices. These can't pass.
+
+## NFS: client, server pods, recycler (freebsd-src 0036, CRI-O a90bf43d4)
+
+*2026-11-19.* Kubelet's NFS client already worked: `mount_nfs` from the host, then nullfs into the container.
+The e2e NFS tests run their NFS *server* in a privileged pod (`volume/nfs`), which never started on FreeBSD:
+
+- **Kernel:** `allow.nfsd` lets `mountd` and `nfsd` run in a jail, but only in a jail with its own vnet. A pod's
+  containers are child jails that *inherit* the pod's vnet, so even a privileged container couldn't serve NFS.
+  freebsd-src 0036 adds `security.jail.nfsd_inherited_vnet` (default 0). When it is set, a jail with
+  `allow.nfsd` may also run the daemons in a vnet inherited from a jail ancestor. NFS server state is per vnet,
+  so the host's server stays isolated. A jail on the host's network stack never qualifies. The other
+  requirements are unchanged: the jail's root must be a mount point, and `enforce_statfs` must not be 0. A
+  main-based twin (`bsdk8s/jail-nfsd-inherited-vnet`) compiles. Both nodes boot `kernel.bsdk8s23`.
+- **CRI-O** (0024): privileged pods with their own network get `allow.nfsd` when the kernel has it. Linux has
+  the same rule: kernel nfsd in a container needs a privileged pod.
+- **Node:** `build-cluster.sh` loads `nfsd` and sets the sysctl.
+- **Image:** `volume/nfs:1.6.0` (`scripts/build-e2e-images-freebsd.sh`) runs `rpcbind`, `mountd` and `nfsd -t`.
+  It is TCP only, because RPC in a jail refuses UDP. It exports its arguments, with `V4:` on the first one.
+- **Checked by hand:** a pod on one node mounts the server pod on the other over NFSv3 and v4.
+
+Found along the way:
+
+- **BusyBox grep had no `\b`.** The PV tests run `id -G | grep -E '\b777\b'`. Our BusyBox used libc's POSIX
+  `regcomp`, which says "trailing backslash". It now links FreeBSD's `libregex` (what `grep(1)` uses) statically.
+- **The PV recycler image was Linux.** The `Recycle` reclaim policy runs a pod with
+  `registry.k8s.io/build-image/debian-base`. `build-cluster.sh` now passes
+  `--pv-recycler-pod-template-filepath-{nfs,hostpath}` to the controller-manager. The template is upstream's
+  default with `docker.io/freebsd/freebsd-runtime:<release>`, which runs the same scrub command.
+- **A dead NFS server hangs its clients.** Both bugs above made a test delete its NFS server while a client pod
+  still had the volume mounted. The mounts are hard, as on Linux, so kubelet, CRI-O and podman threads
+  then blocked in `statfs(2)`; the node kept running, but those pods never terminated. Linux has the same
+  problem: kubelet's in-tree NFS teardown doesn't force the unmount there either. Recovery:
+  `umount -N <mount point>` cancels the outstanding RPCs and dismounts. Separately, a manifest list left behind
+  by an interrupted image-mirror run had broken CRI-O's `ListImages`. The mirror script now always removes it.
+
+| e2e (`NFS\|nfs`, without Disruptive/Flaky/Feature/LinuxOnly; 22 run, the driver skips the other patterns) | Result |
+|---|---|
+| `PersistentVolumes NFS` (PV/PVC pairs, multiple PVs, Recycle) | **12/12** (11 in the sweep, Recycle after the recycler fix) |
+| In-tree `nfs`/`nfs3` driver, inline and pre-provisioned PV (10) | blocked: the driver starts the `sig-storage/nfs-provisioner` pod in every test, though only Dynamic PV uses it. That image is Linux only (userspace Ganesha), and the pod isn't privileged, so kernel nfsd can't stand in. With a local placeholder image that only sleeps (measurement only, then removed), **10/10 pass** |
+| Dynamic PV, Generic Ephemeral-volume | out of scope: they need that provisioner to serve NFS |

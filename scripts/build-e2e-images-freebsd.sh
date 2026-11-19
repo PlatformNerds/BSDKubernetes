@@ -36,7 +36,7 @@
 #   Also needs skopeo (agnhost's fake registry, from ghcr.io/platformnerds/pause:3.10.2).
 #     ONLY="<names>"    build only these images (agnhost kitten nautilus busybox nonroot
 #                       glibc-dns-testing nonewprivs nginx sample-apiserver etcd
-#                       regression-issue-74839 pause)
+#                       regression-issue-74839 volume-nfs pause)
 set -eu
 src=$(cd "$1" && pwd); agnhost=$2; nnp=${3:-}
 busybox=${BUSYBOX:-}; sampleapiserver=${SAMPLE_APISERVER:-}; etcd=${ETCD:-}
@@ -277,6 +277,55 @@ if [ -n "$regression74839" ] && want regression-issue-74839; then
   buildah config --entrypoint '["/regression-issue-74839"]' --cmd '' "$c"
   commit "$reg/regression-issue-74839:$(mtag RegressionIssue74839)"
   echo "built regression-issue-74839"
+fi
+
+# --- volume/nfs: test/images/volume/nfs (nfs-utils + run_nfs.sh) -----------------------------
+# The kernel NFS server in a privileged container, from the base system's rpcbind, mountd and
+# nfsd. It needs allow.nfsd (CRI-O grants it to privileged pods with their own network), and,
+# since a container inherits its pod jail's vnet, security.jail.nfsd_inherited_vnet=1
+# (freebsd-src patch 0036) and nfsd.ko loaded on the node. TCP only: the kernel RPC code
+# refuses UDP transports in jails.
+if want volume-nfs; then
+  new "$base"
+  hostbin /usr/sbin/rpcbind /usr/sbin/mountd /usr/sbin/nfsd /usr/bin/showmount /usr/bin/rpcinfo
+  mkdir -p "$m/exports" "$m/tmp" "$m/var/db" "$m/var/run" "$m/usr/local/bin"
+  install -m 644 "$img/volume/nfs/index.html" "$m/tmp/index.html"
+  cat > "$m/usr/local/bin/run_nfs.sh" <<'NFSEOF'
+#!/bin/sh
+# FreeBSD version of test/images/volume/nfs/run_nfs.sh: export the given directories
+# (read-write, root not squashed; the first one is the NFSv4 root, like fsid=0), copy
+# index.html into them, start rpcbind, mountd and nfsd, print "NFS started".
+gid=
+while getopts "G:" opt; do case $opt in G) gid=$OPTARG ;; esac; done
+shift $((OPTIND - 1))
+: > /etc/exports
+v4root=
+for i in "$@"; do
+  echo "$i -maproot=root" >> /etc/exports
+  [ -n "$v4root" ] || v4root=$i
+  if [ -n "$gid" ]; then chmod 070 "$i"; chgrp "$gid" "$i"; fi
+  cp /tmp/index.html "$i/"; chmod 644 "$i/index.html"
+  echo "Serving $i"
+done
+[ -z "$v4root" ] || echo "V4: $v4root" >> /etc/exports
+stop() {
+  echo "Stopping NFS"
+  pkill -x nfsd; pkill -x mountd; pkill -x rpcbind
+  : > /etc/exports
+  exit 0
+}
+trap stop TERM
+rpcbind
+mountd
+nfsd -t -n 4
+echo "NFS started"
+while :; do sleep 5; done
+NFSEOF
+  chmod 755 "$m/usr/local/bin/run_nfs.sh"
+  buildah config --entrypoint '["/usr/local/bin/run_nfs.sh"]' --cmd '/exports /' \
+    --port 2049/tcp --port 20048/tcp --volume /exports "$c"
+  commit "$reg/volume/nfs:$(mtag VolumeNFSServer)"
+  echo "built volume/nfs"
 fi
 
 # --- pause: reuse the control-plane pause image (scripts/build-images-freebsd.sh) -------------

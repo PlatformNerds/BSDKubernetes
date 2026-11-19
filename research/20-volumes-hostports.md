@@ -89,3 +89,21 @@ table, so this one stays a documented difference.
 Node 2's clock was 15 minutes behind node 1: its ntpd lost its pool servers to a DNS outage (probably while the
 host Mac slept). It now also syncs from node 1 (`server 192.168.100.1 iburst maxpoll 6`), so the nodes stay in
 step without the internet.
+
+## Local PersistentVolumes with fsGroup (kubernetes 92f38fe72f8, patch 0032)
+
+*2026-11-19.* A sig-storage run beyond the conformance set (no CSI or cloud drivers; 97 tests) passed 22. Of the 75
+failures, 74 are local-volume tests: `PersistentVolumes-local` and `In-tree Volumes [Driver: local]`. They prepare
+each volume on the node through a privileged "hostexec" pod that runs
+`nsenter --mount=/rootfs/proc/1/ns/mnt -- sh -c '<cmd>'`, with Linux commands such as `mount --bind`, `losetup` and
+`mkfs.ext4`. A FreeBSD jail can't enter the host's mount namespace that way, so this test machinery doesn't port.
+The 75th failure is the known `df` test above.
+
+So local PVs were checked by hand: a `local` PV on a directory of node 2, a PVC, a writer pod with `fsGroup: 1234`,
+then a reader pod. **The writer never started:** `MountVolume.SetUp failed ... mount.GetMountRefs unsupported`.
+- **Why:** the local plugin calls `GetMountRefs` before applying `fsGroup`, to see whether another pod already uses
+  the volume. The FreeBSD mount-utils returned "unsupported". Without `fsGroup` the mount worked.
+- **Fix:** `GetMountRefs` is now implemented. FreeBSD's bind mounts are nullfs mounts whose source
+  (`f_mntfromname`) names the directory they show, so the references are the nullfs mounts that share the path's
+  source, from `getfsstat(2)`. Unit test: `mount_freebsd_test.go`.
+- **Result:** the writer's file is owned by group 1234 on the node, and the reader reads it back.

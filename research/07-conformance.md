@@ -178,6 +178,7 @@ Not Conformance, Serial, Slow, Disruptive, Flaky, Feature or LinuxOnly:
 | Serial tests of sig-node, apps, network, api-machinery, cli | 17/19, then 18/19 |
 | HostPathType + in-tree hostPath/hostPathSymlink/emptydir drivers | 41/57, then **43/57** (socket mounts, research/20); the other 14 are block/character devices, which need `mknod` |
 | volumes (`HostPath\|Subpath\|EmptyDir\|Projected\|ConfigMap\|Secrets\|Downward API`) | 78/79 |
+| `[Slow]` (not Serial; without Dynamic PV, Generic Ephemeral, resize, DRA, CSI and cloud drivers), kernel `bsdk8s23` | **55/93**; every failure is a known limit: 14 HostPathType block/character devices (`mknod`), 21 local PV (set up through the hostexec pod's `nsenter` into the host mount namespace; a jail can't leave its jail, and the pod mounts `/` read-only), 3 need the Linux-only `nfs-provisioner` pod. All 15 outside sig-storage pass |
 | NFS (`NFS\|nfs`, without Dynamic PV and Generic Ephemeral-volume), kernel `bsdk8s23` | 0 before (no NFS server pod), then **12/22**: `PersistentVolumes NFS` 12/12; the in-tree driver's 10 need the Linux-only `nfs-provisioner` pod to start (research/20) |
 
 - **`kubectl port-forward` crashed CRI-O (fixed).**

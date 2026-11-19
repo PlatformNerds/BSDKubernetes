@@ -243,6 +243,13 @@ Found along the way:
   `umount -N <mount point>` cancels the outstanding RPCs and dismounts. Separately, a manifest list left behind
   by an interrupted image-mirror run had broken CRI-O's `ListImages`. The mirror script now always removes it.
 
+- **Linux NFS mount options (freebsd-src 0037).** The dynamic tests put `vers=4.0` / `vers=3` in the StorageClass,
+  and Linux PVs commonly say `vers=4.1` or `nfsvers=4.1`. FreeBSD's `mount_nfs` rejected `vers=4.1` ("illegal vers
+  value") and passed `nfsvers` on to `nmount(2)`, which refused it, so such a PV couldn't be mounted. 0037 accepts
+  `nfsvers` as a synonym and `4.N` as `vers=4,minorversion=N`. Checked: `vers=4.0/4.1/4.2` and `nfsvers=4.1` give
+  that minor version (`nfsstat -m`), `nfsvers=3` gives v3, and a pod with a PV with `mountOptions: [nfsvers=4.1]`
+  reads and writes over NFSv4.1. The binary is installed on both nodes (`/sbin/mount_nfs.prev-vers` kept).
+
 | e2e (`NFS\|nfs`, without Disruptive/Flaky/Feature/LinuxOnly; 22 run, the driver skips the other patterns) | Result |
 |---|---|
 | `PersistentVolumes NFS` (PV/PVC pairs, multiple PVs, Recycle) | **12/12** (11 in the sweep, Recycle after the recycler fix) |

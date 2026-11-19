@@ -1,0 +1,78 @@
+From d0355f7f179bdb856e2b1ecb78dc2c8c50a29f1d Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 13:00:51 -0700
+Subject: [PATCH] mount_nfs: accept Linux's vers=4.N and nfsvers=
+
+Linux's mount.nfs takes the NFS version as "vers=4.1" (or "nfsvers="),
+the minor version included; FreeBSD wants "vers=4,minorversion=1".
+mount_nfs rejected "vers=4.1" ("illegal vers value") and passed
+"nfsvers" to nmount(2), which refused it.  NFS mount options written
+for Linux clients are common, e.g. in Kubernetes PersistentVolumes and
+StorageClasses, so such a volume could not be mounted on FreeBSD.
+
+Accept "nfsvers" as a synonym for "vers", and a minor version after
+"4." as "minorversion".
+
+Tested: against an NFS server, vers=4.0, 4.1 and 4.2 and nfsvers=4.1
+mount with that minor version (nfsstat -m), nfsvers=3 mounts NFSv3;
+"4.x", "3.1" and "4.-1" are rejected.
+---
+ sbin/mount_nfs/mount_nfs.8 |  8 ++++++++
+ sbin/mount_nfs/mount_nfs.c | 21 ++++++++++++++++++++-
+ 2 files changed, 28 insertions(+), 1 deletion(-)
+
+diff --git a/sbin/mount_nfs/mount_nfs.8 b/sbin/mount_nfs/mount_nfs.8
+index 4ae4b6dbd..5788e1b87 100644
+--- a/sbin/mount_nfs/mount_nfs.8
++++ b/sbin/mount_nfs/mount_nfs.8
+@@ -535,6 +535,14 @@ See the
+ and
+ .Cm nfsv4
+ options for details.
++For compatibility with Linux,
++.Ar vers_number
++may also name a minor version of NFS Version 4, as in
++.Cm vers Ns = Ns Li 4.1 ,
++which is the same as
++.Cm vers Ns = Ns Li 4 Ns , Ns Cm minorversion Ns = Ns Li 1 ,
++and the option may be given as
++.Cm nfsvers .
+ .It Cm wcommitsize Ns = Ns Aq Ar value
+ Set the maximum pending write commit size to the specified value.
+ This determines the maximum amount of pending write data that the NFS
+diff --git a/sbin/mount_nfs/mount_nfs.c b/sbin/mount_nfs/mount_nfs.c
+index 55adb01fc..ce8d2b39e 100644
+--- a/sbin/mount_nfs/mount_nfs.c
++++ b/sbin/mount_nfs/mount_nfs.c
+@@ -332,8 +332,27 @@ main(int argc, char *argv[])
+ 					if (*p || num <= 0)
+ 						errx(1, "illegal maxgroups value -- %s", val);
+ 					//set_rpc_maxgrouplist(num);
+-				} else if (strcmp(opt, "vers") == 0) {
++				} else if (strcmp(opt, "vers") == 0 ||
++				    strcmp(opt, "nfsvers") == 0) {
++					/*
++					 * Linux also takes "nfsvers" and a
++					 * minor version: "vers=4.1" is
++					 * "vers=4,minorversion=1".
++					 */
+ 					num = strtol(val, &p, 10);
++					if (num == 4 && *p == '.') {
++						char *q;
++						long minor;
++
++						minor = strtol(p + 1, &q, 10);
++						if (q == p + 1 || *q || minor < 0)
++							errx(1, "illegal vers value "
++							    "-- %s", val);
++						build_iovec(&iov, &iovlen,
++						    "minorversion",
++						    strdup(p + 1), (size_t)-1);
++						p = q;
++					}
+ 					if (*p || num <= 0)
+ 						errx(1, "illegal vers value -- "
+ 						    "%s", val);
+-- 
+2.54.0 (Apple Git-157)
+

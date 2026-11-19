@@ -1,0 +1,113 @@
+From 9d7f4f90be01a735761c29e6988b0c69e440839e Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 21:53:31 -0700
+Subject: [PATCH] freebsd: port-forward to hostNetwork pods
+
+kubectl port-forward to a hostNetwork pod (kube-scheduler,
+kube-controller-manager: the MetricsGrabber e2e tests) failed with
+"network namespace path of sandbox ... is empty": FreeBSD sandboxes
+have no netns path, and a hostNetwork pod's network is the host's. Skip
+that check on FreeBSD, and when the infra container is spoofed
+(drop_infra_ctr: no jail), dial localhost from crio itself.
+---
+ internal/oci/portforward_freebsd.go | 46 ++++++++++++++++++-----------
+ server/container_portforward.go     |  5 +++-
+ 2 files changed, 33 insertions(+), 18 deletions(-)
+
+diff --git a/internal/oci/portforward_freebsd.go b/internal/oci/portforward_freebsd.go
+index ed69556fc..5af20daed 100644
+--- a/internal/oci/portforward_freebsd.go
++++ b/internal/oci/portforward_freebsd.go
+@@ -43,9 +43,17 @@ func (r *runtimeOCI) PortForwardContainer(ctx context.Context, c *Container, net
+ 	defer span.End()
+ 	defer stream.Close()
+ 
+-	log.Infof(ctx, "Starting port forward for %s in jail %s", c.ID(), c.ID())
+-
+-	conn, err := dialInJail(ctx, c.ID(), port)
++	var conn net.Conn
++	var err error
++	if c.Spoofed() {
++		// No infra jail: a hostNetwork pod (drop_infra_ctr), whose
++		// network stack is the host's own.
++		log.Infof(ctx, "Starting port forward for %s on the host network", c.ID())
++		conn, err = dialLocalhost(port)
++	} else {
++		log.Infof(ctx, "Starting port forward for %s in jail %s", c.ID(), c.ID())
++		conn, err = dialInJail(ctx, c.ID(), port)
++	}
+ 	if err != nil {
+ 		return fmt.Errorf("port forward into jail %s: %w", c.ID(), err)
+ 	}
+@@ -166,20 +174,9 @@ func portForwardChild() {
+ 		fail("jail_attach %s: %v", os.Args[1], e)
+ 	}
+ 
+-	// localhost may mean IPv4 or IPv6 and the server may listen on only one:
+-	// try both, one after the other (as Linux's dialer with FallbackDelay -1).
+-	var conn net.Conn
+-	var errs []error
+-	for _, addr := range []string{"127.0.0.1", "::1"} {
+-		c, err := net.DialTimeout("tcp", net.JoinHostPort(addr, strconv.Itoa(port)), 10*time.Second)
+-		if err == nil {
+-			conn = c
+-			break
+-		}
+-		errs = append(errs, err)
+-	}
+-	if conn == nil {
+-		fail("failed to connect to localhost:%d inside jail %s: %v", port, os.Args[1], errors.Join(errs...))
++	conn, err := dialLocalhost(int32(port))
++	if err != nil {
++		fail("inside jail %s: %v", os.Args[1], err)
+ 	}
+ 	f, err := conn.(*net.TCPConn).File()
+ 	if err != nil {
+@@ -191,6 +188,21 @@ func portForwardChild() {
+ 	os.Exit(0)
+ }
+ 
++// dialLocalhost connects to localhost:port. localhost may mean IPv4 or IPv6
++// and the server may listen on only one: try both, one after the other (as
++// Linux's dialer with FallbackDelay -1).
++func dialLocalhost(port int32) (net.Conn, error) {
++	var errs []error
++	for _, addr := range []string{"127.0.0.1", "::1"} {
++		c, err := net.DialTimeout("tcp", net.JoinHostPort(addr, strconv.Itoa(int(port))), 10*time.Second)
++		if err == nil {
++			return c, nil
++		}
++		errs = append(errs, err)
++	}
++	return nil, fmt.Errorf("failed to connect to localhost:%d: %w", port, errors.Join(errs...))
++}
++
+ // jailID returns the jid of the jail with the given name, from jail_get(2).
+ func jailID(name string) (int32, error) {
+ 	var jid int32
+diff --git a/server/container_portforward.go b/server/container_portforward.go
+index 65a7a10b3..1d6397ef7 100644
+--- a/server/container_portforward.go
++++ b/server/container_portforward.go
+@@ -5,6 +5,7 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"io"
++	"runtime"
+ 
+ 	"go.podman.io/storage/pkg/pools"
+ 	types "k8s.io/cri-api/pkg/apis/runtime/v1"
+@@ -56,7 +57,9 @@ func (s *StreamService) PortForward(ctx context.Context, podSandboxID string, po
+ 	}
+ 
+ 	netNsPath := sb.NetNsPath()
+-	if netNsPath == "" {
++	// FreeBSD finds the pod's network stack through its infra jail, and a
++	// hostNetwork pod's is the host's: no path there.
++	if netNsPath == "" && runtime.GOOS != "freebsd" {
+ 		return fmt.Errorf(
+ 			"network namespace path of sandbox %s is empty", sb.ID(),
+ 		)
+-- 
+2.54.0 (Apple Git-157)
+

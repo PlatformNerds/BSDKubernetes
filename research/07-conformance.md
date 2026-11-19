@@ -160,6 +160,41 @@ tests (FreeBSD has neither `ip` nor a dummy interface type).
 SCTP library was Linux-only. Now **10/10**, after porting the library and teaching pf (`net.pf.sctp_rdr_ports`,
 kernel `bsdk8s20`) to translate SCTP Service ports.
 
+## SIG sweep beyond the conformance set (2026-11-19, kernel `bsdk8s21`)
+
+Not Conformance, Serial, Slow, Disruptive, Flaky, Feature or LinuxOnly:
+
+| SIG | Result |
+|---|---|
+| sig-cli | 50/59, then **58/59** |
+| sig-auth | 7/7 |
+| sig-instrumentation | 4/6, then **6/6** |
+| sig-api-machinery | 63/63 |
+| sig-scheduling | none in this set |
+
+- **`kubectl port-forward` crashed CRI-O (fixed).**
+  - The FreeBSD runtime had no `PortForwardContainer`. The generic one called itself until the goroutine stack
+    overflowed (`fatal error: stack overflow`, in `/var/log/messages` via daemon(8), not in `crio.log`).
+  - The node then went NotReady until crio was restarted. No conformance test port-forwards, so no run had
+    caught it.
+  - CRI-O 0021: crio re-executes itself as `crio-portforward`, which attaches to the pod's infra jail, connects to
+    `localhost:port` and passes the socket back over a socketpair.
+  - CRI-O 0022: hostNetwork pods have no jail (dropped infra container), so crio dials `localhost` itself. That
+    covers kube-scheduler and kube-controller-manager, where the MetricsGrabber tests read metrics.
+- **A pod's containers could not see each other's sockets (fixed).**
+  - Every port-forward test pod has a readiness probe `netstat -na | grep LISTEN | grep -v 8080 | grep 80`.
+    It runs in one container and looks for the other container's listener.
+  - agnhost lacked `netstat`; it now gets FreeBSD's, whose `tcp4 ... *.80 ... LISTEN` matches the same way.
+  - Each container is a sibling jail under the pod jail. Socket visibility follows `prison_check()`: own jail and
+    children, not siblings. So `netstat` saw only its own container's sockets.
+  - On Linux a pod is one network namespace, and every container sees all its sockets.
+  - freebsd-src 0034 adds `security.bsd.see_vnet_sockets`, off by default. When set, jails that share a vnet other
+    than the host's see each other's sockets.
+  - Checked: one pod's containers see each other's listeners, but not another pod's or the host's. Both nodes
+    boot `kernel.bsdk8s21` with it set.
+- **Not FreeBSD:** "should handle in-cluster config" expects `kubectl --server=invalid` to fail name resolution.
+  This network's DNS answers for `invalid` (`192.168.160.1`, from the Mac too), so the request reaches an HTML page.
+
 ## Run 9: 420/446, no regressions, but node 2 froze once (2026-11-17)
 
 This run checked everything since run 8:

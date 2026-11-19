@@ -120,6 +120,9 @@ else
   echo "WARNING: no COREDNS=; agnhost has no /coredns (DNS tests that run it will fail)"
 fi
 hostbin /usr/bin/nc /usr/bin/getent   # e2e runs `nc -v -t -w 2` (OpenBSD nc, like netcat-openbsd)
+# Port-forward tests probe readiness with `netstat -na | grep LISTEN | grep 80` (busybox's netstat
+# on Alpine; FreeBSD's prints `tcp4 0 0 *.80 *.* LISTEN`, which matches the same way).
+hostbin /usr/bin/netstat
 bbfill
 install -m 755 "$agnhost" "$m/agnhost"
 ln -sf agnhost "$m/agnhost-2"

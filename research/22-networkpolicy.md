@@ -77,6 +77,5 @@ restarts.
   iptables-based implementations behave the same, through conntrack.
 - IPv4 and IPv6 rules are rendered alike, but only IPv4 is tested (the cluster is IPv4).
 - AdminNetworkPolicy / ClusterNetworkPolicy tiers (research/03 §3.2) are not implemented.
-- The 5 SCTP variants (`[Feature:SCTPConnectivity] [LinuxOnly]`) weren't counted. The rules handle `proto sctp`,
-  and the nodes can load `sctp.ko`, but agnhost can't open an SCTP socket on FreeBSD: its library
-  (`ishidawataru/sctp`) is Linux-only ("SCTP is unsupported on freebsd/arm64").
+- The 5 SCTP variants (`[Feature:SCTPConnectivity] [LinuxOnly]`) weren't counted at first: agnhost's
+  SCTP library (`ishidawataru/sctp`) was Linux-only. With it ported (research/23) they pass.

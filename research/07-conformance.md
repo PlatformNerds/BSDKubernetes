@@ -147,6 +147,10 @@ LinuxOnly): 52/56, then **54/56**.
     socket. Linux copies TCP to raw sockets; FreeBSD never does, so the server never sends its out-of-window
     packet. Porting it to BPF would be needed to test pf's window checking this way.
 
+**SCTP** (`[Feature:SCTPConnectivity]` and the other SCTP tests, research/23): none could run, because agnhost's
+SCTP library was Linux-only. Now **10/10**, after porting the library and teaching pf (`net.pf.sctp_rdr_ports`,
+kernel `bsdk8s20`) to translate SCTP Service ports.
+
 ## Run 9: 420/446, no regressions, but node 2 froze once (2026-11-17)
 
 This run checked everything since run 8:

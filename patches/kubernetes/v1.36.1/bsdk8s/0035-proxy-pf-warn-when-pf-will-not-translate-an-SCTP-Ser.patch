@@ -1,0 +1,218 @@
+From 2e04a970675bd6ad4ba857eedf0160c41f87608f Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 18:57:19 -0700
+Subject: [PATCH 35/35] proxy/pf: warn when pf will not translate an SCTP
+ Service's port
+
+pf leaves SCTP ports alone on rdr unless net.pf.sctp_rdr_ports is set (a
+BSDKubernetes kernel patch; stock kernels never change them), so an SCTP
+Service whose targetPort or NodePort differs from the port it is reached
+on silently sends connections to the endpoints' wrong port. Log it once
+per Service port, with the sysctl to set.
+---
+ pkg/proxy/pf/proxier.go        | 46 ++++++++++++++++++++++++++++++++++
+ pkg/proxy/pf/proxier_test.go   | 44 ++++++++++++++++++++++++++++++++
+ pkg/proxy/pf/sysctl_freebsd.go | 28 +++++++++++++++++++++
+ pkg/proxy/pf/sysctl_other.go   | 25 ++++++++++++++++++
+ 4 files changed, 143 insertions(+)
+ create mode 100644 pkg/proxy/pf/sysctl_freebsd.go
+ create mode 100644 pkg/proxy/pf/sysctl_other.go
+
+diff --git a/pkg/proxy/pf/proxier.go b/pkg/proxy/pf/proxier.go
+index 17cf36cd6bf..dc94325e804 100644
+--- a/pkg/proxy/pf/proxier.go
++++ b/pkg/proxy/pf/proxier.go
+@@ -144,6 +144,12 @@ type Proxier struct {
+ 	// Inject for test purpose.
+ 	networkInterfacer proxyutil.NetworkInterfacer
+ 
++	// sctpRdrPorts reports whether pf may change SCTP ports on rdr
++	// (sysctl net.pf.sctp_rdr_ports); sctpWarned holds the Service
++	// ports already warned about.
++	sctpRdrPorts func() (bool, error)
++	sctpWarned   sets.Set[string]
++
+ 	logger klog.Logger
+ }
+ 
+@@ -188,6 +194,8 @@ func NewProxier(ctx context.Context,
+ 		pfData:              proxyutil.NewLineBuffer(),
+ 		nodePortAddresses:   nodePortAddresses,
+ 		networkInterfacer:   proxyutil.RealNetwork{},
++		sctpRdrPorts:        pfSCTPRdrPorts,
++		sctpWarned:          sets.New[string](),
+ 		logger:              logger,
+ 	}
+ 
+@@ -537,6 +545,41 @@ type serviceRules struct {
+ 	shortCircuit *pfTarget
+ }
+ 
++// checkSCTPPorts warns, once per Service port, when reaching an SCTP Service
++// means changing the destination port (a targetPort or NodePort different
++// from the port it is reached on) but pf will not: by default pf leaves SCTP
++// ports alone, and connections then reach the endpoints on the wrong port.
++// sysctl net.pf.sctp_rdr_ports=1 (a BSDKubernetes kernel patch) allows it.
++func (proxier *Proxier) checkSCTPPorts(r *serviceRules, dests []externalDestination) {
++	key := r.name
++	if proxier.sctpWarned.Has(key) {
++		return
++	}
++	differs := false
++	for _, t := range []*pfTarget{r.internal, r.external, r.shortCircuit} {
++		if t == nil {
++			continue
++		}
++		for _, g := range t.groups() {
++			differs = differs || g.port != r.port
++			for _, d := range dests {
++				differs = differs || g.port != d.port
++			}
++		}
++	}
++	if !differs {
++		return
++	}
++	on, err := proxier.sctpRdrPorts()
++	if on {
++		return
++	}
++	proxier.sctpWarned.Insert(key)
++	proxier.logger.Info("pf will not change the destination port of this SCTP Service's connections, "+
++		"so they reach its endpoints on the wrong port: set sysctl net.pf.sctp_rdr_ports=1",
++		"service", r.name, "port", r.port, "nodePort", r.nodePort, "err", err)
++}
++
+ // noEndpoints reports whether no traffic to the service can reach an
+ // endpoint (iptables: no locally reachable endpoints).
+ func (r *serviceRules) noEndpoints() bool {
+@@ -551,6 +594,9 @@ func (r *serviceRules) noEndpoints() bool {
+ func (proxier *Proxier) writeServiceRules(r *serviceRules) {
+ 	af, proto := r.af, r.proto
+ 	dests := r.externalDestinations()
++	if proto == "sctp" {
++		proxier.checkSCTPPorts(r, dests)
++	}
+ 	if r.noEndpoints() {
+ 		// Reject (TCP RST, ICMP unreachable) rather than let clients
+ 		// time out, as on Linux.
+diff --git a/pkg/proxy/pf/proxier_test.go b/pkg/proxy/pf/proxier_test.go
+index 5f89a661b82..26d46a9c316 100644
+--- a/pkg/proxy/pf/proxier_test.go
++++ b/pkg/proxy/pf/proxier_test.go
+@@ -374,3 +374,47 @@ func TestWriteServiceRulesSplitPorts(t *testing.T) {
+ 	}
+ 	checkOrder(t, p.pfData.String())
+ }
++
++func TestCheckSCTPPorts(t *testing.T) {
++	for _, tc := range []struct {
++		name       string
++		port       int
++		nodePort   int
++		targetPort int
++		rdrPorts   bool
++		warned     bool
++	}{
++		{name: "same port", port: 9000, targetPort: 9000},
++		{name: "targetPort differs", port: 95, targetPort: 8081, warned: true},
++		{name: "nodePort differs", port: 9000, nodePort: 30000, targetPort: 9000, warned: true},
++		{name: "targetPort differs, pf allowed", port: 95, targetPort: 8081, rdrPorts: true},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			calls := 0
++			p := &Proxier{
++				pfData:     proxyutil.NewLineBuffer(),
++				sctpWarned: sets.New[string](),
++				sctpRdrPorts: func() (bool, error) {
++					calls++
++					return tc.rdrPorts, nil
++				},
++			}
++			r := &serviceRules{
++				name: "ns/svc:s", af: "inet", proto: "sctp",
++				clusterIP: net.ParseIP("10.96.0.10"),
++				port:      tc.port, nodePort: tc.nodePort,
++				nodeIPs:  []net.IP{net.ParseIP("192.168.100.1")},
++				internal: target([]string{"10.244.0.5"}, nil, tc.targetPort),
++				external: target([]string{"10.244.0.5"}, nil, tc.targetPort),
++			}
++			p.writeServiceRules(r)
++			p.writeServiceRules(r)
++			if got := p.sctpWarned.Has("ns/svc:s"); got != tc.warned {
++				t.Errorf("warned = %v, want %v", got, tc.warned)
++			}
++			if tc.warned && calls != 1 {
++				t.Errorf("sysctl read %d times, want once (warn once)", calls)
++			}
++		})
++	}
++}
+diff --git a/pkg/proxy/pf/sysctl_freebsd.go b/pkg/proxy/pf/sysctl_freebsd.go
+new file mode 100644
+index 00000000000..f93ced4c968
+--- /dev/null
++++ b/pkg/proxy/pf/sysctl_freebsd.go
+@@ -0,0 +1,28 @@
++//go:build freebsd
++
++/*
++Copyright 2026 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package pf
++
++import "golang.org/x/sys/unix"
++
++// pfSCTPRdrPorts reports whether pf may change SCTP destination ports on rdr
++// (net.pf.sctp_rdr_ports; kernels without it never do).
++func pfSCTPRdrPorts() (bool, error) {
++	v, err := unix.SysctlUint32("net.pf.sctp_rdr_ports")
++	return err == nil && v != 0, err
++}
+diff --git a/pkg/proxy/pf/sysctl_other.go b/pkg/proxy/pf/sysctl_other.go
+new file mode 100644
+index 00000000000..73fcbb435eb
+--- /dev/null
++++ b/pkg/proxy/pf/sysctl_other.go
+@@ -0,0 +1,25 @@
++//go:build !freebsd
++
++/*
++Copyright 2026 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package pf
++
++import "errors"
++
++func pfSCTPRdrPorts() (bool, error) {
++	return false, errors.New("pf is FreeBSD-only")
++}
+-- 
+2.54.0 (Apple Git-157)
+

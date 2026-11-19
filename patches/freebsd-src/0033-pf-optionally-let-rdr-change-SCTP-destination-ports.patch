@@ -1,0 +1,283 @@
+From 3440bca3d58cffec0fe726add9d6f5e6c833c9dc Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 19:01:25 -0700
+Subject: [PATCH] pf: optionally let rdr change SCTP destination ports
+
+pf never changes SCTP ports (6053adafaa), so a redirect to a different
+port is silently a redirect to the same port. Kubernetes Services map
+port to targetPort, so an SCTP Service whose targetPort differs from its
+port (the common case), and every SCTP NodePort, cannot work with
+pf-based service proxies.
+
+Add net.pf.sctp_rdr_ports (off by default, keeping today's behaviour).
+When set, rdr computes the destination port for SCTP like for TCP and
+UDP; the source port is still never changed. SCTP's CRC32c covers the
+ports and cannot be updated incrementally, so pf_change_ap() flags the
+change and pf_sctp_cksum_fixup() recomputes the checksum after the header
+is copied back, unless it is still left to the stack (CSUM_SCTP).
+pf_translate_compat() now asks for that copy-back when it changed an
+SCTP port (it never needed it before), and pf_packet_rework_nat() copies
+the SCTP header back too.
+
+The cost of the default is why it is a knob: the peer of a multihomed
+association reaches its other addresses on the untranslated port.
+
+Test: sctp:rdr_port_v4.
+---
+ share/man/man4/pf.4          |  6 ++++
+ sys/net/pfvar.h              |  1 +
+ sys/netpfil/pf/pf.c          | 35 ++++++++++++++++++--
+ sys/netpfil/pf/pf_lb.c       | 22 +++++++++++--
+ tests/sys/netpfil/pf/sctp.sh | 63 ++++++++++++++++++++++++++++++++++++
+ 5 files changed, 122 insertions(+), 5 deletions(-)
+
+diff --git a/share/man/man4/pf.4 b/share/man/man4/pf.4
+index 03a4ba2bb..d3f2fa70c 100644
+--- a/share/man/man4/pf.4
++++ b/share/man/man4/pf.4
+@@ -52,6 +52,7 @@ In
+ .Xr sysctl.conf 5 :
+ .Cd net.pf.request_maxcount
+ .Cd net.pf.filter_local
++.Cd net.pf.sctp_rdr_ports
+ .Sh DESCRIPTION
+ Packet filtering takes place in the kernel.
+ A pseudo-device,
+@@ -107,6 +108,11 @@ to also filter on the loopback output hook.
+ This is typically used to allow redirect rules to adjust the source address.
+ .It Va net.pf.request_maxcount
+ The maximum number of items in a single ioctl call.
++.It Va net.pf.sctp_rdr_ports
++Allow rdr rules to change the destination port of SCTP connections.
++The SCTP checksum is recomputed for each translated packet.
++Off by default: the peer of a multihomed association would reach the
++association's other addresses on the original port.
+ .El
+ .Sh LOADER TUNABLES
+ The following tunables can be entered at the
+diff --git a/sys/net/pfvar.h b/sys/net/pfvar.h
+index 9e0917b50..58cc151b6 100644
+--- a/sys/net/pfvar.h
++++ b/sys/net/pfvar.h
+@@ -1727,6 +1727,7 @@ struct pf_pdesc {
+ #define PFDESC_SCTP_HEARTBEAT_ACK	0x0400
+ #define PFDESC_SCTP_OTHER	0x0800
+ #define PFDESC_SCTP_ADD_IP	0x1000
++#define PFDESC_SCTP_CKSUM	0x2000	/* pf changed a port: redo CRC32c */
+ 	u_int16_t	 sctp_flags;
+ 	u_int32_t	 sctp_initiate_tag;
+ 	u_int16_t	 sctp_dummy_sum;
+diff --git a/sys/netpfil/pf/pf.c b/sys/netpfil/pf/pf.c
+index 7aee28e7b..c5f4412db 100644
+--- a/sys/netpfil/pf/pf.c
++++ b/sys/netpfil/pf/pf.c
+@@ -569,6 +569,22 @@ pf_sctp_checksum(struct mbuf *m, int off)
+ 	    sizeof(sum), (caddr_t)&sum);
+ }
+ 
++/*
++ * After pf rewrote an SCTP port and copied the header back, recompute the
++ * checksum, unless the stack has yet to compute it (CSUM_SCTP: a locally
++ * generated packet, checksummed on output).
++ */
++static void
++pf_sctp_cksum_fixup(struct pf_pdesc *pd)
++{
++	if ((pd->sctp_flags & PFDESC_SCTP_CKSUM) == 0)
++		return;
++	pd->sctp_flags &= ~PFDESC_SCTP_CKSUM;
++	if (pd->m->m_pkthdr.csum_flags & (CSUM_SCTP | CSUM_SCTP_IPV6))
++		return;
++	pf_sctp_checksum(pd->m, pd->off);
++}
++
+ int
+ pf_addr_cmp(struct pf_addr *a, struct pf_addr *b, sa_family_t af)
+ {
+@@ -663,7 +679,8 @@ pf_packet_rework_nat(struct pf_pdesc *pd, int off, struct pf_state_key *nk)
+ 			pf_change_ap(pd, pd->dst, &sh->dest_port,
+ 			    &nk->addr[pd->didx], nk->port[pd->didx]);
+ 		}
+-
++		m_copyback(pd->m, off, sizeof(*sh), (caddr_t)sh);
++		pf_sctp_cksum_fixup(pd);
+ 		break;
+ 	}
+ 	case IPPROTO_ICMP: {
+@@ -3382,6 +3399,12 @@ pf_change_ap(struct pf_pdesc *pd, struct pf_addr *a, u_int16_t *p,
+ 		return;
+ 	po = *p;
+ 	*p = pn;
++	/*
++	 * SCTP's CRC32c covers the ports (but not the addresses) and cannot be
++	 * fixed up incrementally: have pf_sctp_cksum_fixup() recompute it.
++	 */
++	if (pd->proto == IPPROTO_SCTP && po != pn)
++		pd->sctp_flags |= PFDESC_SCTP_CKSUM;
+ 
+ 	switch (pd->af) {
+ #ifdef INET
+@@ -6096,8 +6119,10 @@ pf_test_rule(struct pf_krule **rm, struct pf_kstate **sm,
+ 	}
+ 
+ 	/* copy back packet headers if we performed NAT operations */
+-	if (ctx.rewrite)
++	if (ctx.rewrite) {
+ 		m_copyback(pd->m, pd->off, pd->hdrlen, pd->hdr.any);
++		pf_sctp_cksum_fixup(pd);
++	}
+ 
+ 	if (*sm != NULL && !((*sm)->state_flags & PFSTATE_NOSYNC) &&
+ 	    pd->dir == PF_OUT &&
+@@ -6544,6 +6569,8 @@ pf_translate_compat(struct pf_test_ctx *ctx)
+ 			pd->ndport = pd->hdr.sctp.dest_port;
+ 			pf_addrcpy(&pd->ndaddr, pd->dst, pd->af);
+ 		}
++		if (pd->sctp_flags & PFDESC_SCTP_CKSUM)
++			rewrite++;
+ 		break;
+ 	}
+ #ifdef INET
+@@ -7352,8 +7379,10 @@ pf_test_state(struct pf_kstate **state, struct pf_pdesc *pd, u_short *reason)
+ 		copyback = 1;
+ 	}
+ 
+-	if (copyback && pd->hdrlen > 0)
++	if (copyback && pd->hdrlen > 0) {
+ 		m_copyback(pd->m, pd->off, pd->hdrlen, pd->hdr.any);
++		pf_sctp_cksum_fixup(pd);
++	}
+ 
+ 	return (action);
+ }
+diff --git a/sys/netpfil/pf/pf_lb.c b/sys/netpfil/pf/pf_lb.c
+index beffdcd01..882dd3d15 100644
+--- a/sys/netpfil/pf/pf_lb.c
++++ b/sys/netpfil/pf/pf_lb.c
+@@ -71,6 +71,17 @@
+ #define	V_pf_rdr_srcport_rewrite_tries	VNET(pf_rdr_srcport_rewrite_tries)
+ VNET_DEFINE_STATIC(int, pf_rdr_srcport_rewrite_tries) = 16;
+ 
++/*
++ * rdr leaves SCTP ports alone by default: the peer of a multihomed association
++ * would reach its other addresses on the untranslated port. Services that
++ * redirect to a different port (Kubernetes' port -> targetPort) need it.
++ */
++VNET_DEFINE_STATIC(int, pf_sctp_rdr_ports) = 0;
++#define	V_pf_sctp_rdr_ports	VNET(pf_sctp_rdr_ports)
++SYSCTL_INT(_net_pf, OID_AUTO, sctp_rdr_ports, CTLFLAG_VNET | CTLFLAG_RW,
++    &VNET_NAME(pf_sctp_rdr_ports), 0,
++    "Let rdr rules change SCTP destination ports");
++
+ static uint64_t		 pf_hash(struct pf_addr *, struct pf_addr *,
+ 			    struct pf_poolhashkey *, sa_family_t);
+ struct pf_krule		*pf_match_translation(int, struct pf_test_ctx *);
+@@ -1142,8 +1153,8 @@ pf_get_transaddr(struct pf_test_ctx *ctx, struct pf_krule *r,
+ 			pf_poolmask(naddr, naddr, &rpool->cur->addr.v.a.mask,
+ 			    &pd->ndaddr, pd->af);
+ 
+-		/* Do not change SCTP ports. */
+-		if (pd->proto == IPPROTO_SCTP)
++		/* Do not change SCTP ports, unless asked to. */
++		if (pd->proto == IPPROTO_SCTP && !V_pf_sctp_rdr_ports)
+ 			break;
+ 
+ 		if (rpool->proxy_port[1]) {
+@@ -1170,6 +1181,13 @@ pf_get_transaddr(struct pf_test_ctx *ctx, struct pf_krule *r,
+ 		 */
+ 		*nportp = nport;
+ 
++		/*
++		 * SCTP keeps its source port (see pf_get_sport()). The new
++		 * destination port means a new CRC32c: pf_sctp_cksum_fixup().
++		 */
++		if (pd->proto == IPPROTO_SCTP)
++			break;
++
+ 		/*
+ 		 * Do we have a source port conflict in the stack state?  Try to
+ 		 * modulate the source port if so.  Note that this is racy since
+diff --git a/tests/sys/netpfil/pf/sctp.sh b/tests/sys/netpfil/pf/sctp.sh
+index 47bf40181..e195af4ac 100644
+--- a/tests/sys/netpfil/pf/sctp.sh
++++ b/tests/sys/netpfil/pf/sctp.sh
+@@ -531,6 +531,68 @@ rdr_v4_cleanup()
+ 	pft_cleanup
+ }
+ 
++atf_test_case "rdr_port_v4" "cleanup"
++rdr_port_v4_head()
++{
++	atf_set descr 'Test rdr changing SCTP ports (net.pf.sctp_rdr_ports)'
++	atf_set require.user root
++	atf_set require.kmods sctp
++}
++
++rdr_port_v4_body()
++{
++	sctp_init
++
++	j="sctp:rdr_port_v4"
++	epair_c=$(vnet_mkepair)
++	epair_srv=$(vnet_mkepair)
++
++	vnet_mkjail ${j}srv ${epair_srv}a
++	vnet_mkjail ${j}gw ${epair_srv}b ${epair_c}a
++	vnet_mkjail ${j}c ${epair_c}b
++
++	jexec ${j}srv ifconfig ${epair_srv}a 198.51.100.1/24 up
++	# No default route in srv jail, to ensure we're NAT-ing
++	jexec ${j}gw ifconfig ${epair_srv}b 198.51.100.2/24 up
++	jexec ${j}gw ifconfig ${epair_c}a 192.0.2.1/24 up
++	jexec ${j}gw sysctl net.inet.ip.forwarding=1
++	jexec ${j}c ifconfig ${epair_c}b 192.0.2.2/24 up
++	jexec ${j}c route add default 192.0.2.1
++
++	jexec ${j}gw pfctl -e
++	jexec ${j}gw sysctl net.pf.sctp_rdr_ports=1
++	pft_set_rules ${j}gw \
++		"rdr pass on ${epair_srv}b proto sctp from 198.51.100.0/24 to any port 1234 -> 192.0.2.2 port 4321" \
++		"pass"
++
++	echo "foo" | jexec ${j}c nc --sctp -N -l 4321 &
++
++	# Wait for the server to start
++	sleep 1
++
++	# The destination port is translated both ways and the checksum
++	# recomputed, or the association would not come up.
++	out=$(jexec ${j}srv nc --sctp -N -w 3 198.51.100.2 1234)
++	if [ "$out" != "foo" ]; then
++		atf_fail "SCTP connection to the redirected port failed"
++	fi
++
++	# Off again: the port is left alone.
++	jexec ${j}gw sysctl net.pf.sctp_rdr_ports=0
++	jexec ${j}gw pfctl -Fs
++	echo "bar" | jexec ${j}c nc --sctp -N -l 4321 &
++	sleep 1
++	out=$(jexec ${j}srv nc --sctp -N -w 3 198.51.100.2 1234)
++	if [ "$out" == "bar" ]; then
++		atf_fail "Port was unexpectedly changed."
++	fi
++}
++
++rdr_port_v4_cleanup()
++{
++	pft_cleanup
++}
++
+ atf_test_case "pfsync" "cleanup"
+ pfsync_head()
+ {
+@@ -847,6 +909,7 @@ atf_init_test_cases()
+ 	atf_add_test_case "nat_v4"
+ 	atf_add_test_case "nat_v6"
+ 	atf_add_test_case "rdr_v4"
++	atf_add_test_case "rdr_port_v4"
+ 	atf_add_test_case "pfsync"
+ 	atf_add_test_case "timeout"
+ 	atf_add_test_case "related_icmp"
+-- 
+2.54.0 (Apple Git-157)
+

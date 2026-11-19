@@ -197,7 +197,7 @@ Not Conformance, Serial, Slow, Disruptive, Flaky, Feature or LinuxOnly:
   - Checked: one pod's containers see each other's listeners, but not another pod's or the host's. Both nodes
     boot `kernel.bsdk8s21` with it set.
 - **sig-node:**
-  - The 32 `PLR Pod InPlace Resize` tests (pod-level resources, beta) fail like the six container resize tests
+  - The 31 `PLR Pod InPlace Resize` tests that ran (pod-level resources, beta) fail like the six container resize tests
     (research/17). Their pods set `spec.os.name: linux`, so they run under the Linuxulator. There the FreeBSD busybox
     tag is refused, and they check `cpu.weight`, which FreeBSD doesn't enforce. Each waits five minutes, so they
     also push a full sig-node run past its one-hour limit.

@@ -84,6 +84,14 @@ volumes with `MNT_IGNORE` (dfr, so a node's `df` isn't flooded by every pod's mo
 plain `df` in the jail too. FreeBSD's `df` also counts 512-byte blocks. The jail and the host share one mount
 table, so this one stays a documented difference.
 
+**Update (2026-11-19): passes.** The test runs upstream's busybox image, whose `df` is busybox's applet. Our FreeBSD
+busybox build had left the applet out: it reads Linux's mount table (`/proc/mounts`), so the port disables it. With
+`scripts/busybox-freebsd/local/` it now walks `getmntinfo(3)` and counts 1K blocks, like upstream's. It lists
+`MNT_IGNORE` mounts too, as Linux lists bind mounts. In a jail, a nullfs mount whose source is a host path the jail
+can't see is named `nullfs`, as Linux names a bind mount by its filesystem. Otherwise busybox wraps the line after the
+long device name, and `awk '{print $2}'` reads "Used" instead of the size. In the pod, `df` now shows
+`nullfs 10240 4 10236 0% /usr/share/volumeshare`. FreeBSD's own `df` and `MNT_IGNORE` are unchanged.
+
 ## Also fixed along the way
 
 Node 2's clock was 15 minutes behind node 1: its ntpd lost its pool servers to a DNS outage (probably while the

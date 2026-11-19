@@ -123,7 +123,8 @@ Serial/Slow/Disruptive): 87/94, then **91/94**. The 4 probe-while-terminating te
 sidecars) failed with `CreateContainerError: /bin/bash: No such file or directory`. They run `/bin/bash`, which
 Alpine's bash package provides, while FreeBSD's bash lives in `/usr/local/bin`. The agnhost image (and kitten and
 nautilus, built on it) now links `/bin/bash`, and all 4 pass. The 3 left:
-- the memory-backed EmptyDir `df` test (research/20, `MNT_IGNORE`);
+- the memory-backed EmptyDir `df` test (research/20, `MNT_IGNORE`). **Fixed** 2026-11-19: busybox's `df` applet,
+  ported to `getmntinfo(3)`;
 - sysctls with slashes (`[LinuxOnly]`, Linux `kernel.*` names);
 - PrivilegedPod (`[LinuxOnly]`, `ip link add ... type dummy`; FreeBSD has no dummy interface type).
 
@@ -145,7 +146,15 @@ LinuxOnly): 52/56, then **54/56**.
   - "should not be vulnerable to the invalid conntrack state bug": its server
     (`regression-issue-74839`, now built for FreeBSD) watches the client's TCP segments through a raw `ip:tcp`
     socket. Linux copies TCP to raw sockets; FreeBSD never does, so the server never sends its out-of-window
-    packet. Porting it to BPF would be needed to test pf's window checking this way.
+    packet. Porting it to BPF would be needed to test pf's window checking this way. **Fixed** 2026-11-19: on
+    FreeBSD the server reads the segments from bpf(4) (kubernetes patch 0036), and CRI-O gives `/dev/bpf` to
+    containers with `CAP_NET_RAW`, which the test pod asks for (CRI-O patch 0020). In a verbose run, the server
+    saw 30 handshakes and injected 30 out-of-window packets, and the client never sent an RST: pf drops packets
+    outside the state's window, so they never reach the client.
+
+**All `[NodeConformance]`** (2026-11-19, kernel `bsdk8s20`, 235 tests, not Serial/Slow/Disruptive/Flaky): **231/235**.
+The 4 left are `[LinuxOnly]`: the two sysctl tests (Linux `kernel.*` names) and the two `ip link add ... type dummy`
+tests (FreeBSD has neither `ip` nor a dummy interface type).
 
 **SCTP** (`[Feature:SCTPConnectivity]` and the other SCTP tests, research/23): none could run, because agnhost's
 SCTP library was Linux-only. Now **10/10**, after porting the library and teaching pf (`net.pf.sctp_rdr_ports`,

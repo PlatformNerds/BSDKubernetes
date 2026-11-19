@@ -25,10 +25,15 @@ src=$work/busybox-$ver
 
 # The port's do-patch, post-patch and do-configure steps.
 for p in "$port"/files/patch-*; do patch -s -p0 -d "$src" < "$p"; done
+# Ours (local/): the df applet, which the port leaves out because it reads Linux's mount
+# table; upstream's busybox image has it, and tests run `df` (e.g. the memory emptyDir size).
+for p in "$(dirname "$port")"/local/patch-*; do patch -s -p0 -d "$src" < "$p"; done
 sed -i '' -e 's|\([[:<:]]\)sed\([[:blank:]]-n\)|\1gsed\2|' "$src/scripts/gen_build_files.sh"
 find "$src" -name '*.c' -print0 | xargs -0 sed -i '' -e 's|<alloca.h>|<stdlib.h>|; s|<malloc.h>|<stdlib.h>|'
 find "$src" -name '*.[ch]' -print0 | xargs -0 sed -i '' -e 's|"/proc|"/compat/linux/proc|'
 cp "$port/files/data-.config" "$src/.config"
+sed -i '' -e 's|^# CONFIG_DF is not set|CONFIG_DF=y|' \
+    -e 's|^# CONFIG_FEATURE_DF_FANCY is not set|CONFIG_FEATURE_DF_FANCY=y|' "$src/.config"
 # CFLAGS: the ports framework's defaults, plus BB_GLOBAL_CONST='' (the port sets it for armv6
 # only). BusyBox declares the pointer to each applet's globals const and fills it in through a
 # cast, and clang optimizes on the const: 1.37.0's awk dereferenced a stale pointer and

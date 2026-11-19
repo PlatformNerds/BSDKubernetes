@@ -29,8 +29,10 @@
 #                       Corefile). Upstream bundles 1.6.2, which predates Go's freebsd/arm64
 #                       port; use the cluster's FreeBSD CoreDNS build.
 #     REGRESSION_74839=<binary>
-#                       FreeBSD build of test/images/regression-issue-74839 (portable Go: a
-#                       TCP server and a raw ip:tcp socket); the conntrack invalid-state test.
+#                       FreeBSD build of test/images/regression-issue-74839 (kubernetes patch
+#                       0036: reads TCP with bpf(4), as FreeBSD gives raw sockets no TCP; the
+#                       pod needs CAP_NET_RAW, which CRI-O maps to /dev/bpf); the conntrack
+#                       invalid-state test.
 #     ONLY="<names>"    build only these images (agnhost kitten nautilus busybox nonroot
 #                       glibc-dns-testing nonewprivs nginx sample-apiserver etcd
 #                       regression-issue-74839 pause)

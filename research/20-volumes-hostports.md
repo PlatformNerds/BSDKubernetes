@@ -174,3 +174,37 @@ Unit test: `server/submounts_freebsd_test.go` (6 cases).
   maps every mode to private).
 - The practical cost: CSI node plugins rely on `Bidirectional` to make their mounts visible to the kubelet, so a
   CSI node plugin can't run as a pod on FreeBSD. It would have to run on the host.
+
+## hostPath to a unix socket (ocijail dbf2231, freebsd-src 0035)
+
+*2026-11-19.* A hostPath can name a daemon's socket (a container runtime, a CSI or device plugin, a log or
+metrics agent). On FreeBSD such a pod never started:
+
+```
+container create failed: mounting {"destination":"/mnt/test",...,"source":".../asocket","type":"bind"}: Invalid argument
+```
+
+nullfs in 15.1 mounts only directories and regular files. Upstream lifted that in main on 2026-08-28:
+`2c68ad49f13d` "nullfs: Allow VSOCK to be mounted on top of another VSOCK" (D59158, reviewed by dfr@), written
+for exactly this container use. The mount point must be a socket too.
+
+- **Kernel:** freebsd-src 0035, a backport of `2c68ad49f13d` to 15.1. It is upstream's commit unchanged, on
+  branch `bsdk8s/nullfs-socket-mount-15.1`. No main twin is needed. Both nodes boot `kernel.bsdk8s22`.
+- **ocijail** (0015-0016): for a socket source it creates a socket node as the mount point and mounts over it.
+  It uses `bindat(2)` relative to the directory, since container paths are longer than `sun_path`. The node is
+  removed on unmount. On a kernel without the change the error says so. New test `test_socket_mount`: a host
+  listener, its socket mounted into a container, `nc -U` there reads the greeting, and the node is gone
+  afterwards. It is skipped where `mount_nullfs` can't mount a socket.
+- **Userland:** `mount_nullfs(8)` from the same commit, linked statically against the patched `libutil.a` and
+  installed on both nodes (old binary kept as `.prev-vsock`). The system `libutil.so` isn't replaced, so
+  `mount -t nullfs` still refuses sockets; `mount_nullfs` itself works.
+
+| Check | Before | After |
+|---|---|---|
+| `HostPathType Socket` e2e | 5/7 (both "should be able to mount" fail) | **7/7** |
+| ocijail tests (node 2, `bsdk8s22`) | 31 | 32/32 (`test_socket_mount` runs) |
+| `mount_nullfs` of a socket on the node, `nc -U` through it | "must be either a file or directory" | the listener's reply arrives |
+
+The other 14 `HostPathType` failures are block and character devices. The test creates them with `mknod(2)`
+on the node, and FreeBSD has device nodes only in devfs. It has no block devices at all; disks are character
+devices. These can't pass.

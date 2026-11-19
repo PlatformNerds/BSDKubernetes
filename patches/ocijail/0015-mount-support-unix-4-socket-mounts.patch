@@ -1,0 +1,205 @@
+From dbf2231130cde736ff3ec591d74e0d456e60e798 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 07:53:55 -0700
+Subject: [PATCH 15/16] mount: support unix(4) socket mounts
+
+A Kubernetes hostPath can name a daemon's socket (a container runtime,
+a CSI or device plugin, a log or metrics agent). ocijail treated it as a
+directory mount and nullfs refused it: "mounting ... Invalid argument".
+
+FreeBSD main (2c68ad49f13d) lets nullfs mount a socket on top of another
+socket. For a socket source, create a socket node as the mount point
+(bindat(2) relative to its directory, since a container path can be
+longer than sun_path) and mount over it; it is removed on unmount like a
+file mount point. On a kernel without that change, fail with a message
+that says so.
+---
+ ocijail/mount.cpp | 70 ++++++++++++++++++++++++++++++++++++++++++++---
+ test/run_test.py  | 49 +++++++++++++++++++++++++++++++++
+ 2 files changed, 115 insertions(+), 4 deletions(-)
+
+diff --git a/ocijail/mount.cpp b/ocijail/mount.cpp
+index ba0e284..a42fb74 100644
+--- a/ocijail/mount.cpp
++++ b/ocijail/mount.cpp
+@@ -1,7 +1,11 @@
+ #include <sys/param.h>
+ 
++#include <fcntl.h>
+ #include <spawn.h>
++#include <unistd.h>
+ #include <sys/mount.h>
++#include <sys/socket.h>
++#include <sys/un.h>
+ #include <sys/uio.h>
+ #include <sys/wait.h>
+ #include <iostream>
+@@ -317,13 +321,55 @@ int do_mount(
+     return nmount(&iov[0], iov.size(), mount_flags | MNT_IGNORE);
+ }
+ 
++// Create a unix(4) socket node at path to mount a socket over: nullfs mounts
++// a socket only on top of another socket. bindat(2) relative to the parent
++// directory, since a container path can be longer than sun_path.
++static void create_socket_node(const fs::path& path) {
++    int dfd = ::open(path.parent_path().c_str(), O_DIRECTORY | O_CLOEXEC);
++    if (dfd < 0) {
++        throw std::system_error(errno, std::system_category(),
++                                "opening " + path.parent_path().string());
++    }
++    int s = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
++    if (s < 0) {
++        auto e = errno;
++        ::close(dfd);
++        throw std::system_error(e, std::system_category(), "socket");
++    }
++    sockaddr_un sun{};
++    sun.sun_family = AF_UNIX;
++    auto name = path.filename().string();
++    if (name.size() >= sizeof(sun.sun_path)) {
++        ::close(s);
++        ::close(dfd);
++        throw std::runtime_error("socket mount point name too long: " + name);
++    }
++    name.copy(sun.sun_path, name.size());
++    sun.sun_len = SUN_LEN(&sun);
++    int r = ::bindat(dfd, s, reinterpret_cast<sockaddr*>(&sun), sun.sun_len);
++    auto e = errno;
++    ::close(s);
++    ::close(dfd);
++    if (r < 0) {
++        throw std::system_error(e, std::system_category(),
++                                "creating socket mount point " + path.string());
++    }
++}
++
+ static bool create_mount_point(runtime_state& state,
+                                const fs::path& root_path,
+                                const fs::path& destination,
+-                               bool is_file_mount) {
++                               bool is_file_mount,
++                               bool is_socket_mount = false) {
+     auto destination_exists = fs::exists(destination);
+     if (destination_exists) {
+-        if (is_file_mount) {
++        if (is_socket_mount) {
++            if (!fs::is_socket(destination)) {
++                throw std::runtime_error(
++                    "destination for socket mount exists and is not a "
++                    "socket");
++            }
++        } else if (is_file_mount) {
+             if (!fs::is_regular_file(destination)) {
+                 throw std::runtime_error(
+                     "destination for file mount exists and is not a file");
+@@ -336,7 +382,11 @@ static bool create_mount_point(runtime_state& state,
+             }
+         }
+     } else {
+-        if (is_file_mount) {
++        if (is_socket_mount) {
++            state["remove_on_unmount"].push_back(destination);
++            create_directories(root_path, destination.parent_path(), state);
++            create_socket_node(destination);
++        } else if (is_file_mount) {
+             // Create parent directories if necessary and create an
+             // empty file to mount over
+             state["remove_on_unmount"].push_back(destination);
+@@ -369,6 +419,10 @@ static bool mount_volume(main_app& app,
+     }
+     bool is_file_mount =
+         type == "nullfs" && fs::is_regular_file(mount["source"]);
++    // A unix(4) socket (e.g. a host path to a daemon's socket): nullfs mounts
++    // it over a socket node (FreeBSD 15.1 needs the backport of 2c68ad49f13d).
++    bool is_socket_mount =
++        type == "nullfs" && fs::is_socket(mount["source"].get<std::string>());
+ 
+     // Validate mount options before we perform any actions
+     std::vector<std::tuple<pseudo_option*, std::string>> pseudo_opts;
+@@ -406,7 +460,8 @@ static bool mount_volume(main_app& app,
+     }
+ 
+     auto destination_exists =
+-        create_mount_point(state, root_path, destination, is_file_mount);
++        create_mount_point(
++            state, root_path, destination, is_file_mount, is_socket_mount);
+ 
+     if (prepare_only) {
+         return file_mount_supported;
+@@ -437,6 +492,13 @@ retry:
+                 file_mount_supported = false;
+                 goto retry;
+             }
++            if (is_socket_mount && errno == EINVAL) {
++                throw std::runtime_error(
++                    "mounting socket " +
++                    mount["source"].get<std::string>() +
++                    ": this kernel's nullfs cannot mount unix sockets "
++                    "(FreeBSD main 2c68ad49f13d)");
++            }
+             std::stringstream ss;
+             ss << mount;
+             if (errno == ENOENT) {
+diff --git a/test/run_test.py b/test/run_test.py
+index e8b629b..b1e039d 100644
+--- a/test/run_test.py
++++ b/test/run_test.py
+@@ -390,6 +390,55 @@ class test_run(unittest.TestCase):
+             self.assertFalse(
+                 os.path.exists(os.path.join(root_dir, ".ocijail-devfiles")))
+ 
++    def test_socket_mount(self):
++        # A unix(4) socket bind-mounted into the container, like a
++        # Kubernetes hostPath to a daemon's socket: ocijail creates a socket
++        # node to mount over, and connections reach the host listener.
++        import threading
++        with tempfile.TemporaryDirectory(dir="/tmp") as d:
++            src = os.path.join(d, "s")
++            dst = os.path.join(d, "in", "agent.sock")
++            srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
++            srv.bind(src)
++            srv.listen(1)
++            srv.settimeout(20)
++
++            def serve():
++                try:
++                    conn, _ = srv.accept()
++                    conn.sendall(b"hello")
++                    conn.close()
++                except OSError:
++                    pass
++            # Skip where nullfs can't mount sockets (FreeBSD before
++            # 2c68ad49f13d): probe with mount_nullfs(8) on a socket node.
++            probe = os.path.join(d, "probe")
++            p = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
++            p.bind(probe)
++            p.close()
++            if subprocess.run(["mount", "-t", "nullfs", src, probe],
++                              capture_output=True).returncode != 0:
++                srv.close()
++                self.skipTest("nullfs cannot mount unix sockets here")
++            subprocess.run(["umount", probe], check=True)
++            t = threading.Thread(target=serve)
++            t.start()
++            c = self.config()
++            c["mounts"] = [
++                {"destination": dst, "type": "nullfs", "source": src},
++            ]
++            c["process"]["args"] = ["/usr/bin/nc", "-U", dst]
++            try:
++                ret, out, err = self.run_with_config(c)
++                self.assertEqual(ret, 0, err)
++                self.assertEqual(out, "hello")
++            finally:
++                self.delete(False)
++                srv.close()
++                t.join()
++            # the socket node ocijail created is gone
++            self.assertFalse(os.path.exists(dst))
++
+     def test_process_user_umask(self):
+         c = self.config()
+         # If process.user.umask is set, this should be the value of umask inside
+-- 
+2.54.0 (Apple Git-157)
+

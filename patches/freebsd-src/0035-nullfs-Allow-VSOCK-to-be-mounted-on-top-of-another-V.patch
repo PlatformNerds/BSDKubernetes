@@ -1,0 +1,174 @@
+From ecddad6e032f9c24764ef47955551897e53f35a1 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jes=C3=BAs=20Daniel=20Colmenares=20Oviedo?=
+ <dtxdf@FreeBSD.org>
+Date: Fri, 28 Aug 2026 01:12:46 -0400
+Subject: [PATCH] nullfs: Allow VSOCK to be mounted on top of another VSOCK
+
+In the world of containers, mounting a unix(4) socket is a common
+practice to allow communication between processes within containers.
+For example, both Podman and Docker can expose a unix(4) socket,
+and that same unix(4) socket can be mounted as a file accessible
+to a process inside a container, allowing that application to control
+Podman or Docker. Another example is PHP-FPM with NGINX, where,
+instead of using TCP/IP for communication between containers, a
+unix(4) socket is sufficient.
+
+However, nullfs(4) and all related components do not allow mounting
+a VSOCK on top of another. The current workaround involves creating
+the socket in a directory and mounting that directory. This is an
+option, though it does not provide a good user experience compared
+to directly mounting a VSOCK on top of another, since the application
+that creates the socket may create other sockets in that directory,
+and the user may not wish to share them, or, worse yet, applications
+that create unix(4) sockets may not provide any authentication at
+all, as they may assume that security at the file system level is
+sufficient.
+
+Reviewed by:		dfr@
+Approved by:		dfr@
+Relnotes:		yes
+Differential Revision:  https://reviews.freebsd.org/D59158
+
+(cherry picked from commit 2c68ad49f13d, freebsd main 2026-08-28)
+---
+ lib/libutil/mntopts.c            | 2 +-
+ sbin/mount_nullfs/mount_nullfs.8 | 6 ++++--
+ sbin/mount_nullfs/mount_nullfs.c | 6 +++---
+ sys/fs/nullfs/null_vfsops.c      | 2 +-
+ sys/kern/vfs_cache.c             | 6 +++---
+ sys/kern/vfs_mount.c             | 6 +++---
+ 6 files changed, 15 insertions(+), 13 deletions(-)
+
+diff --git a/lib/libutil/mntopts.c b/lib/libutil/mntopts.c
+index 4a064a086..0412007eb 100644
+--- a/lib/libutil/mntopts.c
++++ b/lib/libutil/mntopts.c
+@@ -138,7 +138,7 @@ checkpath_allow_file(const char *path, char *resolved)
+ 
+ 	if (realpath(path, resolved) == NULL || stat(resolved, &sb) != 0)
+ 		return (1);
+-	if (!S_ISDIR(sb.st_mode) && !S_ISREG(sb.st_mode)) {
++	if (!S_ISDIR(sb.st_mode) && !S_ISREG(sb.st_mode) && !S_ISSOCK(sb.st_mode)) {
+ 		errno = ENOTDIR;
+ 		return (1);
+ 	}
+diff --git a/sbin/mount_nullfs/mount_nullfs.8 b/sbin/mount_nullfs/mount_nullfs.8
+index b3cf57fd9..2ea14dca2 100644
+--- a/sbin/mount_nullfs/mount_nullfs.8
++++ b/sbin/mount_nullfs/mount_nullfs.8
+@@ -30,7 +30,7 @@
+ .\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ .\" SUCH DAMAGE.
+ .\"
+-.Dd March 24, 2024
++.Dd August 24, 2026
+ .Dt MOUNT_NULLFS 8
+ .Os
+ .Sh NAME
+@@ -62,7 +62,9 @@ but in other respects it is indistinguishable from the original.
+ .Pp
+ The
+ .Nm
+-utility supports mounting both directories and single files.
++utility supports mounting directories, regular files and
++.Xr unix 4
++sockets.
+ Both
+ .Ar target
+ and
+diff --git a/sbin/mount_nullfs/mount_nullfs.c b/sbin/mount_nullfs/mount_nullfs.c
+index fc04961e6..d1096bd1b 100644
+--- a/sbin/mount_nullfs/mount_nullfs.c
++++ b/sbin/mount_nullfs/mount_nullfs.c
+@@ -98,13 +98,13 @@ main(int argc, char *argv[])
+ 		err(EX_USAGE, "%s", target);
+ 	if (stat_realpath(argv[1], mountpoint, &mountpoint_stat) != 0)
+ 		err(EX_USAGE, "%s", mountpoint);
+-	if (!S_ISDIR(target_stat.st_mode) && !S_ISREG(target_stat.st_mode))
+-		errx(EX_USAGE, "%s: must be either a file or directory",
++	if (!S_ISDIR(target_stat.st_mode) && !S_ISREG(target_stat.st_mode) && !S_ISSOCK(target_stat.st_mode))
++		errx(EX_USAGE, "%s: must be either a file, a socket or a directory",
+ 		    target);
+ 	if ((target_stat.st_mode & S_IFMT) !=
+ 	    (mountpoint_stat.st_mode & S_IFMT))
+ 		errx(EX_USAGE,
+-		    "%s: must be same type as %s (file or directory)",
++		    "%s: must be same type as %s (file, socket or directory)",
+ 		    mountpoint, target);
+ 
+ 	build_iovec(&iov, &iovlen, "fstype", nullfs, (size_t)-1);
+diff --git a/sys/fs/nullfs/null_vfsops.c b/sys/fs/nullfs/null_vfsops.c
+index c3eec727a..0a7a53766 100644
+--- a/sys/fs/nullfs/null_vfsops.c
++++ b/sys/fs/nullfs/null_vfsops.c
+@@ -167,7 +167,7 @@ nullfs_mount(struct mount *mp)
+ 	 * Lower vnode must be the same type as the covered vnode - we
+ 	 * don't allow mounting directories to files or vice versa.
+ 	 */
+-	if ((lowerrootvp->v_type != VDIR && lowerrootvp->v_type != VREG) ||
++	if ((lowerrootvp->v_type != VDIR && lowerrootvp->v_type != VREG && lowerrootvp->v_type != VSOCK) ||
+ 	    lowerrootvp->v_type != mp->mnt_vnodecovered->v_type) {
+ 		NULLFSDEBUG("nullfs_mount: target must be same type as fspath");
+ 		vput(lowerrootvp);
+diff --git a/sys/kern/vfs_cache.c b/sys/kern/vfs_cache.c
+index a5e28665a..1fda7349a 100644
+--- a/sys/kern/vfs_cache.c
++++ b/sys/kern/vfs_cache.c
+@@ -3268,7 +3268,7 @@ kern___realpathat(struct thread *td, int fd, const char *path, char *buf,
+ 	if ((error = namei(&nd)) != 0)
+ 		return (error);
+ 
+-	if (nd.ni_vp->v_type == VREG && nd.ni_dvp->v_type != VDIR &&
++	if ((nd.ni_vp->v_type == VREG || nd.ni_vp->v_type == VSOCK) && nd.ni_dvp->v_type != VDIR &&
+ 	    (nd.ni_vp->v_vflag & VV_ROOT) != 0) {
+ 		struct vnode *covered_vp;
+ 
+@@ -5705,7 +5705,7 @@ cache_fplookup_climb_mount(struct cache_fpl *fpl)
+ 	vp = fpl->tvp;
+ 	vp_seqc = fpl->tvp_seqc;
+ 
+-	VNPASS(vp->v_type == VDIR || vp->v_type == VREG || vp->v_type == VBAD, vp);
++	VNPASS(vp->v_type == VDIR || vp->v_type == VREG || vp->v_type == VSOCK || vp->v_type == VBAD, vp);
+ 	mp = atomic_load_ptr(&vp->v_mountedhere);
+ 	if (__predict_false(mp == NULL)) {
+ 		return (0);
+@@ -5762,7 +5762,7 @@ cache_fplookup_cross_mount(struct cache_fpl *fpl)
+ 	vp = fpl->tvp;
+ 	vp_seqc = fpl->tvp_seqc;
+ 
+-	VNPASS(vp->v_type == VDIR || vp->v_type == VREG || vp->v_type == VBAD, vp);
++	VNPASS(vp->v_type == VDIR || vp->v_type == VREG || vp->v_type == VSOCK || vp->v_type == VBAD, vp);
+ 	mp = atomic_load_ptr(&vp->v_mountedhere);
+ 	if (__predict_false(mp == NULL)) {
+ 		return (0);
+diff --git a/sys/kern/vfs_mount.c b/sys/kern/vfs_mount.c
+index 383ccf98c..6cf993d5a 100644
+--- a/sys/kern/vfs_mount.c
++++ b/sys/kern/vfs_mount.c
+@@ -1155,12 +1155,12 @@ vfs_domount_first(
+ 	if (error == 0)
+ 		error = vinvalbuf(vp, V_SAVE, 0, 0);
+ 	if (vfsp->vfc_flags & VFCF_FILEMOUNT) {
+-		if (error == 0 && vp->v_type != VDIR && vp->v_type != VREG)
++		if (error == 0 && vp->v_type != VDIR && vp->v_type != VREG && vp->v_type != VSOCK)
+ 			error = EINVAL;
+ 		/*
+ 		 * For file mounts, ensure that there is only one hardlink to the file.
+ 		 */
+-		if (error == 0 && vp->v_type == VREG && va.va_nlink != 1)
++		if (error == 0 && (vp->v_type == VREG || vp->v_type == VSOCK) && va.va_nlink != 1)
+ 			error = EINVAL;
+ 	} else {
+ 		if (error == 0 && vp->v_type != VDIR)
+@@ -1674,7 +1674,7 @@ vfs_domount(
+ 	 * Don't allow stacking file mounts to work around problems with the way
+ 	 * that namei sets nd.ni_dvp to vp_crossmp for these.
+ 	 */
+-	if (vp->v_type == VREG)
++	if (vp->v_type == VREG || vp->v_type == VSOCK)
+ 		fsflags |= MNT_NOCOVER;
+ 	if ((fsflags & MNT_UPDATE) == 0) {
+ 		if ((vp->v_vflag & VV_ROOT) != 0 &&
+-- 
+2.54.0 (Apple Git-157)
+

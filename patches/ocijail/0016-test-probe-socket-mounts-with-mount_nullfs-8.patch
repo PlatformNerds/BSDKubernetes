@@ -1,0 +1,27 @@
+From 0f074c57fc8332c99b185985734c98bc03ba0e39 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 07:59:58 -0700
+Subject: [PATCH 16/16] test: probe socket mounts with mount_nullfs(8)
+
+mount(8) checks the path itself (libutil checkpath) before running
+mount_nullfs, and rejects a socket unless libutil has the same change.
+---
+ test/run_test.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/test/run_test.py b/test/run_test.py
+index b1e039d..933b3e5 100644
+--- a/test/run_test.py
++++ b/test/run_test.py
+@@ -416,7 +416,7 @@ class test_run(unittest.TestCase):
+             p = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+             p.bind(probe)
+             p.close()
+-            if subprocess.run(["mount", "-t", "nullfs", src, probe],
++            if subprocess.run(["mount_nullfs", src, probe],
+                               capture_output=True).returncode != 0:
+                 srv.close()
+                 self.skipTest("nullfs cannot mount unix sockets here")
+-- 
+2.54.0 (Apple Git-157)
+

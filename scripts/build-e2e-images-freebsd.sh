@@ -25,11 +25,19 @@
 #                         (sample-apiserver) go mod tidy && GOOS=freebsd CGO_ENABLED=0 go build .
 #                         (etcd/server)      GOOS=freebsd CGO_ENABLED=0 go build -o etcd .
 #                       Images are only built when these are set.
+#     COREDNS=<binary>  CoreDNS for /coredns in agnhost (DNS tests run it with a hosts-plugin
+#                       Corefile). Upstream bundles 1.6.2, which predates Go's freebsd/arm64
+#                       port; use the cluster's FreeBSD CoreDNS build.
+#     REGRESSION_74839=<binary>
+#                       FreeBSD build of test/images/regression-issue-74839 (portable Go: a
+#                       TCP server and a raw ip:tcp socket); the conntrack invalid-state test.
 #     ONLY="<names>"    build only these images (agnhost kitten nautilus busybox nonroot
-#                       glibc-dns-testing nonewprivs nginx sample-apiserver etcd pause)
+#                       glibc-dns-testing nonewprivs nginx sample-apiserver etcd
+#                       regression-issue-74839 pause)
 set -eu
 src=$(cd "$1" && pwd); agnhost=$2; nnp=${3:-}
 busybox=${BUSYBOX:-}; sampleapiserver=${SAMPLE_APISERVER:-}; etcd=${ETCD:-}
+coredns=${COREDNS:-}; regression74839=${REGRESSION_74839:-}
 want() { [ -z "${ONLY:-}" ] && return 0; case " $ONLY " in *" $1 "*) return 0;; esac; return 1; }
 img=$src/test/images
 reg=registry.k8s.io/e2e-test-images
@@ -104,6 +112,11 @@ pkgs curl bash bind-tools iperf iperf3 busybox
 # Tests run `/bin/bash` by absolute path (Alpine's bash package installs it there; FreeBSD's
 # lives in /usr/local/bin): the probe-while-terminating tests failed with CreateContainerError.
 ln -sf /usr/local/bin/bash "$m/bin/bash"
+if [ -n "$coredns" ]; then
+  install -m 755 "$coredns" "$m/coredns"
+else
+  echo "WARNING: no COREDNS=; agnhost has no /coredns (DNS tests that run it will fail)"
+fi
 hostbin /usr/bin/nc /usr/bin/getent   # e2e runs `nc -v -t -w 2` (OpenBSD nc, like netcat-openbsd)
 bbfill
 install -m 755 "$agnhost" "$m/agnhost"
@@ -222,6 +235,15 @@ if [ -n "$etcd" ] && want etcd; then
   buildah config --cmd /usr/local/bin/etcd "$c"
   commit "registry.k8s.io/etcd:$(mtag Etcd)"
   echo "built etcd"
+fi
+
+# --- regression-issue-74839: the conntrack invalid-state test's server ------------------------
+if [ -n "$regression74839" ] && want regression-issue-74839; then
+  new "$base"
+  install -m 755 "$regression74839" "$m/regression-issue-74839"
+  buildah config --entrypoint '["/regression-issue-74839"]' --cmd '' "$c"
+  commit "$reg/regression-issue-74839:$(mtag RegressionIssue74839)"
+  echo "built regression-issue-74839"
 fi
 
 # --- pause: reuse the control-plane pause image (scripts/build-images-freebsd.sh) -------------

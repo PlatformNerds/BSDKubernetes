@@ -127,6 +127,26 @@ nautilus, built on it) now links `/bin/bash`, and all 4 pass. The 3 left:
 - sysctls with slashes (`[LinuxOnly]`, Linux `kernel.*` names);
 - PrivilegedPod (`[LinuxOnly]`, `ip link add ... type dummy`; FreeBSD has no dummy interface type).
 
+**sig-network beyond the conformance set** (56 tests: not Conformance, Feature, Serial, Slow, Disruptive, Flaky or
+LinuxOnly): 52/56, then **54/56**.
+- **Fragmented UDP to a Service was dropped (fixed).** "should function for service endpoints using hostNetwork" sends
+  a 2000-byte UDP request through a ClusterIP, which must be fragmented at MTU 1500. pf doesn't reassemble by default
+  (`set reassemble no`), and only a datagram's first fragment carries ports. kube-proxy's rdr translated that first
+  fragment, but the others never reached the endpoint. Measured by hand from a pod on node 1, the request failed via
+  the ClusterIP to pod and host-network endpoints alike, while direct requests to the same endpoints worked. Both
+  nodes' pf.conf now set `set reassemble yes`, as does the demo's `build-cluster.sh`. Afterwards all four paths
+  echo, and the test passes. This affects any UDP Service with large datagrams, for example DNS with EDNS.
+- **"should support configurable pod resolv.conf" (fixed):** the test runs `/coredns` from agnhost, which upstream
+  bundles (CoreDNS 1.6.2). The FreeBSD agnhost images now include the cluster's CoreDNS 1.14.2 build (`COREDNS=` in
+  the image script). 1.6.2 can't be built for freebsd/arm64: its 2019 dependencies predate Go's port. The test's
+  Corefile (`hosts`, `log`) behaves the same.
+- **Still failing, Linux mechanisms in the tests:**
+  - "should set TCP CLOSE_WAIT timeout" runs `distroless-iptables` to read Linux conntrack.
+  - "should not be vulnerable to the invalid conntrack state bug": its server
+    (`regression-issue-74839`, now built for FreeBSD) watches the client's TCP segments through a raw `ip:tcp`
+    socket. Linux copies TCP to raw sockets; FreeBSD never does, so the server never sends its out-of-window
+    packet. Porting it to BPF would be needed to test pf's window checking this way.
+
 ## Run 9: 420/446, no regressions, but node 2 froze once (2026-11-17)
 
 This run checked everything since run 8:

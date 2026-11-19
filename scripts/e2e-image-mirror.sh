@@ -23,6 +23,12 @@ set -eu
 mirror=$1
 up=registry.k8s.io
 arch=$(uname -m)
+# A manifest list left behind by a failed push stays in the containers storage CRI-O reads, and
+# once its FreeBSD instance is replaced (images get rebuilt) CRI-O's ListImages fails on it
+# ("reading manifest for image instance ... file does not exist"), which breaks kubelet's image
+# listing and image GC. Always remove the list.
+list=
+trap '[ -z "$list" ] || podman manifest rm "$list" >/dev/null 2>&1 || true' EXIT
 
 for img in $(podman images --format '{{.Repository}}:{{.Tag}}' | grep "^$up/e2e-test-images/" | grep -v -- '-prev' | sort -u); do
   path=${img#$up/}                       # e2e-test-images/<name>:<tag>

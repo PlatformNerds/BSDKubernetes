@@ -34,6 +34,13 @@ find "$src" -name '*.[ch]' -print0 | xargs -0 sed -i '' -e 's|"/proc|"/compat/li
 cp "$port/files/data-.config" "$src/.config"
 sed -i '' -e 's|^# CONFIG_DF is not set|CONFIG_DF=y|' \
     -e 's|^# CONFIG_FEATURE_DF_FANCY is not set|CONFIG_FEATURE_DF_FANCY=y|' "$src/.config"
+# Link FreeBSD's libregex (the GNU-compatible regex grep(1) uses) statically, ahead of libc's
+# POSIX-only regcomp. Upstream's image is Alpine, whose musl regex takes \b, \w, \< ...; tests
+# use them (the NFS PV tests run `id -G | grep -E '\b777\b'`), and libc's regcomp rejects them
+# ("trailing backslash"). CONFIG_EXTRA_LDLIBS, because trylink drops LDLIBS entries the link
+# succeeds without; static, so the image needs no extra shared library.
+sed -i '' -e 's|^CONFIG_EXTRA_LDLIBS=.*|CONFIG_EXTRA_LDLIBS=":libregex.a"|' "$src/.config"
+grep -q '^CONFIG_EXTRA_LDLIBS=":libregex.a"' "$src/.config"
 # CFLAGS: the ports framework's defaults, plus BB_GLOBAL_CONST='' (the port sets it for armv6
 # only). BusyBox declares the pointer to each applet's globals const and fills it in through a
 # cast, and clang optimizes on the const: 1.37.0's awk dereferenced a stale pointer and

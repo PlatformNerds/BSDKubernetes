@@ -178,6 +178,7 @@ Not Conformance, Serial, Slow, Disruptive, Flaky, Feature or LinuxOnly:
 | Serial tests of sig-node, apps, network, api-machinery, cli | 17/19, then 18/19 |
 | HostPathType + in-tree hostPath/hostPathSymlink/emptydir drivers | 41/57, then **43/57** (socket mounts, research/20); the other 14 are block/character devices, which need `mknod` |
 | volumes (`HostPath\|Subpath\|EmptyDir\|Projected\|ConfigMap\|Secrets\|Downward API`) | 78/79 |
+| NFS (`NFS\|nfs`, without Dynamic PV and Generic Ephemeral-volume), kernel `bsdk8s23` | 0 before (no NFS server pod), then **12/22**: `PersistentVolumes NFS` 12/12; the in-tree driver's 10 need the Linux-only `nfs-provisioner` pod to start (research/20) |
 
 - **`kubectl port-forward` crashed CRI-O (fixed).**
   - The FreeBSD runtime had no `PortForwardContainer`. The generic one called itself until the goroutine stack
@@ -230,6 +231,10 @@ Not Conformance, Serial, Slow, Disruptive, Flaky, Feature or LinuxOnly:
     the FreeBSD pause image the same way (`fake_registry_pause`). The images on both nodes were updated in place
     (originals `*-prev-registry`), and the mirror was refreshed. "should be able to pull image" uses
     `PullAlways`, which replaced the patched tag with the mirror's old copy until the mirror had the new one.
+- **NFS (research/20):** NFS server pods needed the kernel (freebsd-src 0036, `nfsd` in an inherited vnet), CRI-O
+  (0024, `allow.nfsd` for privileged pods) and a FreeBSD `volume/nfs` image. The PV tests also found two Linux
+  leftovers: BusyBox's grep took no `\b` (now linked with `libregex`), and the PV recycler pod used a Linux image (now
+  `freebsd-runtime`, set in `build-cluster.sh`).
 - **Not FreeBSD:** "should handle in-cluster config" expects `kubectl --server=invalid` to fail name resolution.
   This network's DNS answers for `invalid` (`192.168.160.1`, from the Mac too), so the request reaches an HTML page.
 

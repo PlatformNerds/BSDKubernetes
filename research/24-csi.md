@@ -57,7 +57,7 @@ e2e `[Driver: csi-hostpath]`, not Disruptive/Flaky/Feature/LinuxOnly/Serial/Slow
 
 | | |
 |---|---|
-| Filesystem volumes: dynamic provisioning, PVC data sources, snapshots, expansion, CSI and generic ephemeral volumes | **20 pass** |
+| Filesystem volumes: dynamic provisioning, a PVC as data source (clone), expansion (offline, online, with the pod re-created), subPath (4), ReadWriteOncePod, CSINode volume limits, CSI and generic ephemeral volumes (two pods with the same volume, several volumes per pod, expansion) | **20 pass** (snapshot tests are Feature/Serial/Slow and didn't run in this set) |
 | Block volumes (9) | fail at provisioning: the driver makes block devices with `fallocate` + `losetup`. The kubelet's block-volume path (loop devices, device bind mounts) is Linux-only as well. Not attempted. |
 | Ephemeral `rw,`/`ro,` checks (7) | read Linux `mount(8)` output in the container, as with NFS (research/20) |
 

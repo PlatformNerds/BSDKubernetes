@@ -1,0 +1,67 @@
+From 4d971ab3bd8ca8836d82d2485589e925b4bfd984 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 16:35:50 -0700
+Subject: [PATCH] mount: don't stat mount sources when tearing a container down
+
+unmount_volumes() looked at every mount's source: whether it is a regular
+file (redirect_devfs_file_mounts(), and unmount_volume() to pick the
+fallback for kernels without file mounts). For an NFS volume whose server
+is gone, stat(2) on the source blocks for good on a hard mount, so
+'ocijail state' and 'delete' hung, the runtime with them, and the pod
+could never be removed. This happens whenever a Kubernetes namespace that
+holds both an NFS server pod and its clients is deleted.
+
+Look at the source only where it matters: after the destination has been
+found below a devfs mount, and in unmount_volume() only without file
+mount support.
+---
+ ocijail/mount.cpp | 17 +++++++++++++----
+ 1 file changed, 13 insertions(+), 4 deletions(-)
+
+diff --git a/ocijail/mount.cpp b/ocijail/mount.cpp
+index a42fb74..fee9b00 100644
+--- a/ocijail/mount.cpp
++++ b/ocijail/mount.cpp
+@@ -534,11 +534,14 @@ static void unmount_volume(main_app& app,
+                            ? fs::path{recorded.get<std::string>()}
+                            : resolve_container_path(app, root_path, mount);
+ 
++    // Whether the source is a file only matters without file mount support.
++    // Don't stat it otherwise: for an NFS volume whose server is gone, stat(2)
++    // blocks for good, and the container could never be torn down.
+     std::string type = mount.contains("type") ? mount["type"] : "nullfs";
+-    bool is_file_mount =
+-        type == "nullfs" && fs::is_regular_file(mount["source"]);
++    bool is_file_mount = !file_mount_supported && type == "nullfs" &&
++                         fs::is_regular_file(mount["source"]);
+ 
+-    if (is_file_mount && !file_mount_supported) {
++    if (is_file_mount) {
+         // Restore the saved path if it exists
+         auto [_, save_path] = get_save_path(state, destination);
+         if (fs::exists(save_path)) {
+@@ -603,7 +606,7 @@ static json redirect_devfs_file_mounts(
+     }
+     json res = mounts;
+     for (auto& m : res) {
+-        if (!m.contains("destination") || !is_file_bind_mount(m)) {
++        if (!m.contains("destination")) {
+             continue;
+         }
+         fs::path dest{m["destination"].get<std::string>()};
+@@ -612,6 +615,12 @@ static json redirect_devfs_file_mounts(
+             if (rel.empty() || *rel.begin() == "..") {
+                 continue;
+             }
++            // Only now look at the source: stat(2) on it can block for good
++            // (an NFS volume whose server is gone), and teardown runs this
++            // for every mount.
++            if (!is_file_bind_mount(m)) {
++                break;
++            }
+             std::string flat = dest.relative_path().string();
+             for (auto& c : flat) {
+                 if (c == '/') {
+-- 
+2.54.0 (Apple Git-157)
+

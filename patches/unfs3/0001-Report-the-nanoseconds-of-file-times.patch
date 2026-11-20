@@ -1,0 +1,130 @@
+From f83b9ffe707a9a2fd4ec06f6cfd033e5ee4b34b7 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 16:23:06 -0700
+Subject: [PATCH] Report the nanoseconds of file times
+
+unfsd sent atime, mtime and ctime with nseconds = 0, and a time_delta of
+one second. NFS clients compare mtime, ctime and size to decide whether
+their cached data is still valid, so a file rewritten at the same size
+within the same second looked unchanged to a client that had it cached,
+which went on reading the old data (seen as the Kubernetes NFS e2e
+multiVolume tests reading stale data on FreeBSD clients).
+
+Where struct stat has the POSIX.1-2008 st_atim/st_mtim/st_ctim (checked by
+configure), send their nanoseconds and a time_delta of 1 ns. Other
+platforms, and AFS support, keep whole seconds.
+---
+ attr.c          | 12 +++++++-----
+ backend_unix.h  | 18 ++++++++++++++++++
+ backend_win32.h |  4 ++++
+ configure.ac    |  1 +
+ nfs.c           |  3 ++-
+ 5 files changed, 32 insertions(+), 6 deletions(-)
+
+diff --git a/attr.c b/attr.c
+index cca0b9f..e055525 100644
+--- a/attr.c
++++ b/attr.c
+@@ -99,9 +99,11 @@ pre_op_attr get_pre_cached(void)
+ 
+     result.pre_op_attr_u.attributes.size = st_cache.st_size;
+     result.pre_op_attr_u.attributes.mtime.seconds = st_cache.st_mtime;
+-    result.pre_op_attr_u.attributes.mtime.nseconds = 0;
++    result.pre_op_attr_u.attributes.mtime.nseconds =
++        backend_mtime_nsec(st_cache);
+     result.pre_op_attr_u.attributes.ctime.seconds = st_cache.st_ctime;
+-    result.pre_op_attr_u.attributes.ctime.nseconds = 0;
++    result.pre_op_attr_u.attributes.ctime.nseconds =
++        backend_ctime_nsec(st_cache);
+ 
+     return result;
+ }
+@@ -212,11 +214,11 @@ post_op_attr get_post_buf(backend_statstruct buf, struct svc_req * req)
+     }
+ 
+     result.post_op_attr_u.attributes.atime.seconds = buf.st_atime;
+-    result.post_op_attr_u.attributes.atime.nseconds = 0;
++    result.post_op_attr_u.attributes.atime.nseconds = backend_atime_nsec(buf);
+     result.post_op_attr_u.attributes.mtime.seconds = buf.st_mtime;
+-    result.post_op_attr_u.attributes.mtime.nseconds = 0;
++    result.post_op_attr_u.attributes.mtime.nseconds = backend_mtime_nsec(buf);
+     result.post_op_attr_u.attributes.ctime.seconds = buf.st_ctime;
+-    result.post_op_attr_u.attributes.ctime.nseconds = 0;
++    result.post_op_attr_u.attributes.ctime.nseconds = backend_ctime_nsec(buf);
+ 
+     return result;
+ }
+diff --git a/backend_unix.h b/backend_unix.h
+index a383ad2..a9c7388 100644
+--- a/backend_unix.h
++++ b/backend_unix.h
+@@ -66,7 +66,25 @@
+ #define backend_dirstream DIR
+ #define backend_statvfsstruct struct statvfs
+ #define backend_fsinfo_properties FSF3_LINK | FSF3_SYMLINK | FSF3_HOMOGENEOUS | FSF3_CANSETTIME;
++/*
++ * Nanoseconds of the stat times, where struct stat has them (POSIX.1-2008
++ * st_atim, st_mtim, st_ctim). Clients compare mtime and ctime to tell whether
++ * their cached data is still valid: with whole seconds only, a file rewritten
++ * within the second at the same size looks unchanged.
++ */
++#if defined(HAVE_STRUCT_STAT_ST_MTIM_TV_NSEC) && !defined(AFS_SUPPORT)
++#define backend_atime_nsec(st) ((st).st_atim.tv_nsec)
++#define backend_mtime_nsec(st) ((st).st_mtim.tv_nsec)
++#define backend_ctime_nsec(st) ((st).st_ctim.tv_nsec)
++#define backend_time_delta_seconds 0
++#define backend_time_delta_nseconds 1
++#else
++#define backend_atime_nsec(st) 0
++#define backend_mtime_nsec(st) 0
++#define backend_ctime_nsec(st) 0
+ #define backend_time_delta_seconds 1
++#define backend_time_delta_nseconds 0
++#endif
+ #define backend_pathconf_case_insensitive FALSE
+ #define backend_passwdstruct struct passwd
+ #define backend_getpwnam getpwnam
+diff --git a/backend_win32.h b/backend_win32.h
+index b42c250..42e0387 100644
+--- a/backend_win32.h
++++ b/backend_win32.h
+@@ -72,6 +72,10 @@
+   only applies to atime/mtime. We are choosing 2 seconds.
+ */
+ #define backend_time_delta_seconds 2
++#define backend_time_delta_nseconds 0
++#define backend_atime_nsec(st) 0
++#define backend_mtime_nsec(st) 0
++#define backend_ctime_nsec(st) 0
+ #define backend_pathconf_case_insensitive TRUE
+ #define backend_getpwnam(name) NULL
+ #define backend_gen_nonce win_gen_nonce
+diff --git a/configure.ac b/configure.ac
+index 9eb1764..86ea5fe 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -38,6 +38,7 @@ AC_CHECK_TYPES(int64,,,[#include <sys/inttypes.h>])
+ AC_CHECK_TYPES(uint64,,,[#include <sys/inttypes.h>])
+ AC_CHECK_TYPES(struct rpcent,,, [#include <netdb.h>])
+ AC_CHECK_MEMBERS([struct stat.st_gen],,,[#include <sys/stat.h>])
++AC_CHECK_MEMBERS([struct stat.st_mtim.tv_nsec],,,[#include <sys/stat.h>])
+ AC_CHECK_FUNCS(statvfs)
+ AC_CHECK_FUNCS(seteuid setegid)
+ AC_CHECK_FUNCS(setresuid setresgid)
+diff --git a/nfs.c b/nfs.c
+index 5d819f4..be9902a 100644
+--- a/nfs.c
++++ b/nfs.c
+@@ -1050,7 +1050,8 @@ FSINFO3res *nfsproc3_fsinfo_3_svc(FSINFO3args * argp, struct svc_req * rqstp)
+     result.FSINFO3res_u.resok.dtpref = 4096;
+     result.FSINFO3res_u.resok.maxfilesize = ~0ULL;
+     result.FSINFO3res_u.resok.time_delta.seconds = backend_time_delta_seconds;
+-    result.FSINFO3res_u.resok.time_delta.nseconds = 0;
++    result.FSINFO3res_u.resok.time_delta.nseconds =
++        backend_time_delta_nseconds;
+     result.FSINFO3res_u.resok.properties = backend_fsinfo_properties;
+ 
+     return &result;
+-- 
+2.54.0 (Apple Git-157)
+

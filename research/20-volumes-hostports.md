@@ -250,8 +250,36 @@ Found along the way:
   that minor version (`nfsstat -m`), `nfsvers=3` gives v3, and a pod with a PV with `mountOptions: [nfsvers=4.1]`
   reads and writes over NFSv4.1. The binary is installed on both nodes (`/sbin/mount_nfs.prev-vers` kept).
 
-| e2e (`NFS\|nfs`, without Disruptive/Flaky/Feature/LinuxOnly; 22 run, the driver skips the other patterns) | Result |
+### Dynamic provisioning: a FreeBSD nfs-provisioner (2026-11-19)
+
+The in-tree NFS e2e driver starts `registry.k8s.io/sig-storage/nfs-provisioner` in every test. That
+is `kubernetes-sigs/nfs-ganesha-server-and-external-provisioner`, which serves NFS with NFS Ganesha.
+Ganesha has no FreeBSD port. The pod isn't privileged (`DAC_READ_SEARCH` only), so the kernel nfsd can't
+stand in either. The FreeBSD build (`patches/nfs-provisioner`, image from
+`scripts/build-e2e-images-freebsd.sh` with `NFS_PROVISIONER=` and `UNFSD=`) runs **unfs3**, a user-space
+NFSv3 server. It writes unfs3 export lines and reloads `unfsd` with SIGHUP. NFSv3 only, so the `nfs`
+driver's dynamic tests, which mount `vers=4.0`, can't use it. The `nfs3` driver's can.
+
+Getting it to pass turned up four more problems:
+
+- **unfs3 sent whole-second file times** (`patches/unfs3` 0001). A pod rewrote a 64-byte file within the
+  second another pod had cached it. The size and mtime matched, so the second pod kept reading the old
+  data (the `multiVolume` "concurrently access" tests). unfsd now sends the nanoseconds (`st_mtim`).
+- **mount_nfs retries forever** (kubernetes 0037). For a server that doesn't answer, FreeBSD's
+  `mount_nfs` retries every 60 s indefinitely, so the kubelet's mount never returned. The volume
+  operation stayed pending and the pod could neither start nor be deleted; one such mount was still
+  retrying after 3 h 41 min. Linux's `mount.nfs` gives up after two minutes in the foreground, so the
+  kubelet's FreeBSD mounter now adds `retrycnt=3` unless the PV sets a retry count.
+- **ocijail stat'ed volume sources during teardown** (ocijail 0017). Deleting a namespace that holds
+  an NFS server pod and its clients removes both at once. ocijail's `state`/`delete` then called
+  `stat(2)` on the (dead) NFS volume source, which blocks on a hard mount, and took CRI-O down with it
+  on that node. It now looks at a source only where the answer matters.
+- **The kubelet still stats the volume** while tearing it down (`CleanupMountWithForce` →
+  `PathExists`). Upstream's code does the same on Linux and should block there too on a hard mount;
+  not checked here (no Linux node). Recovery: `umount -N <mount point>` on the node.
+
+| e2e (`NFS\|nfs`, without Disruptive/Flaky/Feature/LinuxOnly/Serial) | Result |
 |---|---|
-| `PersistentVolumes NFS` (PV/PVC pairs, multiple PVs, Recycle) | **12/12** (11 in the sweep, Recycle after the recycler fix) |
-| In-tree `nfs`/`nfs3` driver, inline and pre-provisioned PV (10) | blocked: the driver starts the `sig-storage/nfs-provisioner` pod in every test, though only Dynamic PV uses it. That image is Linux only (userspace Ganesha), and the pod isn't privileged, so kernel nfsd can't stand in. With a local placeholder image that only sleeps (measurement only, then removed), **10/10 pass** |
-| Dynamic PV, Generic Ephemeral-volume | out of scope: they need that provisioner to serve NFS |
+| `PersistentVolumes NFS` (PV/PVC pairs, multiple PVs, Recycle) | **12/12** |
+| In-tree `nfs` + `nfs3` drivers and `DynamicProvisioner External`, skipping the `nfs` (v4) Dynamic PV and Generic Ephemeral patterns | **30/35**. The 5 failures check Linux's `mount(8)` output inside the container: 4 ephemeral tests grep for `rw,`/`ro,`, and "provision storage with mount options" looks for `vers=3` in the mount's options. FreeBSD's `mount` prints `(nullfs, local)` and never `rw`. ocijail also flags container mounts `MNT_IGNORE` so that the host's `mount` and `df` stay readable, which hides them from `mount` in the container, and the NFS options belong to the host's mount, outside the jail. |
+| `nfs` (v4) Dynamic PV / Generic Ephemeral | not run: unfs3 has no NFSv4 |

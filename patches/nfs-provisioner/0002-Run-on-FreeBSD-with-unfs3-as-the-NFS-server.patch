@@ -1,0 +1,475 @@
+From 96c8c3e5ff82587320f48b8440ab50a102827308 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 15:17:58 -0700
+Subject: [PATCH] Run on FreeBSD with unfs3 as the NFS server
+
+NFS Ganesha has no FreeBSD port, and FreeBSD's kernel nfsd can only run in
+a privileged pod (jail allow.nfsd), while this provisioner's pod is not
+privileged. On FreeBSD the provisioner's own server (run-server, the
+default) is unfs3, a user-space NFSv3 server:
+
+- server: Setup starts rpcbind and creates the exports file; Run runs
+  unfsd in the foreground (MOUNT on 20048, NFS on 2049) with its output in
+  the log file.
+- volume: the run-server exporter writes unfs3 export lines (no fsid
+  option and no '*' host in unfs3; the export ID goes in a comment, where
+  the restart recovery finds it) and makes unfsd reread them with SIGHUP.
+  The D-Bus Ganesha exporter moves to a !freebsd file.
+
+NFSv3 only: unfs3 has no NFSv4.
+---
+ pkg/server/server.go                    |  3 +
+ pkg/server/server_freebsd.go            | 73 +++++++++++++++++++
+ pkg/volume/export.go                    | 51 -------------
+ pkg/volume/export_ganesha.go            | 85 ++++++++++++++++++++++
+ pkg/volume/export_unfs3_freebsd.go      | 95 +++++++++++++++++++++++++
+ pkg/volume/export_unfs3_freebsd_test.go | 69 ++++++++++++++++++
+ pkg/volume/provision.go                 |  2 +-
+ 7 files changed, 326 insertions(+), 52 deletions(-)
+ create mode 100644 pkg/server/server_freebsd.go
+ create mode 100644 pkg/volume/export_ganesha.go
+ create mode 100644 pkg/volume/export_unfs3_freebsd.go
+ create mode 100644 pkg/volume/export_unfs3_freebsd_test.go
+
+diff --git a/pkg/server/server.go b/pkg/server/server.go
+index b73f3ec..ee0c40d 100644
+--- a/pkg/server/server.go
++++ b/pkg/server/server.go
+@@ -1,3 +1,6 @@
++//go:build !freebsd
++// +build !freebsd
++
+ /*
+ Copyright 2016 The Kubernetes Authors.
+ 
+diff --git a/pkg/server/server_freebsd.go b/pkg/server/server_freebsd.go
+new file mode 100644
+index 0000000..747ce80
+--- /dev/null
++++ b/pkg/server/server_freebsd.go
+@@ -0,0 +1,73 @@
++/*
++Copyright 2026 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package server
++
++import (
++	"fmt"
++	"io/ioutil"
++	"os"
++	"os/exec"
++
++	"github.com/golang/glog"
++	"github.com/kubernetes-sigs/nfs-ganesha-server-and-external-provisioner/pkg/volume"
++)
++
++// On FreeBSD the server is unfs3 (see pkg/volume/export_unfs3_freebsd.go).
++// The Ganesha arguments keep their meaning where one exists: the config file
++// is unfsd's exports file and the log is where unfsd's output goes. Grace
++// period and fsid settings are Ganesha's and have no unfs3 equivalent.
++
++const rpcbindSocket = "/var/run/rpcbind.sock"
++
++// Setup starts rpcbind, with which unfsd registers, and creates an empty
++// exports file if there is none.
++func Setup(config string, gracePeriod uint, fsidDevice bool) error {
++	// rpcbind is running if its socket exists. (rpcinfo 127.0.0.1 retries
++	// for minutes when nothing listens.) rpcbind daemonizes; it gets no
++	// output pipes, which its child would hold open.
++	if _, err := os.Stat(rpcbindSocket); err != nil {
++		if err := exec.Command("/usr/sbin/rpcbind").Run(); err != nil {
++			return fmt.Errorf("starting rpcbind failed with error: %v", err)
++		}
++	}
++	if _, err := os.Stat(config); os.IsNotExist(err) {
++		if err := ioutil.WriteFile(config, []byte("# unfsd exports, written by nfs-provisioner\n"), 0600); err != nil {
++			return fmt.Errorf("error writing exports file %s: %v", config, err)
++		}
++	}
++	return nil
++}
++
++// Run runs unfsd in the foreground until it exits. MOUNT is served on 20048,
++// the port Ganesha uses, NFS on 2049.
++func Run(log, pid, config string) error {
++	glog.Infof("Running NFS server!")
++	cmd := exec.Command("/usr/local/sbin/unfsd", "-d", "-e", config, "-i", volume.UnfsPidFile, "-n", "2049", "-m", "20048")
++	f, err := os.OpenFile(log, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
++	if err == nil {
++		defer f.Close()
++		cmd.Stdout, cmd.Stderr = f, f
++	}
++	if err := cmd.Run(); err != nil {
++		return fmt.Errorf("unfsd failed with error: %v", err)
++	}
++	return nil
++}
++
++// Stop stops the NFS server.
++func Stop() {
++}
+diff --git a/pkg/volume/export.go b/pkg/volume/export.go
+index 4a5e02d..a034c0d 100644
+--- a/pkg/volume/export.go
++++ b/pkg/volume/export.go
+@@ -25,7 +25,6 @@ import (
+ 	"sync"
+ 
+ 	"github.com/golang/glog"
+-	"github.com/godbus/dbus"
+ 	"k8s.io/api/core/v1"
+ )
+ 
+@@ -106,56 +105,6 @@ func (e *genericExporter) RemoveExportBlock(block string, exportID uint16) error
+ 	return removeFromFile(e.fileMutex, e.config, block)
+ }
+ 
+-type ganeshaExporter struct {
+-	genericExporter
+-}
+-
+-var _ exporter = &ganeshaExporter{}
+-
+-func newGaneshaExporter(ganeshaConfig string) exporter {
+-	return &ganeshaExporter{
+-		genericExporter: *newGenericExporter(&ganeshaExportBlockCreator{}, ganeshaConfig, regexp.MustCompile("Export_Id = ([0-9]+);")),
+-	}
+-}
+-
+-// Export exports the given directory using NFS Ganesha, assuming it is running
+-// and can be connected to using D-Bus.
+-func (e *ganeshaExporter) Export(path string) error {
+-	// Call AddExport using dbus
+-	conn, err := dbus.SystemBus()
+-	if err != nil {
+-		return fmt.Errorf("error getting dbus session bus: %v", err)
+-	}
+-	obj := conn.Object("org.ganesha.nfsd", "/org/ganesha/nfsd/ExportMgr")
+-	call := obj.Call("org.ganesha.nfsd.exportmgr.AddExport", 0, e.config, fmt.Sprintf("export(path = %s)", path))
+-	if call.Err != nil {
+-		return fmt.Errorf("error calling org.ganesha.nfsd.exportmgr.AddExport: %v", call.Err)
+-	}
+-
+-	return nil
+-}
+-
+-func (e *ganeshaExporter) Unexport(volume *v1.PersistentVolume) error {
+-	ann, ok := volume.Annotations[annExportID]
+-	if !ok {
+-		return fmt.Errorf("PV doesn't have an annotation %s, can't remove the export from the server", annExportID)
+-	}
+-	exportID, _ := strconv.ParseUint(ann, 10, 16)
+-
+-	// Call RemoveExport using dbus
+-	conn, err := dbus.SystemBus()
+-	if err != nil {
+-		return fmt.Errorf("error getting dbus session bus: %v", err)
+-	}
+-	obj := conn.Object("org.ganesha.nfsd", "/org/ganesha/nfsd/ExportMgr")
+-	call := obj.Call("org.ganesha.nfsd.exportmgr.RemoveExport", 0, uint16(exportID))
+-	if call.Err != nil {
+-		return fmt.Errorf("error calling org.ganesha.nfsd.exportmgr.RemoveExport: %v", call.Err)
+-	}
+-
+-	return nil
+-}
+-
+ type ganeshaExportBlockCreator struct{}
+ 
+ var _ exportBlockCreator = &ganeshaExportBlockCreator{}
+diff --git a/pkg/volume/export_ganesha.go b/pkg/volume/export_ganesha.go
+new file mode 100644
+index 0000000..e310d53
+--- /dev/null
++++ b/pkg/volume/export_ganesha.go
+@@ -0,0 +1,85 @@
++//go:build !freebsd
++// +build !freebsd
++
++/*
++Copyright 2016 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package volume
++
++import (
++	"fmt"
++	"regexp"
++	"strconv"
++
++	"github.com/godbus/dbus"
++	"k8s.io/api/core/v1"
++)
++
++type ganeshaExporter struct {
++	genericExporter
++}
++
++var _ exporter = &ganeshaExporter{}
++
++func newGaneshaExporter(ganeshaConfig string) exporter {
++	return &ganeshaExporter{
++		genericExporter: *newGenericExporter(&ganeshaExportBlockCreator{}, ganeshaConfig, regexp.MustCompile("Export_Id = ([0-9]+);")),
++	}
++}
++
++// newServerExporter returns the exporter for the NFS server this provisioner
++// runs (run-server): NFS Ganesha, driven over D-Bus.
++func newServerExporter(ganeshaConfig string) exporter {
++	return newGaneshaExporter(ganeshaConfig)
++}
++
++// Export exports the given directory using NFS Ganesha, assuming it is running
++// and can be connected to using D-Bus.
++func (e *ganeshaExporter) Export(path string) error {
++	// Call AddExport using dbus
++	conn, err := dbus.SystemBus()
++	if err != nil {
++		return fmt.Errorf("error getting dbus session bus: %v", err)
++	}
++	obj := conn.Object("org.ganesha.nfsd", "/org/ganesha/nfsd/ExportMgr")
++	call := obj.Call("org.ganesha.nfsd.exportmgr.AddExport", 0, e.config, fmt.Sprintf("export(path = %s)", path))
++	if call.Err != nil {
++		return fmt.Errorf("error calling org.ganesha.nfsd.exportmgr.AddExport: %v", call.Err)
++	}
++
++	return nil
++}
++
++func (e *ganeshaExporter) Unexport(volume *v1.PersistentVolume) error {
++	ann, ok := volume.Annotations[annExportID]
++	if !ok {
++		return fmt.Errorf("PV doesn't have an annotation %s, can't remove the export from the server", annExportID)
++	}
++	exportID, _ := strconv.ParseUint(ann, 10, 16)
++
++	// Call RemoveExport using dbus
++	conn, err := dbus.SystemBus()
++	if err != nil {
++		return fmt.Errorf("error getting dbus session bus: %v", err)
++	}
++	obj := conn.Object("org.ganesha.nfsd", "/org/ganesha/nfsd/ExportMgr")
++	call := obj.Call("org.ganesha.nfsd.exportmgr.RemoveExport", 0, uint16(exportID))
++	if call.Err != nil {
++		return fmt.Errorf("error calling org.ganesha.nfsd.exportmgr.RemoveExport: %v", call.Err)
++	}
++
++	return nil
++}
+diff --git a/pkg/volume/export_unfs3_freebsd.go b/pkg/volume/export_unfs3_freebsd.go
+new file mode 100644
+index 0000000..0aec8b1
+--- /dev/null
++++ b/pkg/volume/export_unfs3_freebsd.go
+@@ -0,0 +1,95 @@
++/*
++Copyright 2026 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package volume
++
++import (
++	"fmt"
++	"io/ioutil"
++	"regexp"
++	"strconv"
++	"strings"
++	"syscall"
++
++	"k8s.io/api/core/v1"
++)
++
++// UnfsPidFile is where unfsd(8) writes its pid; the server package starts it
++// with this file.
++const UnfsPidFile = "/var/run/unfsd.pid"
++
++// On FreeBSD the provisioner's own NFS server (run-server) is unfs3, a user
++// space NFSv3 server: NFS Ganesha has no FreeBSD port, and the kernel nfsd
++// needs a privileged pod (jail allow.nfsd). unfs3 reads a Linux-style exports
++// file and rereads it on SIGHUP.
++type unfsExporter struct {
++	genericExporter
++}
++
++var _ exporter = &unfsExporter{}
++
++// newServerExporter returns the exporter for the NFS server this provisioner
++// runs (run-server).
++func newServerExporter(config string) exporter {
++	return &unfsExporter{
++		genericExporter: *newGenericExporter(&unfsExportBlockCreator{}, config, regexp.MustCompile("Export_Id = ([0-9]+);")),
++	}
++}
++
++// Export makes unfsd reread its exports file, which has the new export.
++func (e *unfsExporter) Export(_ string) error {
++	return reloadUnfsd()
++}
++
++// Unexport makes unfsd reread its exports file, which no longer has the export.
++func (e *unfsExporter) Unexport(_ *v1.PersistentVolume) error {
++	return reloadUnfsd()
++}
++
++func reloadUnfsd() error {
++	b, err := ioutil.ReadFile(UnfsPidFile)
++	if err != nil {
++		return fmt.Errorf("error reading unfsd pid file %s: %v", UnfsPidFile, err)
++	}
++	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
++	if err != nil {
++		return fmt.Errorf("bad unfsd pid file %s: %v", UnfsPidFile, err)
++	}
++	if err := syscall.Kill(pid, syscall.SIGHUP); err != nil {
++		return fmt.Errorf("error signalling unfsd (pid %d): %v", pid, err)
++	}
++	return nil
++}
++
++type unfsExportBlockCreator struct{}
++
++var _ exportBlockCreator = &unfsExportBlockCreator{}
++
++// CreateExportBlock creates the lines to add to unfsd's exports file. unfs3
++// has no fsid option (and no "*" host: no host means every host), so the
++// export ID, which the provisioner recovers from the file after a restart,
++// goes in a comment.
++func (e *unfsExportBlockCreator) CreateExportBlock(exportID, path string, rootSquash bool, exportSubnet string) string {
++	squash := "no_root_squash"
++	if rootSquash {
++		squash = "root_squash"
++	}
++	host := exportSubnet
++	if host == "*" {
++		host = ""
++	}
++	return "\n# Export_Id = " + exportID + ";\n" + path + " " + host + "(rw,insecure," + squash + ")\n"
++}
+diff --git a/pkg/volume/export_unfs3_freebsd_test.go b/pkg/volume/export_unfs3_freebsd_test.go
+new file mode 100644
+index 0000000..57e1ebe
+--- /dev/null
++++ b/pkg/volume/export_unfs3_freebsd_test.go
+@@ -0,0 +1,69 @@
++/*
++Copyright 2026 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package volume
++
++import (
++	"io/ioutil"
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++func TestUnfsExportBlock(t *testing.T) {
++	c := &unfsExportBlockCreator{}
++	for _, tc := range []struct {
++		subnet     string
++		rootSquash bool
++		want       string
++	}{
++		{"*", false, "\n# Export_Id = 3;\n/export/pvc-a (rw,insecure,no_root_squash)\n"},
++		{"10.0.0.0/8", true, "\n# Export_Id = 3;\n/export/pvc-a 10.0.0.0/8(rw,insecure,root_squash)\n"},
++	} {
++		if got := c.CreateExportBlock("3", "/export/pvc-a", tc.rootSquash, tc.subnet); got != tc.want {
++			t.Errorf("subnet %q rootSquash %v: got %q, want %q", tc.subnet, tc.rootSquash, got, tc.want)
++		}
++	}
++}
++
++// The export IDs in use are recovered from the exports file after a restart,
++// and removing a block leaves the others.
++func TestUnfsExporterIDs(t *testing.T) {
++	dir, err := ioutil.TempDir("", "unfs")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer os.RemoveAll(dir)
++	config := filepath.Join(dir, "exports")
++	if err := ioutil.WriteFile(config, []byte("# unfsd exports\n"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	e := newServerExporter(config).(*unfsExporter)
++	b1, id1, err := e.AddExportBlock("/export/a", false, "*")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, _, err := e.AddExportBlock("/export/b", false, "*"); err != nil {
++		t.Fatal(err)
++	}
++	if err := e.RemoveExportBlock(b1, id1); err != nil {
++		t.Fatal(err)
++	}
++	again := newServerExporter(config).(*unfsExporter)
++	if len(again.exportIDs) != 1 || again.exportIDs[id1] {
++		t.Errorf("recovered IDs %v, want only the second export's", again.exportIDs)
++	}
++}
+diff --git a/pkg/volume/provision.go b/pkg/volume/provision.go
+index c85fad2..edc8257 100644
+--- a/pkg/volume/provision.go
++++ b/pkg/volume/provision.go
+@@ -81,7 +81,7 @@ const (
+ func NewNFSProvisioner(exportDir string, client kubernetes.Interface, outOfCluster bool, useGanesha bool, ganeshaConfig string, enableXfsQuota bool, serverHostname string, maxExports int, exportSubnet string) controller.Provisioner {
+ 	var exp exporter
+ 	if useGanesha {
+-		exp = newGaneshaExporter(ganeshaConfig)
++		exp = newServerExporter(ganeshaConfig)
+ 	} else {
+ 		exp = newKernelExporter()
+ 	}
+-- 
+2.54.0 (Apple Git-157)
+

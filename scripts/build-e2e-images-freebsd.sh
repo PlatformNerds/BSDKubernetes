@@ -33,14 +33,24 @@
 #                       0036: reads TCP with bpf(4), as FreeBSD gives raw sockets no TCP; the
 #                       pod needs CAP_NET_RAW, which CRI-O maps to /dev/bpf); the conntrack
 #                       invalid-state test.
+#     NFS_PROVISIONER=<binary>
+#                       FreeBSD build of the in-tree NFS driver's dynamic provisioner
+#                       (registry.k8s.io/sig-storage/nfs-provisioner): kubernetes-sigs/
+#                       nfs-ganesha-server-and-external-provisioner with the FreeBSD port in
+#                       patches/nfs-provisioner (unfs3 instead of NFS Ganesha, NFSv3 only):
+#                         GOOS=freebsd CGO_ENABLED=0 go build ./cmd/nfs-provisioner
+#     UNFSD=<binary>    unfsd for it, built from unfs3 0.11.0 + patches/unfs3 (nanosecond file
+#                       times; the package's unfsd reports whole seconds, so clients keep stale
+#                       data after a same-size rewrite within the second). Without it the
+#                       package is used, with a warning.
 #   Also needs skopeo (agnhost's fake registry, from ghcr.io/platformnerds/pause:3.10.2).
 #     ONLY="<names>"    build only these images (agnhost kitten nautilus busybox nonroot
 #                       glibc-dns-testing nonewprivs nginx sample-apiserver etcd
-#                       regression-issue-74839 volume-nfs pause)
+#                       regression-issue-74839 volume-nfs nfs-provisioner pause)
 set -eu
 src=$(cd "$1" && pwd); agnhost=$2; nnp=${3:-}
 busybox=${BUSYBOX:-}; sampleapiserver=${SAMPLE_APISERVER:-}; etcd=${ETCD:-}
-coredns=${COREDNS:-}; regression74839=${REGRESSION_74839:-}
+coredns=${COREDNS:-}; regression74839=${REGRESSION_74839:-}; nfsprovisioner=${NFS_PROVISIONER:-}; unfsd=${UNFSD:-}
 want() { [ -z "${ONLY:-}" ] && return 0; case " $ONLY " in *" $1 "*) return 0;; esac; return 1; }
 img=$src/test/images
 reg=registry.k8s.io/e2e-test-images
@@ -326,6 +336,27 @@ NFSEOF
     --port 2049/tcp --port 20048/tcp --volume /exports "$c"
   commit "$reg/volume/nfs:$(mtag VolumeNFSServer)"
   echo "built volume/nfs"
+fi
+
+# --- nfs-provisioner: the in-tree NFS driver's provisioner pod (test/e2e/storage/utils) -------
+# Upstream's image runs NFS Ganesha; the FreeBSD build runs unfs3 (a user-space NFSv3 server:
+# the pod isn't privileged, so the kernel nfsd can't run in it). It needs rpcbind and rpcinfo.
+if [ -n "$nfsprovisioner" ] && want nfs-provisioner; then
+  new "$base"
+  if [ -n "$unfsd" ]; then
+    mkdir -p "$m/usr/local/sbin"
+    install -m 755 "$unfsd" "$m/usr/local/sbin/unfsd"
+  else
+    echo "WARNING: no UNFSD=; using the unfs3 package, which reports whole-second file times"
+    pkgs unfs3
+  fi
+  hostbin /usr/sbin/rpcbind /usr/bin/rpcinfo
+  install -m 755 "$nfsprovisioner" "$m/nfs-provisioner"
+  mkdir -p "$m/export" "$m/var/run" "$m/var/db"
+  buildah config --entrypoint '["/nfs-provisioner"]' --cmd '[]' \
+    --port 2049/tcp --port 20048/tcp --port 111/tcp --port 111/udp --volume /export "$c"
+  commit "registry.k8s.io/sig-storage/nfs-provisioner:$(mtag NFSProvisioner)"
+  echo "built nfs-provisioner"
 fi
 
 # --- pause: reuse the control-plane pause image (scripts/build-images-freebsd.sh) -------------

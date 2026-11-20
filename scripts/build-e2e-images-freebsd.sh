@@ -47,8 +47,8 @@
 #                       image, named like the image (hostpathplugin, csi-provisioner,
 #                       csi-attacher, csi-resizer, csi-snapshotter, csi-snapshot-metadata,
 #                       csi-node-driver-registrar, livenessprobe,
-#                       csi-external-health-monitor-controller), at the tags the e2e manifest
-#                       names. hostpathplugin must be built against the BSDKubernetes
+#                       csi-external-health-monitor-controller, and snapshot-controller for the
+#                       cluster), at the tags the e2e manifest names. hostpathplugin must be built against the BSDKubernetes
 #                       kubernetes fork's k8s.io/mount-utils (it mounts through
 #                       bsdk8s-mount-proxy, components/mount-proxy).
 #   Also needs skopeo (agnhost's fake registry, from ghcr.io/platformnerds/pause:3.10.2).
@@ -381,6 +381,16 @@ if [ -n "$csibindir" ] && want csi; then
     commit "$ref"
     echo "built $ref"
   done
+  # The cluster's snapshot-controller (external-snapshotter, same release as csi-snapshotter): the
+  # snapshot tests need it and the VolumeSnapshot CRDs installed (research/24).
+  snapref=$(sed -n 's|^ *image: registry.k8s.io/sig-storage/csi-snapshotter:\(.*\)$|registry.k8s.io/sig-storage/snapshot-controller:\1|p' "$csiman" | head -1)
+  if [ -n "$snapref" ] && [ -x "$csibindir/snapshot-controller" ]; then
+    new "$base"
+    install -m 755 "$csibindir/snapshot-controller" "$m/snapshot-controller"
+    buildah config --entrypoint '["/snapshot-controller"]' --cmd '[]' "$c"
+    commit "$snapref"
+    echo "built $snapref"
+  fi
 fi
 
 # --- pause: reuse the control-plane pause image (scripts/build-images-freebsd.sh) -------------

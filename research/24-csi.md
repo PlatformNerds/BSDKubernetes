@@ -57,9 +57,22 @@ e2e `[Driver: csi-hostpath]`, not Disruptive/Flaky/Feature/LinuxOnly/Serial/Slow
 
 | | |
 |---|---|
-| Filesystem volumes: dynamic provisioning, a PVC as data source (clone), expansion (offline, online, with the pod re-created), subPath (4), ReadWriteOncePod, CSINode volume limits, CSI and generic ephemeral volumes (two pods with the same volume, several volumes per pod, expansion) | **20 pass** (snapshot tests are Feature/Serial/Slow and didn't run in this set) |
+| Filesystem volumes: dynamic provisioning, a PVC as data source (clone), expansion (offline, online, with the pod re-created), subPath (4), ReadWriteOncePod, CSINode volume limits, CSI and generic ephemeral volumes (two pods with the same volume, several volumes per pod, expansion) | **20 pass** (snapshots: below) |
 | Block volumes (9) | fail at provisioning: the driver makes block devices with `fallocate` + `losetup`. The kubelet's block-volume path (loop devices, device bind mounts) is Linux-only as well. Not attempted. |
 | Ephemeral `rw,`/`ro,` checks (7) | read Linux `mount(8)` output in the container, as with NFS (research/20) |
+
+### Snapshots
+
+The snapshot tests need the VolumeSnapshot CRDs and a snapshot-controller in the cluster; e2e doesn't deploy
+them. They come from external-snapshotter v8.5.0, the release of the e2e manifest's `csi-snapshotter`: its
+`client/config/crd` CRDs, and `deploy/kubernetes/snapshot-controller` with the image set to
+`snapshot-controller:v8.5.0`. Upstream's deploy file still names v8.4.0; the image is the v8.5.0 source built
+for FreeBSD, so it's tagged as what it is. The image comes from `scripts/build-e2e-images-freebsd.sh`
+(`CSI_BINDIR=` with a `snapshot-controller` binary). Both replicas run, one per node.
+
+`[Driver: csi-hostpath]` snapshot tests (not Disruptive/Flaky/LinuxOnly/Serial): **7/8**. Taking a snapshot,
+restoring a volume from it, and the `[Feature:VolumeSnapshotDataSource]` provisioning pass. The failure is the
+block-volume variant. The driver makes snapshots with `tar`, which the FreeBSD base image has.
 
 ## Limits and next steps
 

@@ -274,9 +274,14 @@ Getting it to pass turned up four more problems:
   an NFS server pod and its clients removes both at once. ocijail's `state`/`delete` then called
   `stat(2)` on the (dead) NFS volume source, which blocks on a hard mount, and took CRI-O down with it
   on that node. It now looks at a source only where the answer matters.
-- **The kubelet still stats the volume** while tearing it down (`CleanupMountWithForce` →
-  `PathExists`). Upstream's code does the same on Linux and should block there too on a hard mount;
-  not checked here (no Linux node). Recovery: `umount -N <mount point>` on the node.
+- **The kubelet stat'ed the dead volume too** (kubernetes 0038). Tearing the volume down,
+  `PathExists` called `stat(2)` and `IsMountPoint` called `statfs(2)` on the mount point. Both block on a
+  hard mount whose server is gone, and so would `umount(8)`, which looks the path up. On FreeBSD both
+  checks now read the mount table (`getfsstat(2)` without `MNT_WAIT`). The mounter also implements
+  `UnmountWithForce`, so the NFS plugin takes upstream's `CleanupMountWithForce` path: after the
+  plugin's one-minute timeout, `umount -N` cancels the RPCs and dismounts without a path lookup.
+  Deleting a namespace with an NFS server pod and two client pods now finishes on its own in 97 s;
+  before, it never finished. (Upstream's Linux code has the same `stat(2)`; not checked here.)
 
 | e2e (`NFS\|nfs`, without Disruptive/Flaky/Feature/LinuxOnly/Serial) | Result |
 |---|---|

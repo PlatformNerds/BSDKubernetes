@@ -1,0 +1,247 @@
+From 9b87dea1dbf4233ac16d3cbd950e22c1e55eb644 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 17:13:13 -0700
+Subject: [PATCH] mount-utils: tear down an NFS volume whose server is gone on
+ FreeBSD
+
+When an NFS server goes away before its clients' volumes are torn down
+(e.g. a namespace holding an NFS server pod and its clients is deleted),
+the kubelet blocked for good: PathExists stat(2)s the mount point and
+IsMountPoint statfs(2)s it (mountinfo.Mounted), both of which wait on the
+dead server on a hard mount, and so would umount(8) looking the path up.
+
+On FreeBSD:
+- IsMountPoint and PathExists consult the mount table (getfsstat(2)
+  without MNT_WAIT) instead of looking at the mount point;
+- the Mounter implements MounterForceUnmounter, so the NFS plugin uses
+  CleanupMountWithForce: an NFS mount still there after the timeout is
+  dismounted with umount -N, which cancels the outstanding RPCs without
+  a path lookup. The graceful umount runs without being waited for, as a
+  process blocked on the dead server can't be killed and reaped.
+
+Other platforms are unchanged (mountTypeWithoutStat reports nothing).
+---
+ .../src/k8s.io/mount-utils/mount_freebsd.go   | 102 +++++++++++++++++-
+ .../k8s.io/mount-utils/mount_freebsd_test.go  |  23 ++++
+ .../k8s.io/mount-utils/mount_helper_unix.go   |   5 +
+ .../k8s.io/mount-utils/mount_nostat_other.go  |  25 +++++
+ 4 files changed, 150 insertions(+), 5 deletions(-)
+ create mode 100644 staging/src/k8s.io/mount-utils/mount_nostat_other.go
+
+diff --git a/staging/src/k8s.io/mount-utils/mount_freebsd.go b/staging/src/k8s.io/mount-utils/mount_freebsd.go
+index 180ba1ed4b6..a736259c55f 100644
+--- a/staging/src/k8s.io/mount-utils/mount_freebsd.go
++++ b/staging/src/k8s.io/mount-utils/mount_freebsd.go
+@@ -21,11 +21,12 @@ package mount
+ import (
+ 	"errors"
+ 	"fmt"
++	"os"
+ 	"os/exec"
+ 	"path/filepath"
+ 	"strings"
++	"time"
+ 
+-	"github.com/moby/sys/mountinfo"
+ 	"golang.org/x/sys/unix"
+ 	"k8s.io/klog/v2"
+ )
+@@ -124,15 +125,106 @@ func (mounter *Mounter) CanSafelySkipMountPointCheck() bool {
+ 	return false
+ }
+ 
+-// IsMountPoint determines if a directory is a mountpoint.
++// IsMountPoint determines if a directory is a mountpoint, from the mount table
++// (getfsstat(2) without MNT_WAIT) rather than statfs(2) on the path: for an NFS
++// mount whose server is gone, statfs(2) and stat(2) on the mount point block
++// for good, and the kubelet could never tear the volume down. Only the parent
++// directory's symbolic links are resolved; the last component is the mount
++// point itself.
+ func (mounter *Mounter) IsMountPoint(file string) (bool, error) {
+-	isMnt, isMntErr := mountinfo.Mounted(file)
+-	if isMntErr == nil {
+-		return isMnt, nil
++	path, err := mountPointPath(file)
++	if err != nil {
++		return false, err
++	}
++	mps, err := mounter.List()
++	if err != nil {
++		return false, err
++	}
++	for _, mp := range mps {
++		if mp.Path == path {
++			return true, nil
++		}
++	}
++	// Not a mount point, so lstat(2) can't block on one; report a missing
++	// path like Linux does.
++	if _, err := os.Lstat(path); err != nil {
++		return false, err
+ 	}
+ 	return false, nil
+ }
+ 
++// mountPointPath returns file as an absolute path with the symbolic links of
++// its parent directory resolved, without looking at file itself.
++func mountPointPath(file string) (string, error) {
++	abs, err := filepath.Abs(file)
++	if err != nil {
++		return "", err
++	}
++	if abs == "/" {
++		return abs, nil
++	}
++	dir, err := filepath.EvalSymlinks(filepath.Dir(abs))
++	if err != nil {
++		return "", err
++	}
++	return filepath.Join(dir, filepath.Base(abs)), nil
++}
++
++// mountTypeWithoutStat returns the file system type mounted at path, if path is
++// a mount point, from the mount table only (see IsMountPoint).
++func mountTypeWithoutStat(path string) (string, bool) {
++	p, err := mountPointPath(path)
++	if err != nil {
++		return "", false
++	}
++	mps, err := (&Mounter{}).List()
++	if err != nil {
++		return "", false
++	}
++	for _, mp := range mps {
++		if mp.Path == p {
++			return mp.Type, true
++		}
++	}
++	return "", false
++}
++
++// UnmountWithForce unmounts target. An NFS mount that isn't off after
++// umountTimeout - its server is gone, and umount(8) blocks looking the path up
++// - is dismounted with "umount -N", which cancels the outstanding RPCs without
++// a lookup of the path (also releasing the blocked umount). Other file systems
++// are unmounted as by Unmount.
++func (mounter *Mounter) UnmountWithForce(target string, umountTimeout time.Duration) error {
++	if fstype, _ := mountTypeWithoutStat(target); fstype != "nfs" {
++		return mounter.Unmount(target)
++	}
++	klog.V(4).Infof("Unmounting %s", target)
++	type result struct {
++		output []byte
++		err    error
++	}
++	done := make(chan result, 1)
++	command := exec.Command("umount", target)
++	go func() {
++		output, err := command.CombinedOutput()
++		done <- result{output, err}
++	}()
++	select {
++	case r := <-done:
++		if r.err != nil {
++			return checkUmountError(target, command, r.output, r.err)
++		}
++		return nil
++	case <-time.After(umountTimeout):
++	}
++	klog.V(2).Infof("Timed out waiting for unmount of %s, dismounting it with umount -N", target)
++	force := exec.Command("umount", "-N", target)
++	if output, err := force.CombinedOutput(); err != nil {
++		return checkUmountError(target, force, output, err)
++	}
++	return nil
++}
++
+ // GetMountRefs finds the other mount points of the directory pathname is, or
+ // is mounted from. FreeBSD's bind mounts are nullfs mounts, whose source
+ // (f_mntfromname) is the directory they show, so the references are the nullfs
+diff --git a/staging/src/k8s.io/mount-utils/mount_freebsd_test.go b/staging/src/k8s.io/mount-utils/mount_freebsd_test.go
+index 10c03dc9b0e..05b0fda7ef0 100644
+--- a/staging/src/k8s.io/mount-utils/mount_freebsd_test.go
++++ b/staging/src/k8s.io/mount-utils/mount_freebsd_test.go
+@@ -19,6 +19,8 @@ limitations under the License.
+ package mount
+ 
+ import (
++	"os"
++	"path/filepath"
+ 	"reflect"
+ 	"testing"
+ )
+@@ -68,3 +70,24 @@ func TestWithNFSRetryCount(t *testing.T) {
+ 		}
+ 	}
+ }
++
++func TestIsMountPointFromMountTable(t *testing.T) {
++	m := New("")
++	if isMnt, err := m.IsMountPoint("/"); err != nil || !isMnt {
++		t.Errorf("IsMountPoint(/) = %v, %v; want true", isMnt, err)
++	}
++	dir := t.TempDir()
++	if isMnt, err := m.IsMountPoint(dir); err != nil || isMnt {
++		t.Errorf("IsMountPoint(%s) = %v, %v; want false", dir, isMnt, err)
++	}
++	missing := filepath.Join(dir, "missing")
++	if _, err := m.IsMountPoint(missing); !os.IsNotExist(err) {
++		t.Errorf("IsMountPoint(%s) error = %v; want not exist", missing, err)
++	}
++	if fstype, ok := mountTypeWithoutStat("/"); !ok || fstype == "" {
++		t.Errorf("mountTypeWithoutStat(/) = %q, %v", fstype, ok)
++	}
++	if exists, err := PathExists("/"); err != nil || !exists {
++		t.Errorf("PathExists(/) = %v, %v", exists, err)
++	}
++}
+diff --git a/staging/src/k8s.io/mount-utils/mount_helper_unix.go b/staging/src/k8s.io/mount-utils/mount_helper_unix.go
+index 8b2a4d6f2f0..c05e5916de4 100644
+--- a/staging/src/k8s.io/mount-utils/mount_helper_unix.go
++++ b/staging/src/k8s.io/mount-utils/mount_helper_unix.go
+@@ -187,6 +187,11 @@ func isMountPointMatch(mp MountPoint, dir string) bool {
+ // PathExists returns true if the specified path exists.
+ // TODO: clean this up to use pkg/util/file/FileExists
+ func PathExists(path string) (bool, error) {
++	// A mount point exists; don't stat(2) it where that can block for good
++	// (FreeBSD: an NFS mount whose server is gone).
++	if _, isMountPoint := mountTypeWithoutStat(path); isMountPoint {
++		return true, nil
++	}
+ 	_, err := os.Stat(path)
+ 	if err == nil {
+ 		return true, nil
+diff --git a/staging/src/k8s.io/mount-utils/mount_nostat_other.go b/staging/src/k8s.io/mount-utils/mount_nostat_other.go
+new file mode 100644
+index 00000000000..1fdfab78635
+--- /dev/null
++++ b/staging/src/k8s.io/mount-utils/mount_nostat_other.go
+@@ -0,0 +1,25 @@
++//go:build !windows && !freebsd
++
++/*
++Copyright 2026 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package mount
++
++// mountTypeWithoutStat tells whether path is a mount point without looking at
++// it. Only FreeBSD implements it (mount_freebsd.go).
++func mountTypeWithoutStat(path string) (string, bool) {
++	return "", false
++}
+-- 
+2.54.0 (Apple Git-157)
+

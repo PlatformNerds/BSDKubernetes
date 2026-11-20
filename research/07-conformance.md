@@ -142,7 +142,15 @@ LinuxOnly): 52/56, then **54/56**.
   the image script). 1.6.2 can't be built for freebsd/arm64: its 2019 dependencies predate Go's port. The test's
   Corefile (`hosts`, `log`) behaves the same.
 - **Still failing, Linux mechanisms in the tests:**
-  - "should set TCP CLOSE_WAIT timeout" runs `distroless-iptables` to read Linux conntrack.
+  - "should set TCP CLOSE_WAIT timeout" runs `distroless-iptables` to read Linux conntrack. What it checks was
+    really missing, though (kubernetes 0039, 2026-11-19). The pf proxier ignored kube-proxy's conntrack
+    settings, and pf's timeout once one side has sent a FIN (`tcp.closing`) is 15 minutes, against
+    kube-proxy's 1-hour CLOSE_WAIT. So a half-closed connection through a Service lost its translation after
+    15 idle minutes. kube-proxy now sets pf's global options from the conntrack settings with `pfctl -m -O`,
+    which leaves rules alone: `limit states` (maxPerCore × CPUs), `tcp.established`, `tcp.closing`,
+    `udp.single`, `udp.multiple`. Checked: a half-closed connection to a ClusterIP has a pf state expiring in
+    59:56. The state limit went from 100000 to 262144 (8 CPUs), and pfctl scaled the adaptive-timeout
+    thresholds with it.
   - "should not be vulnerable to the invalid conntrack state bug": its server
     (`regression-issue-74839`, now built for FreeBSD) watches the client's TCP segments through a raw `ip:tcp`
     socket. Linux copies TCP to raw sockets; FreeBSD never does, so the server never sends its out-of-window

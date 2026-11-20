@@ -76,8 +76,15 @@ block-volume variant. The driver makes snapshots with `tar`, which the FreeBSD b
 
 ## Limits and next steps
 
-- **Block volumes** need FreeBSD code in the driver (`truncate` + `mdconfig` instead of
-  `fallocate` + `losetup`) and in the kubelet's block-volume handling.
+- **Block volumes: not pursued.** On Linux, a raw block PV is mapped by bind-mounting the device node onto
+  regular files: the kubelet's global map path (a reference it counts through the mount table) and the
+  driver's publish target, with a loop device held as a lock. nullfs can't mount a device node, and FreeBSD
+  has no block devices at all (disks are character devices). So the e2e block tests, which check `[ -b <path> ]`,
+  fail on any FreeBSD node, like the HostPathType block tests (research/20). Supporting raw "block" PVs would
+  mean redesigning the kubelet's block mapping (symlinks, `mdconfig` instead of `losetup`), the driver's
+  (`truncate` + `mdconfig`) and the runtime's device exposure (unhide the `md` device in the jail's devfs and
+  link the requested path to it), for character devices that applications ask for as block devices. Raw
+  block PVs are uncommon; filesystem volumes are what CSI drivers are used for.
 - **Drivers that format or attach disks** (`SafeFormatAndMount`, iSCSI, NVMe) would send more operations
   through the proxy. Today it does mount, unmount and list.
 - **Security:** the socket is root-only and reachable only by pods that mount the kubelet's `plugins/`

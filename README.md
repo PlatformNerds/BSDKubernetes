@@ -37,6 +37,7 @@ as **Linux containers** where the Linuxulator can handle them, and inside **bhyv
 | [research/21-rmlock-epoch-deadlock.md](research/21-rmlock-epoch-deadlock.md) | Node freeze under pod churn: an rmlock lost wakeup (kernel fix) |
 | [research/22-networkpolicy.md](research/22-networkpolicy.md) | NetworkPolicy with pf (bsd-netpol) |
 | [research/23-sctp.md](research/23-sctp.md) | SCTP: Services, NetworkPolicy, HostPorts |
+| [research/24-csi.md](research/24-csi.md) | **CSI on FreeBSD:** a mount proxy (like Windows' csi-proxy) instead of mount propagation; csi-hostpath e2e 20/36 (filesystem volumes) |
 | [patches/README.md](patches/README.md) | **Every patch, per project** (kubernetes, CRI-O, ocijail, FreeBSD, CNI plugins, nfs-provisioner, unfs3) |
 | [research/UPSTREAM-PINS.md](research/UPSTREAM-PINS.md) | Exact upstream commits the research was done against |
 | [patches/kubernetes/v1.36.1/](patches/kubernetes/v1.36.1/) | Doug Rabson's FreeBSD patch series for kubelet, kube-proxy and kubeadm (Apache-2.0, credit: dfr), and ours on top (`bsdk8s/`) |

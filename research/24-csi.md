@@ -1,0 +1,72 @@
+# 24. CSI on FreeBSD: a mount proxy instead of mount propagation (2026-11-20)
+
+## The problem
+
+A CSI node plugin runs as a privileged pod. To publish a volume, it mounts the volume at a path the
+kubelet chose, e.g. `/var/db/kubelet/pods/<uid>/volumes/kubernetes.io~csi/<pv>/mount`. The runtime
+then gives that path to the workload container. On Linux the plugin's pod mounts the kubelet's
+directories with `mountPropagation: Bidirectional`, so its mounts appear on the host.
+
+FreeBSD has no mount propagation (research/20). The plugin runs in a jail that sees `/var/db/kubelet`
+through a nullfs mount. A mount it makes there sits on top of the nullfs vnode, and the host's directory
+never sees it. CSI node plugins therefore could not run as pods, and no CSI driver worked.
+
+Windows has the same problem. Kubernetes solves it there with **csi-proxy**, a host service that does
+storage operations on behalf of node plugins in containers. This is the FreeBSD equivalent.
+
+## The design
+
+- **`bsdk8s-mount-proxy`** (`components/mount-proxy`): a host daemon (rc.d `bsdk8s_mount_proxy`).
+  - It listens on `<kubelet root>/plugins/bsdk8s-mount-proxy.sock`, mode 0600, root only. CSI plugin
+    pods already mount the kubelet's `plugins/` directory, so no manifest changes are needed.
+  - Requests are JSON, one per connection: `mount`, `unmount` and `list`.
+  - It identifies the caller from `LOCAL_PEERCRED`: the peer's pid, then the pid's jail (`ps -o jid`)
+    and the jail's root (`jls`).
+  - It translates the caller's paths to host paths through that jail's root and its nullfs mounts.
+    For example, `/csi-data-dir/<id>` in the plugin's container is `/var/lib/csi-hostpath-data/<id>`
+    on the host. `list` translates the other way. A caller can therefore only mount what it can see
+    already.
+  - Mount targets must be below the kubelet's `pods/` or `plugins/`. Linux bind options become
+    nullfs, as in `k8s.io/mount-utils` on FreeBSD.
+- **`k8s.io/mount-utils`** (kubernetes 0040): in a jail, when the socket is reachable, `Mount`,
+  `Unmount` and `List` go to the proxy. `IsMountPoint` and `UnmountWithForce` go through `List`, so
+  they follow. A driver built against this mount-utils needs no FreeBSD code.
+- **csi-driver-host-path** (patch 0001): its node server still imported the deprecated
+  `k8s.io/utils/mount`, which has no FreeBSD support ("util/mount on this platform is not supported").
+  It now imports `k8s.io/mount-utils`, a one-line change that is upstreamable on its own.
+- **Images:** the e2e csi-hostpath driver and its 8 sidecars (provisioner, attacher, resizer,
+  snapshotter, snapshot-metadata, node-driver-registrar, livenessprobe, health monitor) all build for
+  freebsd/arm64 unmodified. `scripts/build-e2e-images-freebsd.sh` (`CSI_BINDIR=`) makes FreeBSD images
+  of them at the manifest's tags. The binaries need `-X main.version=<tag>`, as upstream's
+  release-tools set it, or the driver refuses `GetPluginInfo` ("Driver is missing version").
+
+The e2e framework rewrites `/var/lib/kubelet/` in the manifests to `--kubelet-root-dir`
+(`/var/db/kubelet` here), so the upstream manifests deploy unchanged.
+
+A run, from the proxy's log, for one writer pod then one reader pod:
+
+```
+pid 66523 (root /var/db/containers/storage/zfs/graph/42ac...): mount -t nullfs /var/lib/csi-hostpath-data/169d... /var/db/kubelet/pods/fe08.../volumes/kubernetes.io~csi/pvc-31d0.../mount
+pid 66523 (...): umount /var/db/kubelet/pods/fe08.../volumes/kubernetes.io~csi/pvc-31d0.../mount
+pid 66523 (...): mount -t nullfs /var/lib/csi-hostpath-data/169d... /var/db/kubelet/pods/acc5.../volumes/kubernetes.io~csi/pvc-31d0.../mount
+```
+
+## Results
+
+e2e `[Driver: csi-hostpath]`, not Disruptive/Flaky/Feature/LinuxOnly/Serial/Slow: **20/36**.
+
+| | |
+|---|---|
+| Filesystem volumes: dynamic provisioning, PVC data sources, snapshots, expansion, CSI and generic ephemeral volumes | **20 pass** |
+| Block volumes (9) | fail at provisioning: the driver makes block devices with `fallocate` + `losetup`. The kubelet's block-volume path (loop devices, device bind mounts) is Linux-only as well. Not attempted. |
+| Ephemeral `rw,`/`ro,` checks (7) | read Linux `mount(8)` output in the container, as with NFS (research/20) |
+
+## Limits and next steps
+
+- **Block volumes** need FreeBSD code in the driver (`truncate` + `mdconfig` instead of
+  `fallocate` + `losetup`) and in the kubelet's block-volume handling.
+- **Drivers that format or attach disks** (`SafeFormatAndMount`, iSCSI, NVMe) would send more operations
+  through the proxy. Today it does mount, unmount and list.
+- **Security:** the socket is root-only and reachable only by pods that mount the kubelet's `plugins/`
+  hostPath, which is privileged already. Requests come from root in some jail; the proxy doesn't
+  check that the pod is privileged.

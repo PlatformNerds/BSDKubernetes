@@ -1,0 +1,52 @@
+From 74ba5dba844c907cc3b2ea2bda63e1dc7f4cb9b9 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 22:00:23 -0700
+Subject: [PATCH] nodeserver: use k8s.io/mount-utils instead of the deprecated
+ k8s.io/utils/mount
+
+k8s.io/utils/mount is the old copy of the mount library, frozen since it moved
+to k8s.io/mount-utils; the rest of the driver already gets mount-utils through
+its dependencies. Platform support lands in mount-utils only (e.g. FreeBSD),
+so with the old package the node server could not mount anything there:
+'util/mount on this platform is not supported'.
+---
+ go.mod                     | 2 +-
+ pkg/hostpath/nodeserver.go | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/go.mod b/go.mod
+index c641908..5c9e211 100644
+--- a/go.mod
++++ b/go.mod
+@@ -15,6 +15,7 @@ require (
+ 	k8s.io/apimachinery v0.33.1
+ 	k8s.io/klog/v2 v2.130.1
+ 	k8s.io/kubernetes v1.33.0
++	k8s.io/mount-utils v0.33.0
+ 	k8s.io/utils v0.0.0-20241210054802-24370beab758
+ )
+ 
+@@ -49,7 +50,6 @@ require (
+ 	k8s.io/client-go v0.33.1 // indirect
+ 	k8s.io/component-base v0.33.1 // indirect
+ 	k8s.io/controller-manager v0.33.0 // indirect
+-	k8s.io/mount-utils v0.33.0 // indirect
+ 	sigs.k8s.io/yaml v1.4.0 // indirect
+ )
+ 
+diff --git a/pkg/hostpath/nodeserver.go b/pkg/hostpath/nodeserver.go
+index def0000..6dab1cc 100644
+--- a/pkg/hostpath/nodeserver.go
++++ b/pkg/hostpath/nodeserver.go
+@@ -29,7 +29,7 @@ import (
+ 	"google.golang.org/grpc/status"
+ 	"k8s.io/klog/v2"
+ 	"k8s.io/kubernetes/pkg/volume/util/volumepathhandler"
+-	"k8s.io/utils/mount"
++	mount "k8s.io/mount-utils"
+ )
+ 
+ const (
+-- 
+2.54.0 (Apple Git-157)
+

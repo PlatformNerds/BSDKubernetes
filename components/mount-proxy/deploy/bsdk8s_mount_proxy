@@ -1,0 +1,28 @@
+#!/bin/sh
+
+# PROVIDE: bsdk8s_mount_proxy
+# REQUIRE: LOGIN
+# BEFORE: kubelet
+# KEYWORD: shutdown
+#
+# bsdk8s-mount-proxy: mounts for CSI node plugins in jails (FreeBSD has no
+# mount propagation). Add to /etc/rc.conf:
+#   bsdk8s_mount_proxy_enable="YES"
+#   bsdk8s_mount_proxy_args="--kubelet-root-dir=/var/db/kubelet"   # optional
+
+. /etc/rc.subr
+
+name=bsdk8s_mount_proxy
+rcvar=bsdk8s_mount_proxy_enable
+load_rc_config $name
+
+: ${bsdk8s_mount_proxy_enable:="NO"}
+: ${bsdk8s_mount_proxy_args:=""}
+: ${bsdk8s_mount_proxy_log:="/var/log/bsdk8s-mount-proxy.log"}
+
+pidfile="/var/run/${name}_daemon.pid"
+command="/usr/sbin/daemon"
+procname="/usr/sbin/daemon"
+command_args="-o ${bsdk8s_mount_proxy_log} -f -P ${pidfile} -p /var/run/${name}.pid -r /usr/local/bin/bsdk8s-mount-proxy ${bsdk8s_mount_proxy_args}"
+
+run_rc_command "$1"

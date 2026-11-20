@@ -43,14 +43,22 @@
 #                       times; the package's unfsd reports whole seconds, so clients keep stale
 #                       data after a same-size rewrite within the second). Without it the
 #                       package is used, with a warning.
+#     CSI_BINDIR=<dir>  FreeBSD builds of the csi-hostpath e2e driver's images, one binary per
+#                       image, named like the image (hostpathplugin, csi-provisioner,
+#                       csi-attacher, csi-resizer, csi-snapshotter, csi-snapshot-metadata,
+#                       csi-node-driver-registrar, livenessprobe,
+#                       csi-external-health-monitor-controller), at the tags the e2e manifest
+#                       names. hostpathplugin must be built against the BSDKubernetes
+#                       kubernetes fork's k8s.io/mount-utils (it mounts through
+#                       bsdk8s-mount-proxy, components/mount-proxy).
 #   Also needs skopeo (agnhost's fake registry, from ghcr.io/platformnerds/pause:3.10.2).
 #     ONLY="<names>"    build only these images (agnhost kitten nautilus busybox nonroot
 #                       glibc-dns-testing nonewprivs nginx sample-apiserver etcd
-#                       regression-issue-74839 volume-nfs nfs-provisioner pause)
+#                       regression-issue-74839 volume-nfs nfs-provisioner csi pause)
 set -eu
 src=$(cd "$1" && pwd); agnhost=$2; nnp=${3:-}
 busybox=${BUSYBOX:-}; sampleapiserver=${SAMPLE_APISERVER:-}; etcd=${ETCD:-}
-coredns=${COREDNS:-}; regression74839=${REGRESSION_74839:-}; nfsprovisioner=${NFS_PROVISIONER:-}; unfsd=${UNFSD:-}
+coredns=${COREDNS:-}; regression74839=${REGRESSION_74839:-}; nfsprovisioner=${NFS_PROVISIONER:-}; unfsd=${UNFSD:-}; csibindir=${CSI_BINDIR:-}
 want() { [ -z "${ONLY:-}" ] && return 0; case " $ONLY " in *" $1 "*) return 0;; esac; return 1; }
 img=$src/test/images
 reg=registry.k8s.io/e2e-test-images
@@ -357,6 +365,22 @@ if [ -n "$nfsprovisioner" ] && want nfs-provisioner; then
     --port 2049/tcp --port 20048/tcp --port 111/tcp --port 111/udp --volume /export "$c"
   commit "registry.k8s.io/sig-storage/nfs-provisioner:$(mtag NFSProvisioner)"
   echo "built nfs-provisioner"
+fi
+
+# --- csi: the csi-hostpath e2e driver (test/e2e/testing-manifests/storage-csi/hostpath) -------
+# Upstream: distroless/static (sidecars), alpine + util-linux coreutils socat tar (plugin). Each image
+# here is the FreeBSD runtime base plus the binary as its entrypoint, at the manifest's tag.
+if [ -n "$csibindir" ] && want csi; then
+  csiman=$src/test/e2e/testing-manifests/storage-csi/hostpath/hostpath/csi-hostpath-plugin.yaml
+  for ref in $(sed -n 's|^ *image: \(registry.k8s.io/sig-storage/[^ ]*\)$|\1|p' "$csiman" | sort -u); do
+    name=${ref##*/}; name=${name%%:*}
+    if [ ! -x "$csibindir/$name" ]; then echo "WARNING: no $csibindir/$name for $ref"; continue; fi
+    new "$base"
+    install -m 755 "$csibindir/$name" "$m/$name"
+    buildah config --entrypoint "[\"/$name\"]" --cmd '[]' "$c"
+    commit "$ref"
+    echo "built $ref"
+  done
 fi
 
 # --- pause: reuse the control-plane pause image (scripts/build-images-freebsd.sh) -------------

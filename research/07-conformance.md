@@ -118,6 +118,9 @@ Still red, for reasons that hold: sysctls (Linux `kernel.*` names) and the privi
 the 6 in-place resize tests (research/17) and 3 `[LinuxOnly]` (ImageVolume's Alpine check, sysctls, dummy device).
 Excluding `[LinuxOnly]` the count is unchanged at 394/400; the two new passes are both `[LinuxOnly]` tests.
 
+**Run 14** (2026-11-20, `kernel.bsdk8s23`, after the hostPath-submount, socket-mount, NFS, kubelet-teardown and
+pf-state-option changes): **437/446**, the same 9 failures as run 13. No regressions.
+
 **`[NodeConformance]` beyond the conformance set** (94 tests: NodeConformance, not Conformance, not
 Serial/Slow/Disruptive): 87/94, then **91/94**. The 4 probe-while-terminating tests (2 for regular containers, 2 for
 sidecars) failed with `CreateContainerError: /bin/bash: No such file or directory`. They run `/bin/bash`, which

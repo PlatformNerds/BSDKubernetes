@@ -1,0 +1,127 @@
+From 2d6c7dca5e167b92267fc4ad7aee9315419f5969 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 08:05:59 -0700
+Subject: [PATCH] jail: add allow.mknod to create device nodes outside devfs
+
+A jail can't create device nodes: PRIV_VFS_MKNOD_DEV is never granted.
+Software that runs as root in a container may expect to (a privileged
+Linux container has CAP_MKNOD), e.g. to prepare a device node in a volume.
+
+On FreeBSD a device node outside devfs is inert: devices are reached only
+through devfs, and opening a node on ZFS, UFS or tmpfs reaches no driver.
+Add allow.mknod, which grants PRIV_VFS_MKNOD_DEV.
+
+devfs implements mknod(2) by bringing back a node that was removed or
+that a devfs ruleset hides (DE_WHITEOUT). A jail must not undo its
+ruleset, so devfs_mknod() now refuses jailed callers, with or without
+allow.mknod. Before this change a jail never got that far.
+---
+ sys/fs/devfs/devfs_vnops.c |  7 +++++++
+ sys/kern/kern_jail.c       | 14 ++++++++++++++
+ sys/sys/jail.h             |  3 ++-
+ usr.sbin/jail/jail.8       | 11 +++++++++++
+ 4 files changed, 34 insertions(+), 1 deletion(-)
+
+diff --git a/sys/fs/devfs/devfs_vnops.c b/sys/fs/devfs/devfs_vnops.c
+index 8c188e768..964b0ceff 100644
+--- a/sys/fs/devfs/devfs_vnops.c
++++ b/sys/fs/devfs/devfs_vnops.c
+@@ -1244,6 +1244,13 @@ devfs_mknod(struct vop_mknod_args *ap)
+ 	 */
+ 	if (ap->a_vap->va_type != VCHR)
+ 		return (EOPNOTSUPP);
++	/*
++	 * mknod(2) here brings back a node that was removed or that a
++	 * devfs ruleset hides (DE_WHITEOUT).  A jail must not undo its
++	 * ruleset, even with allow.mknod.
++	 */
++	if (jailed(ap->a_cnp->cn_cred))
++		return (EPERM);
+ 	dvp = ap->a_dvp;
+ 	dmp = VFSTODEVFS(dvp->v_mount);
+ 
+diff --git a/sys/kern/kern_jail.c b/sys/kern/kern_jail.c
+index 41c26975c..97600aca3 100644
+--- a/sys/kern/kern_jail.c
++++ b/sys/kern/kern_jail.c
+@@ -243,6 +243,7 @@ static struct bool_flags pr_flag_allow[NBBY * NBPW] = {
+ 	{"allow.settime", "allow.nosettime", PR_ALLOW_SETTIME},
+ 	{"allow.routing", "allow.norouting", PR_ALLOW_ROUTING},
+ 	{"allow.pf", "allow.nopf", PR_ALLOW_PF},
++	{"allow.mknod", "allow.nomknod", PR_ALLOW_MKNOD},
+ 	{"allow.unprivileged_parent_tampering",
+ 	    "allow.nounprivileged_parent_tampering",
+ 	    PR_ALLOW_UNPRIV_PARENT_TAMPER},
+@@ -4602,6 +4603,17 @@ prison_priv_check(struct ucred *cred, int priv)
+ 			return (0);
+ 		return (EPERM);
+ 
++		/*
++		 * Device nodes outside devfs are inert: a device is reached
++		 * only through devfs, which refuses mknod(2) from a jail.
++		 * With allow.mknod a jail may create them, e.g. for software
++		 * that expects to (a privileged Linux container can).
++		 */
++	case PRIV_VFS_MKNOD_DEV:
++		if (cred->cr_prison->pr_allow & PR_ALLOW_MKNOD)
++			return (0);
++		return (EPERM);
++
+ 	case PRIV_VMM_PPTDEV:
+ 		/*
+ 		 * Allow jailed root to manage passthrough devices.  vmm(4) also
+@@ -5085,6 +5097,8 @@ SYSCTL_JAIL_PARAM(_allow, routing, CTLTYPE_INT | CTLFLAG_RW,
+     "B", "Jail may modify routing table");
+ SYSCTL_JAIL_PARAM(_allow, pf, CTLTYPE_INT | CTLFLAG_RW,
+     "B", "Jail may manage the pf firewall without its own vnet");
++SYSCTL_JAIL_PARAM(_allow, mknod, CTLTYPE_INT | CTLFLAG_RW,
++    "B", "Jail may create device nodes outside devfs");
+ #ifdef AUDIT
+ SYSCTL_JAIL_PARAM(_allow, setaudit, CTLTYPE_INT | CTLFLAG_RW,
+     "B", "Jail may set and get audit session state");
+diff --git a/sys/sys/jail.h b/sys/sys/jail.h
+index b13ff6b56..52face39c 100644
+--- a/sys/sys/jail.h
++++ b/sys/sys/jail.h
+@@ -273,6 +273,7 @@ struct prison_racct {
+ #define	PR_ALLOW_UNPRIV_PARENT_TAMPER	0x00400000
+ #define	PR_ALLOW_SETAUDIT		0x00800000
+ #define	PR_ALLOW_PF			0x01000000
++#define	PR_ALLOW_MKNOD			0x02000000
+ 
+ /*
+  * PR_ALLOW_PRISON0 are the allow flags that we apply by default to prison0,
+@@ -280,7 +281,7 @@ struct prison_racct {
+  * build time.  PR_ALLOW_ALL_STATIC should contain any bit above that we expect
+  * to be used on the system, while PR_ALLOW_PRISON0 will be some subset of that.
+  */
+-#define	PR_ALLOW_ALL_STATIC		0x01ff87ff
++#define	PR_ALLOW_ALL_STATIC		0x03ff87ff
+ #define	PR_ALLOW_PRISON0		\
+     (PR_ALLOW_ALL_STATIC & ~(PR_ALLOW_UNPRIV_PARENT_TAMPER))
+ 
+diff --git a/usr.sbin/jail/jail.8 b/usr.sbin/jail/jail.8
+index aab3f9003..27ba64ee5 100644
+--- a/usr.sbin/jail/jail.8
++++ b/usr.sbin/jail/jail.8
+@@ -722,6 +722,17 @@ This permission includes also
+ .It Va allow.routing
+ Allow privileged process in the non-VNET jail to modify the system routing
+ table.
++.It Va allow.mknod
++Allow privileged processes in the jail to create character and block
++device nodes with
++.Xr mknod 2
++outside
++.Xr devfs 4 .
++Such nodes give no access to devices, which are reached only through
++.Xr devfs 4 ;
++creating or restoring nodes in a
++.Xr devfs 4
++mount is never allowed in a jail.
+ .It Va allow.setaudit
+ Allow privileged processes in the jail to set
+ .Xr audit 4
+-- 
+2.54.0 (Apple Git-157)
+

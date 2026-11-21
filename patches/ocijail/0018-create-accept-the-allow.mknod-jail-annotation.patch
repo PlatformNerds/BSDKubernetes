@@ -1,0 +1,29 @@
+From 31472cde55d51405409038297b602086897d0f33 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 08:06:10 -0700
+Subject: [PATCH] create: accept the allow.mknod jail annotation
+
+freebsd-src's allow.mknod lets a jail create device nodes outside devfs
+(they are inert there: devices are reached only through devfs). CRI-O asks
+for it for privileged containers, which on Linux have CAP_MKNOD.
+---
+ ocijail/create.cpp | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/ocijail/create.cpp b/ocijail/create.cpp
+index 684401e..ae0dee8 100644
+--- a/ocijail/create.cpp
++++ b/ocijail/create.cpp
+@@ -275,7 +275,8 @@ void create::run() {
+         // final authority and will reject any parameter it does not recognise.
+         static const std::unordered_set<std::string> known_allow_params = {
+             "allow.adjtime",       "allow.chflags",
+-            "allow.extattr",       "allow.mlock",
++            "allow.extattr",       "allow.mknod",
++            "allow.mlock",
+             "allow.mount",         "allow.mount.devfs",
+             "allow.mount.fdescfs", "allow.mount.nullfs",
+             "allow.mount.procfs",  "allow.mount.tmpfs",
+-- 
+2.54.0 (Apple Git-157)
+

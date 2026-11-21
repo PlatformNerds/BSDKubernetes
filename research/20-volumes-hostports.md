@@ -281,9 +281,57 @@ for exactly this container use. The mount point must be a socket too.
 | ocijail tests (node 2, `bsdk8s22`) | 31 | 32/32 (`test_socket_mount` runs) |
 | `mount_nullfs` of a socket on the node, `nc -U` through it | "must be either a file or directory" | the listener's reply arrives |
 
-The other 14 `HostPathType` failures are block and character devices. The test creates them with `mknod(2)`
-on the node, and FreeBSD has device nodes only in devfs. It has no block devices at all; disks are character
-devices. These can't pass.
+The other 14 `HostPathType` failures are block and character devices; see the next section.
+
+## Device nodes: `allow.mknod` (freebsd-src 0043, CRI-O 0026-0027, ocijail 0018)
+
+*2026-11-21.* The `HostPathType` Character and Block Device tests create `achardev` (`c 89 1`) and `ablkdev`
+(`b 89 1`) with `mknod` in an ordinary pod, in a hostPath directory, then check how the kubelet classifies them.
+
+**Correction:** this section used to say FreeBSD can't have these nodes outside devfs. It can. As root on the
+node, `mknod` makes both character and block nodes on ZFS and tmpfs. They are **inert**: since FreeBSD 5 a device
+is reached only through devfs. A node elsewhere is a file with a type and a number. Checked on node 2 with the
+number of `/dev/mem`: reading the copy on ZFS returns end of file, and writing to it fails.
+
+What failed was the jail: `mknod` in a pod returned `EPERM`, because a jail never gets `PRIV_VFS_MKNOD_DEV`. On
+Linux it is a capability, `CAP_MKNOD`: containerd and Docker include it in the default set, and CRI-O leaves it out.
+
+- **Kernel (0043, branch `bsdk8s/jail-allow-mknod-15.1`, stacked on `allow.pf`):** a new jail parameter,
+  `allow.mknod`, grants `PRIV_VFS_MKNOD_DEV`.
+  - devfs implements `mknod(2)` by bringing back a node that was removed or that the jail's devfs ruleset hides
+    (`DE_WHITEOUT`). With `allow.mknod` alone, that would let a jail unhide devices.
+  - So `devfs_mknod()` now refuses every jailed caller, with or without `allow.mknod`. Before this patch a jail
+    never got that far.
+  - Checked by hand: in a jail with `allow.mknod` and ruleset 4, `mknod /dev/mem` fails and `mem` stays hidden.
+- **CRI-O (0026-0027):** a container jail gets `allow.mknod` when the container is privileged or ends up with
+  `MKNOD`. "Ends up with" means the defaults, plus what it adds, minus what it drops; one `hasCapability`
+  helper now serves both `NET_RAW` and `MKNOD`. The sandbox jail always gets the parameter when the kernel knows it.
+  A child jail can't have a permission its parent lacks, which containers will have the capability isn't known
+  yet, and the sandbox only runs pause.
+- **ocijail (0018):** accepts the `org.freebsd.jail.allow.mknod` annotation.
+- **Cluster configuration (demo `build-cluster.sh`, `35-default-capabilities.conf`):** like containerd, containers
+  have `MKNOD` by default. On FreeBSD it grants nothing beyond the inert nodes.
+
+| Pod (node 2, `kernel.bsdk8s25`) | `mknod /mnt/c c 89 1`, `mknod /mnt/b b 89 1` | `mknod /dev/mem c 0 15` |
+|---|---|---|
+| plain, CRI-O's default capabilities | `EPERM` | `EPERM` |
+| `capabilities.add: [MKNOD]` | both created | `EPERM` |
+| `privileged: true` | both created | `File exists` (a privileged pod sees all of `/dev`) |
+| plain, `MKNOD` in the defaults (as configured now) | both created | `EPERM` |
+
+**`HostPathType`: 21/35 → 31/35.** All the "should fail" checks for device nodes now pass: the kubelet
+classifies the inert nodes correctly.
+
+**The 4 left** ("should be able to mount character/block device ... when HostPathType is CharDev/BlockDev/Unset")
+start a pod that bind-mounts the device node itself into the container. ocijail does that with a nullfs file mount,
+and nullfs mounts only directories, regular files and sockets (`Invalid argument`). I left it there on purpose:
+- The nodes these tests mount are inert, so there is little to gain.
+- Letting nullfs cover device nodes would have to keep refusing devfs vnodes. Otherwise a hostPath to a real
+  device would reach the device past the jail's devfs ruleset.
+
+The real gap is a hostPath to a real device (`/dev/kmsg` for node-problem-detector, `/dev/fuse`). On FreeBSD
+that should become a devfs rule that unhides the device in the container's devfs, as CRI-O's `devices` already
+does. It still fails today.
 
 ## NFS: client, server pods, recycler (freebsd-src 0036, CRI-O a90bf43d4)
 

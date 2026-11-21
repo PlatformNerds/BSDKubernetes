@@ -1,0 +1,73 @@
+From 8350a81295880606e298019bb9129a4ba03f83e7 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 08:06:36 -0700
+Subject: [PATCH 26/27] freebsd: let privileged containers create device nodes
+ (allow.mknod)
+
+A privileged Linux container has CAP_MKNOD. On FreeBSD a jail can't
+create device nodes; freebsd-src patch 0043 adds allow.mknod for that.
+Ask ocijail for it for privileged containers and their sandbox jail (a
+child jail can't have a permission its parent lacks), when the kernel
+knows the parameter. The nodes are inert outside devfs, and devfs refuses
+mknod(2) from a jail, so this grants no device access.
+---
+ internal/factory/container/namespaces_freebsd.go |  5 +++++
+ internal/jailparam/jailparam_freebsd.go          | 12 ++++++++++++
+ server/sandbox_run_freebsd.go                    |  5 +++++
+ 3 files changed, 22 insertions(+)
+
+diff --git a/internal/factory/container/namespaces_freebsd.go b/internal/factory/container/namespaces_freebsd.go
+index 733029d90..80922d614 100644
+--- a/internal/factory/container/namespaces_freebsd.go
++++ b/internal/factory/container/namespaces_freebsd.go
+@@ -30,6 +30,11 @@ func (c *container) SpecAddNamespaces(sb SandboxIFace, targetCtr *oci.Container,
+ 	if jailparam.PodNFSDAllowed(hostNetwork, c.Privileged()) {
+ 		c.Spec().AddAnnotation(jailparam.AllowNFSDAnnotation, "true")
+ 	}
++	// Privileged containers may create device nodes outside devfs; the
++	// sandbox jail got the same permission.
++	if jailparam.MknodAllowed(c.Privileged()) {
++		c.Spec().AddAnnotation(jailparam.AllowMknodAnnotation, "true")
++	}
+ 
+ 	return nil
+ }
+diff --git a/internal/jailparam/jailparam_freebsd.go b/internal/jailparam/jailparam_freebsd.go
+index e9775dc52..3e63f7a3e 100644
+--- a/internal/jailparam/jailparam_freebsd.go
++++ b/internal/jailparam/jailparam_freebsd.go
+@@ -38,3 +38,15 @@ const AllowNFSDAnnotation = "org.freebsd.jail.allow.nfsd"
+ func PodNFSDAllowed(hostNetwork, privileged bool) bool {
+ 	return !hostNetwork && privileged && Supported("allow.nfsd")
+ }
++
++// AllowMknodAnnotation asks ocijail to set the allow.mknod jail parameter:
++// the jail may create device nodes outside devfs (freebsd-src patch 0043).
++const AllowMknodAnnotation = "org.freebsd.jail.allow.mknod"
++
++// MknodAllowed reports whether a privileged jail should get allow.mknod, as a
++// privileged Linux container has CAP_MKNOD (e.g. tools that prepare device
++// nodes in a volume). It grants no device access: on FreeBSD a device is
++// reached only through devfs, where a jail can't create nodes.
++func MknodAllowed(privileged bool) bool {
++	return privileged && Supported("allow.mknod")
++}
+diff --git a/server/sandbox_run_freebsd.go b/server/sandbox_run_freebsd.go
+index 8f9416367..67a0491ac 100644
+--- a/server/sandbox_run_freebsd.go
++++ b/server/sandbox_run_freebsd.go
+@@ -384,6 +384,11 @@ func (s *Server) runPodSandbox(ctx context.Context, req *types.RunPodSandboxRequ
+ 	if jailparam.PodNFSDAllowed(hostNetwork, req.GetConfig().GetLinux().GetSecurityContext().GetPrivileged()) {
+ 		g.AddAnnotation(jailparam.AllowNFSDAnnotation, "true")
+ 	}
++	// A privileged pod may create device nodes outside devfs (allow.mknod),
++	// like CAP_MKNOD on Linux; the sandbox jail needs it too.
++	if jailparam.MknodAllowed(req.GetConfig().GetLinux().GetSecurityContext().GetPrivileged()) {
++		g.AddAnnotation(jailparam.AllowMknodAnnotation, "true")
++	}
+ 	// We want to cleanup after ourselves if we are managing any namespaces and fail in this function.
+ 	// However, we don't immediately register this func with resourceCleaner because we need to pair the
+ 	// ns cleanup with networkStop. Otherwise, we could try to cleanup the namespace before the network stop runs,
+-- 
+2.54.0 (Apple Git-157)
+

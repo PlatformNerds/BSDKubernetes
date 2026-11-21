@@ -77,6 +77,11 @@ block-volume variant. The driver makes snapshots with `tar`, which the FreeBSD b
 
 ## Limits and next steps
 
+- **Block volumes (update 2026-11-21):** the kubelet and runtime side is done (research/20, "Block volumes":
+  symlinks instead of device bind mounts, disks as GEOM providers, devices linked into the container's devfs;
+  local block volumes pass 143/143). What is left for CSI is the hostpath driver's own block path
+  (`fallocate` + `losetup` → `truncate` + `mdconfig`) and its publish target (a bind mount of the device). The
+  original reasoning follows.
 - **Block volumes: not pursued.** On Linux, a raw block PV is mapped by bind-mounting the device node onto
   regular files: the kubelet's global map path (a reference it counts through the mount table) and the
   driver's publish target, with a loop device held as a lock. nullfs can't mount a device node, and FreeBSD

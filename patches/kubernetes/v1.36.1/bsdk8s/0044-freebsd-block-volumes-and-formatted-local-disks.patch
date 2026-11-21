@@ -1,0 +1,702 @@
+From dbad0d7199ac7d0e3230c0ac8af78df0cdf78518 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 12:28:22 -0700
+Subject: [PATCH 44/46] freebsd: block volumes and formatted local disks
+
+FreeBSD has no block devices; disks are character devices in devfs.
+
+- hostutil: a character device that is a GEOM provider (disk, partition,
+  label, md(4), ZFS volume) is a BlockDevice, read from
+  kern.geom.conftxt without opening it. Local PVs of a disk, block-mode
+  volumes and HostPathType BlockDevice now take FreeBSD disks.
+- volumepathhandler: nullfs can't mount a device node, so the per-pod
+  references below the global map path are symbolic links to the device,
+  counted as such; no loop device is attached as a lock (md(4) can't
+  stack on a device); FindGlobalMapPathUUIDFromPod follows the links.
+- mount-utils: format and check like Linux (blkid, mkfs.ext4 and e2fsck
+  from e2fsprogs; newfs and fsck_ufs for ufs), mount ext2/3/4 as ext2fs.
+- e2e: loop devices are md(4) vnode disks (mdconfig), blockfs is ext4
+  mounted with ext2fs, and the volume mode check expects a character
+  device on FreeBSD nodes.
+---
+ pkg/volume/util/hostutil/hostutil_freebsd.go  |  63 +++++-
+ .../util/hostutil/hostutil_freebsd_test.go    |  46 ++++
+ .../volumepathhandler/volume_path_handler.go  |  13 +-
+ .../volume_path_handler_freebsd.go            |  85 ++++++--
+ .../volume_path_handler_linux.go              |   5 +
+ .../volume_path_handler_unsupported.go        |   5 +
+ .../mount-utils/mount_format_freebsd.go       | 202 ++++++++++++++++++
+ .../src/k8s.io/mount-utils/mount_freebsd.go   |  10 +-
+ test/e2e/framework/volume/fixtures.go         |  11 +-
+ test/e2e/storage/utils/local.go               |  20 +-
+ 10 files changed, 426 insertions(+), 34 deletions(-)
+ create mode 100644 pkg/volume/util/hostutil/hostutil_freebsd_test.go
+ create mode 100644 staging/src/k8s.io/mount-utils/mount_format_freebsd.go
+
+diff --git a/pkg/volume/util/hostutil/hostutil_freebsd.go b/pkg/volume/util/hostutil/hostutil_freebsd.go
+index 2b1c33ea607..847dc266a8b 100644
+--- a/pkg/volume/util/hostutil/hostutil_freebsd.go
++++ b/pkg/volume/util/hostutil/hostutil_freebsd.go
+@@ -25,6 +25,7 @@ import (
+ 	"path/filepath"
+ 	"strings"
+ 
++	"golang.org/x/sys/unix"
+ 	"k8s.io/klog/v2"
+ 	"k8s.io/mount-utils"
+ 	utilpath "k8s.io/utils/path"
+@@ -75,9 +76,16 @@ func (hu *HostUtil) DeviceOpened(pathname string) (bool, error) {
+ 	return false, nil
+ }
+ 
+-// PathIsDevice determines if a path is a device.
++// PathIsDevice determines if a path is a block device (see GetFileType).
+ func (hu *HostUtil) PathIsDevice(pathname string) (bool, error) {
+-	return false, nil
++	t, err := hu.GetFileType(pathname)
++	if err != nil {
++		if os.IsNotExist(err) {
++			return false, nil
++		}
++		return false, err
++	}
++	return t == FileTypeBlockDev, nil
+ }
+ 
+ // MakeRShared checks that given path is on a mount with 'rshared' mount
+@@ -86,9 +94,56 @@ func (hu *HostUtil) MakeRShared(path string) error {
+ 	return nil
+ }
+ 
+-// GetFileType checks for sockets/block/character devices
++// GetFileType checks for sockets/block/character devices.
++//
++// FreeBSD has no block devices: disks are character devices in devfs. What
++// Linux calls a block device is a disk, so a character device that is a
++// GEOM provider (a disk, a partition, a label, an md(4) or a ZFS volume) is
++// a BlockDevice here, and HostPathType BlockDevice, local block volumes and
++// block-mode volumes work with them.
+ func (hu *(HostUtil)) GetFileType(pathname string) (FileType, error) {
+-	return getFileType(pathname)
++	t, err := getFileType(pathname)
++	if err != nil || t != FileTypeCharDev {
++		return t, err
++	}
++	if isGEOMProvider(pathname) {
++		return FileTypeBlockDev, nil
++	}
++	return t, nil
++}
++
++// isGEOMProvider reports whether pathname is a GEOM provider's device in a
++// devfs. It reads the GEOM configuration; it doesn't open the device.
++func isGEOMProvider(pathname string) bool {
++	resolved, err := filepath.EvalSymlinks(pathname)
++	if err != nil {
++		return false
++	}
++	var st unix.Statfs_t
++	if err := unix.Statfs(resolved, &st); err != nil || unix.ByteSliceToString(st.Fstypename[:]) != "devfs" {
++		return false
++	}
++	name, err := filepath.Rel(unix.ByteSliceToString(st.Mntonname[:]), resolved)
++	if err != nil {
++		return false
++	}
++	conf, err := unix.Sysctl("kern.geom.conftxt")
++	if err != nil {
++		return false
++	}
++	return geomProviderListed(conf, name)
++}
++
++// geomProviderListed reports whether kern.geom.conftxt lists a provider
++// called name ("<depth> <class> <name> <mediasize> ...").
++func geomProviderListed(conftxt, name string) bool {
++	for _, line := range strings.Split(conftxt, "\n") {
++		f := strings.Fields(line)
++		if len(f) >= 3 && f[2] == name {
++			return true
++		}
++	}
++	return false
+ }
+ 
+ // PathExists checks whether the path exists
+diff --git a/pkg/volume/util/hostutil/hostutil_freebsd_test.go b/pkg/volume/util/hostutil/hostutil_freebsd_test.go
+new file mode 100644
+index 00000000000..c28a4f5877d
+--- /dev/null
++++ b/pkg/volume/util/hostutil/hostutil_freebsd_test.go
+@@ -0,0 +1,46 @@
++//go:build freebsd
++
++package hostutil
++
++import (
++	"strings"
++	"testing"
++
++	"golang.org/x/sys/unix"
++)
++
++var (
++	unixSysctl = unix.Sysctl
++	fields     = strings.Fields
++)
++
++func splitLines(s string) []string { return strings.Split(s, "\n") }
++
++func TestGeomProviderListed(t *testing.T) {
++	conf := "0 DISK vtbd0 85899345920 512 hd 16 sc 63\n1 PART vtbd0p4 84790426624 512 i 4\n2 LABEL gpt/swapfs 1073741824 512 i 0 o 0\n0 MD md0 20971520 512 u 0 s 512\n"
++	for name, want := range map[string]bool{"vtbd0": true, "vtbd0p4": true, "gpt/swapfs": true, "md0": true, "md1": false, "null": false, "DISK": false} {
++		if got := geomProviderListed(conf, name); got != want {
++			t.Errorf("%s: got %v, want %v", name, got, want)
++		}
++	}
++}
++
++func TestGetFileTypeDevices(t *testing.T) {
++	hu := NewHostUtil()
++	if got, err := hu.GetFileType("/dev/null"); err != nil || got != FileTypeCharDev {
++		t.Errorf("/dev/null: %v %v", got, err)
++	}
++	conf, err := unixSysctl("kern.geom.conftxt")
++	if err != nil {
++		t.Skip(err)
++	}
++	for _, line := range splitLines(conf) {
++		f := fields(line)
++		if len(f) >= 3 && f[1] == "DISK" {
++			if got, err := hu.GetFileType("/dev/" + f[2]); err != nil || got != FileTypeBlockDev {
++				t.Errorf("/dev/%s: %v %v", f[2], got, err)
++			}
++			return
++		}
++	}
++}
+diff --git a/pkg/volume/util/volumepathhandler/volume_path_handler.go b/pkg/volume/util/volumepathhandler/volume_path_handler.go
+index 5eea77007cb..3552654bfed 100644
+--- a/pkg/volume/util/volumepathhandler/volume_path_handler.go
++++ b/pkg/volume/util/volumepathhandler/volume_path_handler.go
+@@ -102,7 +102,7 @@ func (v VolumePathHandler) MapDevice(devicePath string, mapPath string, linkName
+ 		return fmt.Errorf("failed to mkdir %s: %v", mapPath, err)
+ 	}
+ 
+-	if bindMount {
++	if bindMount && deviceBindMounts {
+ 		return mapBindMountDevice(devicePath, mapPath, linkName)
+ 	}
+ 	return mapSymlinkDevice(devicePath, mapPath, linkName)
+@@ -165,7 +165,7 @@ func (v VolumePathHandler) UnmapDevice(mapPath string, linkName string, bindMoun
+ 	klog.V(5).Infof("UnmapDevice: mapPath %s", mapPath)
+ 	klog.V(5).Infof("UnmapDevice: linkName %s", linkName)
+ 
+-	if bindMount {
++	if bindMount && deviceBindMounts {
+ 		return unmapBindMountDevice(v, mapPath, linkName)
+ 	}
+ 	return unmapSymlinkDevice(v, mapPath, linkName)
+@@ -262,6 +262,9 @@ func (v VolumePathHandler) IsSymlinkExist(mapPath string) (bool, error) {
+ // If file doesn't exist, or file exists but not device, return false with no error.
+ // On other cases, return false with error from Lstat().
+ func (v VolumePathHandler) IsDeviceBindMountExist(mapPath string) (bool, error) {
++	if !deviceBindMounts {
++		return isDeviceSymlink(mapPath)
++	}
+ 	fi, err := os.Lstat(mapPath)
+ 	if err != nil {
+ 		// If file doesn't exist, return false and no error
+@@ -288,7 +291,11 @@ func (v VolumePathHandler) GetDeviceBindMountRefs(devPath string, mapPath string
+ 		return nil, err
+ 	}
+ 	for _, file := range files {
+-		if file.Type()&os.ModeDevice != os.ModeDevice {
++		if !deviceBindMounts {
++			if ok, _ := isDeviceSymlink(filepath.Join(mapPath, file.Name())); !ok {
++				continue
++			}
++		} else if file.Type()&os.ModeDevice != os.ModeDevice {
+ 			continue
+ 		}
+ 		filename := file.Name()
+diff --git a/pkg/volume/util/volumepathhandler/volume_path_handler_freebsd.go b/pkg/volume/util/volumepathhandler/volume_path_handler_freebsd.go
+index 81e4b367d0f..ebeb140fe54 100644
+--- a/pkg/volume/util/volumepathhandler/volume_path_handler_freebsd.go
++++ b/pkg/volume/util/volumepathhandler/volume_path_handler_freebsd.go
+@@ -21,27 +21,62 @@ package volumepathhandler
+ import (
+ 	"errors"
+ 	"fmt"
++	"os"
++	"path/filepath"
+ 
+ 	"k8s.io/apimachinery/pkg/types"
+ 	"k8s.io/klog/v2"
+ )
+ 
+-// FreeBSD has no block devices and no loop devices (md(4) disks are character
+-// devices), so a file is never attached as one: AttachFileDevice fails, and so
+-// does mapping a block-mode volume. Tearing one down must still work, or a pod
+-// whose block volume failed to map can never finish terminating.
++// Block volumes on FreeBSD. Disks (md(4), da(4), nvd(4), ...) are character
++// devices in devfs; FreeBSD has no block devices. Linux keeps, per pod, a
++// bind mount of the device below the volume's global map path, and counts
++// those to know when the device is no longer used. nullfs can't mount a
++// device node, so on FreeBSD these are symbolic links to the device, like
++// the per-pod links Linux already uses, and the references are the links
++// that lead to a device.
++//
++// Linux also attaches a loop device to the global map path, as a lock that
++// keeps the device from being removed while it is mapped. FreeBSD's md(4)
++// can't stack on a device, and an open device is busy anyway: there is no
++// lock to take.
++const deviceBindMounts = false
++
++// isDeviceSymlink reports whether path is a symbolic link to a device.
++func isDeviceSymlink(path string) (bool, error) {
++	fi, err := os.Lstat(path)
++	if err != nil {
++		if os.IsNotExist(err) {
++			return false, nil
++		}
++		return false, fmt.Errorf("failed to Lstat file %s: %v", path, err)
++	}
++	if fi.Mode()&os.ModeSymlink == 0 {
++		return false, nil
++	}
++	target, err := os.Stat(path)
++	if err != nil {
++		// A dangling link (the device is gone) still refers to it.
++		return true, nil
++	}
++	return target.Mode()&os.ModeDevice != 0, nil
++}
+ 
+-// AttachFileDevice takes a path to a regular file and makes it available as an
+-// attached block device.
++// AttachFileDevice: see above. A device needs no attaching; a regular file
++// can't be attached (md(4) could, but nothing on FreeBSD asks for it).
+ func (v VolumePathHandler) AttachFileDevice(path string) (string, error) {
+-	return "", fmt.Errorf("AttachFileDevice: FreeBSD has no loop (block) devices to attach %s to", path)
++	fi, err := os.Stat(path)
++	if err != nil {
++		return "", fmt.Errorf("AttachFileDevice: %v", err)
++	}
++	if fi.Mode()&os.ModeDevice == 0 {
++		return "", fmt.Errorf("AttachFileDevice: %s is not a device, and FreeBSD has no loop devices", path)
++	}
++	klog.V(4).Infof("AttachFileDevice: %s is a device, nothing to attach on FreeBSD", path)
++	return "", nil
+ }
+ 
+-// DetachFileDevice takes a path to the attached block device and
+-// detach it from block device.
+-//
+-// Nothing can have been attached, so there is nothing to detach: as on Linux
+-// when no loop device holds the file, skip it.
++// DetachFileDevice: nothing was attached.
+ func (v VolumePathHandler) DetachFileDevice(path string) error {
+ 	klog.V(4).Infof("DetachFileDevice: no loop device on FreeBSD, nothing to detach for %q", path)
+ 	return nil
+@@ -52,8 +87,28 @@ func (v VolumePathHandler) GetLoopDevice(path string) (string, error) {
+ 	return "", errors.New(ErrDeviceNotFound)
+ }
+ 
+-// FindGlobalMapPathUUIDFromPod finds {pod uuid} bind mount under globalMapPath
+-// corresponding to map path symlink, and then return global map path with pod uuid.
++// FindGlobalMapPathUUIDFromPod finds the {pod uuid} link below pluginDir that
++// leads to the same device as the pod's link mapPath, and returns it.
+ func (v VolumePathHandler) FindGlobalMapPathUUIDFromPod(pluginDir, mapPath string, podUID types.UID) (string, error) {
+-	return "", fmt.Errorf("FindGlobalMapPathUUIDFromPod not supported on FreeBSD")
++	podDev, err := filepath.EvalSymlinks(mapPath)
++	if err != nil {
++		return "", fmt.Errorf("FindGlobalMapPathUUIDFromPod: %v", err)
++	}
++	var globalMapPathUUID string
++	err = filepath.Walk(pluginDir, func(path string, fi os.FileInfo, err error) error {
++		if err != nil {
++			return err
++		}
++		if fi.Mode()&os.ModeSymlink != 0 && fi.Name() == string(podUID) {
++			if dev, err := filepath.EvalSymlinks(path); err == nil && dev == podDev {
++				globalMapPathUUID = path
++			}
++		}
++		return nil
++	})
++	if err != nil {
++		return "", fmt.Errorf("FindGlobalMapPathUUIDFromPod failed: %v", err)
++	}
++	klog.V(5).Infof("FindGlobalMapPathFromPod: globalMapPathUUID %s", globalMapPathUUID)
++	return globalMapPathUUID, nil
+ }
+diff --git a/pkg/volume/util/volumepathhandler/volume_path_handler_linux.go b/pkg/volume/util/volumepathhandler/volume_path_handler_linux.go
+index b1256a2152c..e99e282c7c4 100644
+--- a/pkg/volume/util/volumepathhandler/volume_path_handler_linux.go
++++ b/pkg/volume/util/volumepathhandler/volume_path_handler_linux.go
+@@ -233,3 +233,8 @@ func getDeviceMajorMinor(path string) (string, error) {
+ 
+ 	return fmt.Sprintf("%x:%x", major, minor), nil
+ }
++
++// deviceBindMounts: the global map path bind-mounts the device.
++const deviceBindMounts = true
++
++func isDeviceSymlink(string) (bool, error) { return false, nil }
+diff --git a/pkg/volume/util/volumepathhandler/volume_path_handler_unsupported.go b/pkg/volume/util/volumepathhandler/volume_path_handler_unsupported.go
+index a9da177d3bb..ef6b1a267c1 100644
+--- a/pkg/volume/util/volumepathhandler/volume_path_handler_unsupported.go
++++ b/pkg/volume/util/volumepathhandler/volume_path_handler_unsupported.go
+@@ -46,3 +46,8 @@ func (v VolumePathHandler) GetLoopDevice(path string) (string, error) {
+ func (v VolumePathHandler) FindGlobalMapPathUUIDFromPod(pluginDir, mapPath string, podUID types.UID) (string, error) {
+ 	return "", fmt.Errorf("FindGlobalMapPathUUIDFromPod not supported for this build.")
+ }
++
++// deviceBindMounts: the global map path bind-mounts the device.
++const deviceBindMounts = true
++
++func isDeviceSymlink(string) (bool, error) { return false, nil }
+diff --git a/staging/src/k8s.io/mount-utils/mount_format_freebsd.go b/staging/src/k8s.io/mount-utils/mount_format_freebsd.go
+new file mode 100644
+index 00000000000..33a7bae09c6
+--- /dev/null
++++ b/staging/src/k8s.io/mount-utils/mount_format_freebsd.go
+@@ -0,0 +1,202 @@
++//go:build freebsd
++
++/*
++Copyright 2026 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package mount
++
++import (
++	"fmt"
++	"strings"
++	"time"
++
++	"k8s.io/klog/v2"
++	utilexec "k8s.io/utils/exec"
++)
++
++// Formatting disks on FreeBSD. The commands are the Linux ones where FreeBSD
++// has them (blkid, mkfs.ext4 and e2fsck come with e2fsprogs), so a volume
++// formatted on one OS mounts on the other. ext2/3/4 are mounted with FreeBSD's
++// ext2fs, which handles all three; UFS is formatted with newfs.
++
++const (
++	fsckErrorsCorrected   = 1
++	fsckErrorsUncorrected = 4
++)
++
++// freeBSDFSType maps a volume's fsType to the type mount(8) knows.
++func freeBSDFSType(fstype string) string {
++	switch fstype {
++	case "ext2", "ext3", "ext4":
++		return "ext2fs"
++	}
++	return fstype
++}
++
++func isExtFS(fstype string) bool {
++	return fstype == "ext2" || fstype == "ext3" || fstype == "ext4"
++}
++
++// formatAndMountSensitive formats source if it has no file system (as Linux
++// does; the default is ext4), checks it if it has one, and mounts it.
++func (mounter *SafeFormatAndMount) formatAndMountSensitive(source string, target string, fstype string, options []string, sensitiveOptions []string, formatOptions []string) error {
++	readOnly := false
++	for _, o := range append(append([]string(nil), options...), sensitiveOptions...) {
++		if o == "ro" {
++			readOnly = true
++		}
++	}
++	mountErrorValue := UnknownMountError
++
++	existingFormat, err := mounter.GetDiskFormat(source)
++	if err != nil {
++		return NewMountError(GetDiskFormatFailed, "failed to get disk format of disk %s: %v", source, err)
++	}
++	if fstype == "" {
++		fstype = "ext4"
++	}
++
++	if existingFormat == "" {
++		if readOnly {
++			return NewMountError(UnformattedReadOnly, "cannot mount unformatted disk %s as we are manipulating it in read-only mode", source)
++		}
++		cmd, args := formatCommand(fstype, source)
++		args = append(formatOptions, args...)
++		klog.Infof("Disk %q appears to be unformatted, attempting to format as type: %q with options: %v", source, fstype, args)
++		output, err := mounter.format(cmd, args)
++		if err != nil {
++			sensitiveOptionsLog := sanitizedOptionsForLogging(options, sensitiveOptions)
++			detailedErr := fmt.Sprintf("format of disk %q failed: type:(%q) target:(%q) options:(%q) errcode:(%v) output:(%v) ", source, fstype, target, sensitiveOptionsLog, err, string(output))
++			klog.Error(detailedErr)
++			return NewMountError(FormatFailed, "%s", detailedErr)
++		}
++		klog.Infof("Disk successfully formatted (%s): %s - %s %s", cmd, fstype, source, target)
++	} else {
++		if fstype != existingFormat {
++			mountErrorValue = FilesystemMismatch
++			klog.Warningf("Configured to mount disk %s as %s but current format is %s, things might break", source, fstype, existingFormat)
++		}
++		if !readOnly {
++			if err := mounter.checkAndRepairFilesystem(source, existingFormat); err != nil {
++				return err
++			}
++		}
++	}
++
++	klog.V(4).Infof("Attempting to mount disk %s in %s format at %s", source, fstype, target)
++	if err := mounter.MountSensitive(source, target, fstype, options, sensitiveOptions); err != nil {
++		return NewMountError(mountErrorValue, "%s", err.Error())
++	}
++	return nil
++}
++
++// formatCommand returns the command that makes a file system of fstype.
++func formatCommand(fstype, source string) (string, []string) {
++	switch {
++	case isExtFS(fstype):
++		return "mkfs." + fstype, []string{"-F", "-m0", source}
++	case fstype == "ufs":
++		return "newfs", []string{"-U", source}
++	}
++	return "mkfs." + fstype, []string{source}
++}
++
++func (mounter *SafeFormatAndMount) format(cmd string, args []string) ([]byte, error) {
++	if mounter.formatSem != nil {
++		done := make(chan struct{})
++		defer close(done)
++		mounter.formatSem <- struct{}{}
++		go func() {
++			defer func() { <-mounter.formatSem }()
++			timeout := time.NewTimer(mounter.formatTimeout)
++			defer timeout.Stop()
++			select {
++			case <-done:
++			case <-timeout.C:
++			}
++		}()
++	}
++	return mounter.Exec.Command(cmd, args...).CombinedOutput()
++}
++
++// checkAndRepairFilesystem runs the file system's own checker in preen mode
++// (FreeBSD's fsck(8) picks the checker from /etc/fstab, not from the disk).
++func (mounter *SafeFormatAndMount) checkAndRepairFilesystem(source, fstype string) error {
++	var cmd string
++	switch {
++	case isExtFS(fstype):
++		cmd = "e2fsck"
++	case fstype == "ufs":
++		cmd = "fsck_ufs"
++	default:
++		return nil
++	}
++	klog.V(4).Infof("Checking for issues with %s on disk: %s", cmd, source)
++	out, err := mounter.Exec.Command(cmd, "-p", source).CombinedOutput()
++	if err != nil {
++		ee, isExitError := err.(utilexec.ExitError)
++		switch {
++		case err == utilexec.ErrExecutableNotFound:
++			klog.Warningf("%q not found on system; continuing mount without checking the file system.", cmd)
++		case isExitError && ee.ExitStatus() == fsckErrorsCorrected:
++			klog.Infof("Device %s has errors which were corrected by %s.", source, cmd)
++		case isExitError && ee.ExitStatus() == fsckErrorsUncorrected:
++			return NewMountError(HasFilesystemErrors, "%q found errors on device %s but could not correct them: %s", cmd, source, string(out))
++		case isExitError && ee.ExitStatus() > fsckErrorsUncorrected:
++			klog.Infof("%q error %s", cmd, string(out))
++		default:
++			klog.Warningf("%s on device %s failed with error %v, output: %v", cmd, source, err, string(out))
++		}
++	}
++	return nil
++}
++
++// GetDiskFormat uses blkid (e2fsprogs) to see if the given disk is
++// unformatted. It returns "" for an unformatted disk.
++func (mounter *SafeFormatAndMount) GetDiskFormat(disk string) (string, error) {
++	args := []string{"-p", "-s", "TYPE", "-s", "PTTYPE", "-o", "export", disk}
++	dataOut, err := mounter.Exec.Command("blkid", args...).CombinedOutput()
++	output := string(dataOut)
++	if err != nil {
++		if exit, ok := err.(utilexec.ExitError); ok && exit.ExitStatus() == 2 {
++			return "", nil
++		}
++		klog.Errorf("Could not determine if disk %q is formatted (%v)", disk, err)
++		return "", err
++	}
++	var fstype, pttype string
++	for _, l := range strings.Split(output, "\n") {
++		k, v, ok := strings.Cut(l, "=")
++		if !ok {
++			continue
++		}
++		switch k {
++		case "TYPE":
++			fstype = v
++		case "PTTYPE":
++			pttype = v
++		}
++	}
++	if pttype != "" {
++		return "unknown data, probably partitions", nil
++	}
++	return fstype, nil
++}
++
++func (mounter *SafeFormatAndMount) diskLooksUnformatted(disk string) (bool, error) {
++	format, err := mounter.GetDiskFormat(disk)
++	return format == "", err
++}
+diff --git a/staging/src/k8s.io/mount-utils/mount_freebsd.go b/staging/src/k8s.io/mount-utils/mount_freebsd.go
+index 72995c0d7c2..037301b37a5 100644
+--- a/staging/src/k8s.io/mount-utils/mount_freebsd.go
++++ b/staging/src/k8s.io/mount-utils/mount_freebsd.go
+@@ -19,7 +19,6 @@ limitations under the License.
+ package mount
+ 
+ import (
+-	"errors"
+ 	"fmt"
+ 	"os"
+ 	"os/exec"
+@@ -282,14 +281,6 @@ func nullfsMountRefs(path string, mps []MountPoint) []string {
+ 	return refs
+ }
+ 
+-func (mounter *SafeFormatAndMount) formatAndMountSensitive(source string, target string, fstype string, options []string, sensitiveOptions []string, formatOptions []string) error {
+-	return mounter.Interface.Mount(source, target, fstype, options)
+-}
+-
+-func (mounter *SafeFormatAndMount) diskLooksUnformatted(disk string) (bool, error) {
+-	//return true, errUnsupported
+-	return true, errors.New("mount.diskLooksUnformatted unsupported")
+-}
+ 
+ // SafeFormatAndMount has no IsMountPoint of its own (as on Linux): the embedded
+ // Interface's applies. A stub here that always failed used to shadow it.
+@@ -300,6 +291,7 @@ func (mounter *SafeFormatAndMount) diskLooksUnformatted(disk string) (bool, erro
+ // mount.
+ func (mounter *Mounter) doMount(mountCmd string, source string, target string, fstype string, options []string, sensitiveOptions []string, mountFlags []string) error {
+ 	options = withNFSRetryCount(fstype, options)
++	fstype = freeBSDFSType(fstype)
+ 	mountArgs, mountArgsLogStr := MakeMountArgsSensitiveWithMountFlags(source, target, fstype, options, sensitiveOptions, mountFlags)
+ 
+ 	// Logging with sensitive mount options removed.
+diff --git a/test/e2e/framework/volume/fixtures.go b/test/e2e/framework/volume/fixtures.go
+index ebbc0083a5b..eddd3125098 100644
+--- a/test/e2e/framework/volume/fixtures.go
++++ b/test/e2e/framework/volume/fixtures.go
+@@ -688,9 +688,16 @@ func generateWriteFileCmd(content, fullPath string) []string {
+ 
+ // CheckVolumeModeOfPath check mode of volume
+ func CheckVolumeModeOfPath(ctx context.Context, f *framework.Framework, pod *v1.Pod, volMode v1.PersistentVolumeMode, path string) error {
++	// FreeBSD has no block devices: disks are character devices.
++	blockTest := "-b"
++	if pod.Spec.NodeName != "" {
++		if node, err := f.ClientSet.CoreV1().Nodes().Get(ctx, pod.Spec.NodeName, metav1.GetOptions{}); err == nil && node.Labels[v1.LabelOSStable] == "freebsd" {
++			blockTest = "-c"
++		}
++	}
+ 	if volMode == v1.PersistentVolumeBlock {
+ 		// Check if block exists
+-		if err := e2epod.VerifyExecInPodSucceed(ctx, f, pod, fmt.Sprintf("test -b %s", path)); err != nil {
++		if err := e2epod.VerifyExecInPodSucceed(ctx, f, pod, fmt.Sprintf("test %s %s", blockTest, path)); err != nil {
+ 			return err
+ 		}
+ 
+@@ -705,7 +712,7 @@ func CheckVolumeModeOfPath(ctx context.Context, f *framework.Framework, pod *v1.
+ 		}
+ 
+ 		// Double check that it's not block
+-		if err := e2epod.VerifyExecInPodFail(ctx, f, pod, fmt.Sprintf("test -b %s", path), 1); err != nil {
++		if err := e2epod.VerifyExecInPodFail(ctx, f, pod, fmt.Sprintf("test %s %s", blockTest, path), 1); err != nil {
+ 			return err
+ 		}
+ 	}
+diff --git a/test/e2e/storage/utils/local.go b/test/e2e/storage/utils/local.go
+index 1d883691f73..aa613888d44 100644
+--- a/test/e2e/storage/utils/local.go
++++ b/test/e2e/storage/utils/local.go
+@@ -132,6 +132,10 @@ func (l *ltrMgr) createAndSetupLoopDevice(ctx context.Context, dir string, node
+ 	}
+ 	ddCmd := fmt.Sprintf("dd if=/dev/zero of=%s/file bs=4096 count=%d", dir, count)
+ 	losetupCmd := fmt.Sprintf("losetup -f %s/file", dir)
++	if isFreeBSD(node) {
++		// md(4) in vnode mode is FreeBSD's loop device.
++		losetupCmd = fmt.Sprintf("mdconfig -a -t vnode -f %s/file", dir)
++	}
+ 	err := l.hostExec.IssueCommand(ctx, fmt.Sprintf("%s && %s && %s", mkdirCmd, ddCmd, losetupCmd), node)
+ 	framework.ExpectNoError(err)
+ }
+@@ -139,6 +143,9 @@ func (l *ltrMgr) createAndSetupLoopDevice(ctx context.Context, dir string, node
+ // findLoopDevice finds loop device path by its associated storage directory.
+ func (l *ltrMgr) findLoopDevice(ctx context.Context, dir string, node *v1.Node) string {
+ 	cmd := fmt.Sprintf("E2E_LOOP_DEV=$(losetup | grep %s/file | awk '{ print $1 }') 2>&1 > /dev/null && echo ${E2E_LOOP_DEV}", dir)
++	if isFreeBSD(node) {
++		cmd = fmt.Sprintf("mdconfig -lv | awk '$4 == \"%s/file\" { print \"/dev/\" $1 }'", dir)
++	}
+ 	loopDevResult, err := l.hostExec.IssueCommandWithResult(ctx, cmd, node)
+ 	framework.ExpectNoError(err)
+ 	return strings.TrimSpace(loopDevResult)
+@@ -160,6 +167,9 @@ func (l *ltrMgr) teardownLoopDevice(ctx context.Context, dir string, node *v1.No
+ 	loopDev := l.findLoopDevice(ctx, dir, node)
+ 	ginkgo.By(fmt.Sprintf("Tear down block device %q on node %q at path %s/file", loopDev, node.Name, dir))
+ 	losetupDeleteCmd := fmt.Sprintf("losetup -d %s", loopDev)
++	if isFreeBSD(node) {
++		losetupDeleteCmd = fmt.Sprintf("mdconfig -d -u %s", strings.TrimPrefix(loopDev, "/dev/"))
++	}
+ 	err := l.hostExec.IssueCommand(ctx, losetupDeleteCmd, node)
+ 	framework.ExpectNoError(err)
+ 	return
+@@ -179,6 +189,10 @@ func (l *ltrMgr) setupLocalVolumeBlockFS(ctx context.Context, node *v1.Node, par
+ 	loopDir := ltr.loopDir
+ 	// Format and mount at loopDir and give others rwx for read/write testing
+ 	cmd := fmt.Sprintf("mkfs -t ext4 %s && mount -t ext4 %s %s && chmod o+rwx %s", loopDev, loopDev, loopDir, loopDir)
++	if isFreeBSD(node) {
++		// mkfs.ext4 from e2fsprogs; FreeBSD's ext2fs mounts ext4.
++		cmd = fmt.Sprintf("mkfs.ext4 -q -F %s && mount -t ext2fs %s %s && chmod o+rwx %s", loopDev, loopDev, loopDir, loopDir)
++	}
+ 	err := l.hostExec.IssueCommand(ctx, cmd, node)
+ 	framework.ExpectNoError(err)
+ 	return &LocalTestResource{
+@@ -189,7 +203,7 @@ func (l *ltrMgr) setupLocalVolumeBlockFS(ctx context.Context, node *v1.Node, par
+ }
+ 
+ func (l *ltrMgr) cleanupLocalVolumeBlockFS(ctx context.Context, ltr *LocalTestResource) {
+-	umountCmd := fmt.Sprintf("umount %s", ltr.Path)
++	umountCmd := unmount(ltr.Node, ltr.Path)
+ 	err := l.hostExec.IssueCommand(ctx, umountCmd, ltr.Node)
+ 	framework.ExpectNoError(err)
+ 	l.cleanupLocalVolumeBlock(ctx, ltr)
+@@ -363,6 +377,10 @@ func (l *ltrMgr) Remove(ctx context.Context, ltr *LocalTestResource) {
+ 
+ // bindMount returns the command that bind-mounts a directory on node: FreeBSD's
+ // bind mount is nullfs.
++func isFreeBSD(node *v1.Node) bool {
++	return node.Labels[v1.LabelOSStable] == "freebsd"
++}
++
+ func bindMount(node *v1.Node) string {
+ 	if node.Labels[v1.LabelOSStable] == "freebsd" {
+ 		return "mount -t nullfs"
+-- 
+2.54.0 (Apple Git-157)
+

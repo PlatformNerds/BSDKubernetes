@@ -1,0 +1,73 @@
+From 3348a0747f65c864b66b99c747d7b89d47761e6f Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 13:01:24 -0700
+Subject: [PATCH 46/46] e2e: local block volumes: whole-sector I/O, no nocache
+ on FreeBSD disks, retry mdconfig -d
+
+PersistentVolumes-local wrote a short file to the device and hexdumped
+100 bytes of it; a raw disk (FreeBSD) needs whole sectors. multiVolume
+asks dd for oflag=nocache, which FreeBSD's dd lacks and a FreeBSD disk
+doesn't need (no cache). mdconfig -d fails while the kubelet's mount
+still holds the disk, where losetup -d detaches on release: retry.
+---
+ test/e2e/storage/persistent_volumes-local.go | 6 ++++--
+ test/e2e/storage/utils/local.go              | 4 +++-
+ test/e2e/storage/utils/utils.go              | 3 ++-
+ 3 files changed, 9 insertions(+), 4 deletions(-)
+
+diff --git a/test/e2e/storage/persistent_volumes-local.go b/test/e2e/storage/persistent_volumes-local.go
+index d886731916b..240631c08dc 100644
+--- a/test/e2e/storage/persistent_volumes-local.go
++++ b/test/e2e/storage/persistent_volumes-local.go
+@@ -1001,7 +1001,8 @@ func createWriteCmd(testDir string, testFile string, writeTestFileContent string
+ 		// sudo is not needed and does not exist in some containers (e.g. busybox), when using pod exec.
+ 		sudoCmd := fmt.Sprintf("SUDO_CMD=$(which sudo); echo ${SUDO_CMD}")
+ 		// Write the testFileContent into the block device.
+-		writeBlockCmd := fmt.Sprintf("${SUDO_CMD} dd if=%s of=%s bs=512 count=100", testFilePath, testDir)
++		// conv=sync: whole sectors, which a raw disk (FreeBSD) needs.
++		writeBlockCmd := fmt.Sprintf("${SUDO_CMD} dd if=%s of=%s bs=512 count=100 conv=sync", testFilePath, testDir)
+ 		// Cleanup the file containing testFileContent.
+ 		deleteTestFileCmd := fmt.Sprintf("rm %s", testFilePath)
+ 		return fmt.Sprintf("%s && %s && %s && %s", writeTestFileCmd, sudoCmd, writeBlockCmd, deleteTestFileCmd)
+@@ -1013,7 +1014,8 @@ func createWriteCmd(testDir string, testFile string, writeTestFileContent string
+ func createReadCmd(testFileDir string, testFile string, volumeType localVolumeType) string {
+ 	if volumeType == BlockLocalVolumeType {
+ 		// Create the command to read the beginning of the block device and print it in ascii.
+-		return fmt.Sprintf("hexdump -n 100 -e '100 \"%%_p\"' %s | head -1", testFileDir)
++		// Read a whole sector: a raw disk (FreeBSD) reads nothing less.
++		return fmt.Sprintf("dd if=%s bs=512 count=1 2>/dev/null | hexdump -n 100 -e '100 \"%%_p\"' | head -1", testFileDir)
+ 	}
+ 	// Create the command to read (aka cat) a file.
+ 	testFilePath := filepath.Join(testFileDir, testFile)
+diff --git a/test/e2e/storage/utils/local.go b/test/e2e/storage/utils/local.go
+index aa613888d44..a42812704a4 100644
+--- a/test/e2e/storage/utils/local.go
++++ b/test/e2e/storage/utils/local.go
+@@ -168,7 +168,9 @@ func (l *ltrMgr) teardownLoopDevice(ctx context.Context, dir string, node *v1.No
+ 	ginkgo.By(fmt.Sprintf("Tear down block device %q on node %q at path %s/file", loopDev, node.Name, dir))
+ 	losetupDeleteCmd := fmt.Sprintf("losetup -d %s", loopDev)
+ 	if isFreeBSD(node) {
+-		losetupDeleteCmd = fmt.Sprintf("mdconfig -d -u %s", strings.TrimPrefix(loopDev, "/dev/"))
++		// losetup -d on a loop device still in use detaches it when it is
++		// released; mdconfig -d fails while the kubelet's mount holds it.
++		losetupDeleteCmd = fmt.Sprintf("{ i=0; until mdconfig -d -u %s; do i=$((i+1)); [ $i -lt 90 ] || exit 1; sleep 2; done; }", strings.TrimPrefix(loopDev, "/dev/"))
+ 	}
+ 	err := l.hostExec.IssueCommand(ctx, losetupDeleteCmd, node)
+ 	framework.ExpectNoError(err)
+diff --git a/test/e2e/storage/utils/utils.go b/test/e2e/storage/utils/utils.go
+index 0afac727fa1..a2f0a6eff4c 100644
+--- a/test/e2e/storage/utils/utils.go
++++ b/test/e2e/storage/utils/utils.go
+@@ -550,7 +550,8 @@ func CheckWriteToPath(ctx context.Context, f *framework.Framework, pod *v1.Pod,
+ 		pathForVolMode = filepath.Join(path, "file1.txt")
+ 	}
+ 
+-	if nocache {
++	// A FreeBSD disk has no cache to bypass (and FreeBSD's dd no nocache).
++	if nocache && (volMode != v1.PersistentVolumeBlock || !e2evolume.PodOnFreeBSDNode(ctx, f.ClientSet, pod)) {
+ 		oflag = "oflag=nocache"
+ 	}
+ 
+-- 
+2.54.0 (Apple Git-157)
+

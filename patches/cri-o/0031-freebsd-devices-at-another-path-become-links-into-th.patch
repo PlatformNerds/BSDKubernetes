@@ -1,0 +1,335 @@
+From 163c6673221f7a79760659e65c560721ab1480a7 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 12:28:17 -0700
+Subject: [PATCH] freebsd: devices at another path become links into the
+ container's devfs
+
+A block volume reaches the container as a CRI device: the kubelet's link
+to the disk (an md(4), da(4), ... in devfs) at the pod's devicePath, such
+as /mnt/volume1. devfs can't show a device under another name, so unhide
+it at its own name and make devicePath, in the container's root file
+system, a symbolic link to it. Host path volumes of a device at another
+path get the same. A path below /dev stays an error (the devfs would hide
+the link), and so do configured devices (additional_devices).
+
+The kubelet's host path is a link: resolve it before looking for devfs.
+---
+ internal/config/device/device_freebsd.go     |  3 +
+ internal/devfs/devfs_freebsd.go              | 62 ++++++++++++++++++--
+ internal/devfs/devfs_freebsd_test.go         | 36 +++++++++++-
+ internal/factory/container/device_freebsd.go | 21 +++----
+ server/container_create.go                   |  4 ++
+ server/container_create_freebsd.go           |  1 +
+ server/device_links_freebsd.go               | 40 +++++++++++++
+ server/device_links_other.go                 | 11 ++++
+ 8 files changed, 161 insertions(+), 17 deletions(-)
+ create mode 100644 server/device_links_freebsd.go
+ create mode 100644 server/device_links_other.go
+
+diff --git a/internal/config/device/device_freebsd.go b/internal/config/device/device_freebsd.go
+index 2995a9e4c..7a63a568c 100644
+--- a/internal/config/device/device_freebsd.go
++++ b/internal/config/device/device_freebsd.go
+@@ -90,6 +90,9 @@ func devicesFromStrings(devs []string, allowedDevices map[string]struct{}) ([]De
+ 		if err != nil {
+ 			return nil, err
+ 		}
++		if t.Link != "" {
++			return nil, fmt.Errorf("%s: on FreeBSD a configured device keeps its own path (%s), not %s", src, t.Link, dst)
++		}
+ 		res = append(res, Device{HostPath: src, ContainerPath: dst, Rules: t.Rules})
+ 	}
+ 	return res, nil
+diff --git a/internal/devfs/devfs_freebsd.go b/internal/devfs/devfs_freebsd.go
+index 61377ffc2..524ae2df6 100644
+--- a/internal/devfs/devfs_freebsd.go
++++ b/internal/devfs/devfs_freebsd.go
+@@ -15,7 +15,10 @@
+ //   - the root of the host's devfs (hostPath /dev) at another path, such as
+ //     /host/dev, becomes a second devfs mount with the ruleset and rules of
+ //     the container's /dev, so it shows what /dev shows;
+-//   - anything else is an error: devfs can't show a device under another name.
++//   - a device at another path (a block volume's devicePath) is unhidden at
++//     its own name, and the path becomes a symbolic link to it;
++//   - a directory at another path is an error: devfs can't show it under
++//     another name.
+ //
+ // Rules applied with "devfs rule apply" cover the devices that exist when the
+ // container starts. A device created later (a driver loaded afterwards) stays
+@@ -29,6 +32,7 @@ import (
+ 	"path/filepath"
+ 	"strings"
+ 
++	securejoin "github.com/cyphar/filepath-securejoin"
+ 	rspec "github.com/opencontainers/runtime-spec/specs-go"
+ 	"golang.org/x/sys/unix"
+ )
+@@ -77,6 +81,11 @@ type Translation struct {
+ 	// destination isn't /dev: mount another devfs there, with the options of
+ 	// the container's /dev (see SyncMounts).
+ 	Mount bool
++	// Link is set when a device is wanted at another path (a block volume's
++	// devicePath, e.g. /mnt/volume1): the destination becomes a symbolic link
++	// to Link, the device in the container's devfs. Open, read, write and
++	// ioctl behave as on the device; lstat(2) shows the link.
++	Link string
+ }
+ 
+ // Translate maps src, a host path on devfs, to destination in the container.
+@@ -89,14 +98,21 @@ func Translate(src *Source, hostPath, destination string) (*Translation, error)
+ 		return &Translation{Mount: true}, nil
+ 	}
+ 	want := filepath.Join(ContainerDev, src.Rel)
+-	if destination != want {
+-		return nil, fmt.Errorf("%s is a device on the host's devfs; on FreeBSD a container can only get it at %s, not %s", hostPath, want, destination)
++	if destination != want && (src.Dir || destination == ContainerDev || strings.HasPrefix(destination, ContainerDev+"/")) {
++		// A link below /dev would be hidden by the container's devfs.
++		return nil, fmt.Errorf("%s is on the host's devfs; on FreeBSD a container can only get it at %s, not %s", hostPath, want, destination)
+ 	}
+ 	rules, err := UnhideRules(src.Rel, src.Dir)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	return &Translation{Rules: rules}, nil
++	t := &Translation{Rules: rules}
++	if destination != want {
++		// devfs can't show the device under another name: unhide it at its
++		// own name and link the destination to it (see Link).
++		t.Link = want
++	}
++	return t, nil
+ }
+ 
+ // UnhideRules returns the devfs rules that unhide rel (relative to the
+@@ -168,3 +184,41 @@ func SyncMounts(mounts []rspec.Mount) {
+ 		}
+ 	}
+ }
++
++// CreateLink makes the symbolic link at destination (a path in the
++// container) to target, in the container's root file system at rootfs. An
++// existing link is replaced; anything else at destination is an error.
++func CreateLink(rootfs, destination, target string) error {
++	parent, err := securejoin.SecureJoin(rootfs, filepath.Dir(destination))
++	if err != nil {
++		return err
++	}
++	if err := os.MkdirAll(parent, 0o755); err != nil {
++		return err
++	}
++	link := filepath.Join(parent, filepath.Base(destination))
++	if fi, err := os.Lstat(link); err == nil {
++		if fi.Mode()&os.ModeSymlink == 0 {
++			return fmt.Errorf("cannot link device %s to %s: something else is there", target, destination)
++		}
++		if err := os.Remove(link); err != nil {
++			return err
++		}
++	}
++	return os.Symlink(target, link)
++}
++
++// TranslateHostPath resolves hostPath (the kubelet hands block volumes over
++// as a link to the device) and translates it for destination. It returns nil
++// when hostPath isn't on a devfs.
++func TranslateHostPath(hostPath, destination string) (*Translation, error) {
++	resolved, err := filepath.EvalSymlinks(hostPath)
++	if err != nil {
++		return nil, nil
++	}
++	src, err := HostSource(resolved)
++	if err != nil || src == nil {
++		return nil, err
++	}
++	return Translate(src, hostPath, destination)
++}
+diff --git a/internal/devfs/devfs_freebsd_test.go b/internal/devfs/devfs_freebsd_test.go
+index 145424c54..ab8a31218 100644
+--- a/internal/devfs/devfs_freebsd_test.go
++++ b/internal/devfs/devfs_freebsd_test.go
+@@ -1,6 +1,8 @@
+ package devfs
+ 
+ import (
++	"os"
++	"path/filepath"
+ 	"reflect"
+ 	"testing"
+ 
+@@ -23,7 +25,9 @@ func TestTranslate(t *testing.T) {
+ 		{Source{"dri", true}, "/dev/dri", &Translation{Rules: []string{
+ 			"rule=path dri unhide", "rule=path dri/* unhide", "rule=path dri/*/* unhide", "rule=path dri/*/*/* unhide"}}, false},
+ 		{Source{"klog", false}, "/dev/kmsg", nil, true},
+-		{Source{"fuse", false}, "/host/dev/fuse", nil, true},
++		{Source{"klog", false}, "/var/kmsg", &Translation{Rules: []string{"rule=path klog unhide"}, Link: "/dev/klog"}, false},
++		{Source{"md0", false}, "/mnt/volume1", &Translation{Rules: []string{"rule=path md0 unhide"}, Link: "/dev/md0"}, false},
++		{Source{"dri", true}, "/host/dri", nil, true},
+ 		{Source{"a b", false}, "/dev/a b", nil, true},
+ 		{Source{"x*", false}, "/dev/x*", nil, true},
+ 	} {
+@@ -82,3 +86,33 @@ func TestAddRulesAndSync(t *testing.T) {
+ 		t.Error("AddRules without a devfs /dev: no error")
+ 	}
+ }
++
++func TestCreateLink(t *testing.T) {
++	root := t.TempDir()
++	if err := CreateLink(root, "/mnt/volume1", "/dev/md0"); err != nil {
++		t.Fatal(err)
++	}
++	if got, err := os.Readlink(filepath.Join(root, "mnt/volume1")); err != nil || got != "/dev/md0" {
++		t.Errorf("got %q, %v", got, err)
++	}
++	// Again (a restarted container): the link is replaced.
++	if err := CreateLink(root, "/mnt/volume1", "/dev/md1"); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.MkdirAll(filepath.Join(root, "data"), 0o755); err != nil {
++		t.Fatal(err)
++	}
++	if err := CreateLink(root, "/data", "/dev/md0"); err == nil {
++		t.Error("replaced a directory")
++	}
++	// A symlink in the image must not lead outside the root.
++	if err := os.Symlink("/", filepath.Join(root, "escape")); err != nil {
++		t.Fatal(err)
++	}
++	if err := CreateLink(root, "/escape/x", "/dev/md0"); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := os.Lstat(filepath.Join(root, "x")); err != nil {
++		t.Errorf("link not inside the root: %v", err)
++	}
++}
+diff --git a/internal/factory/container/device_freebsd.go b/internal/factory/container/device_freebsd.go
+index 1a4e12df4..e9f2fd99f 100644
+--- a/internal/factory/container/device_freebsd.go
++++ b/internal/factory/container/device_freebsd.go
+@@ -52,25 +52,22 @@ func (c *container) specAddHostDevicesIfPrivileged(privilegedWithoutHostDevices
+ 	return nil
+ }
+ 
+-// specAddContainerConfigDevices unhides the CRI devices (from device
+-// plugins, for example) in the container's devfs. devfs can't show a device
+-// under another name, so the container path must be the device's own path.
+-// Privileged containers already see every device.
++// specAddContainerConfigDevices unhides the CRI devices (device plugins,
++// block volumes) in the container's devfs. A device wanted at another path
++// (a block volume's devicePath) also gets a link there, made once the root
++// file system is mounted (see devfs.Translation.Link). Privileged containers
++// see every device already.
+ func (c *container) specAddContainerConfigDevices(enableDeviceOwnershipFromSecurityContext bool) error {
+-	if c.Privileged() {
+-		return nil
+-	}
+ 	for _, d := range c.Config().GetDevices() {
+-		src, err := devfs.HostSource(d.GetHostPath())
++		t, err := devfs.TranslateHostPath(d.GetHostPath(), d.GetContainerPath())
+ 		if err != nil {
+ 			return fmt.Errorf("device %s: %w", d.GetHostPath(), err)
+ 		}
+-		if src == nil || src.Rel == "." {
++		if t == nil || t.Mount {
+ 			return fmt.Errorf("device %s: not a device on the host's devfs", d.GetHostPath())
+ 		}
+-		t, err := devfs.Translate(src, d.GetHostPath(), d.GetContainerPath())
+-		if err != nil {
+-			return err
++		if c.Privileged() {
++			continue
+ 		}
+ 		if err := devfs.AddRules(c.Spec().Config.Mounts, t.Rules); err != nil {
+ 			return fmt.Errorf("device %s: %w", d.GetHostPath(), err)
+diff --git a/server/container_create.go b/server/container_create.go
+index d43d6c387..960af4ca8 100644
+--- a/server/container_create.go
++++ b/server/container_create.go
+@@ -737,6 +737,10 @@ func (s *Server) createSandboxContainer(ctx context.Context, ctr container.Conta
+ 		}
+ 	}()
+ 
++	if err := s.createDeviceLinks(ctx, ctr, mountPoint); err != nil {
++		return nil, err
++	}
++
+ 	s.resourceStore.SetStageForResource(ctx, ctr.Name(), "container spec configuration")
+ 
+ 	labels := containerConfig.GetLabels()
+diff --git a/server/container_create_freebsd.go b/server/container_create_freebsd.go
+index 4f877a1fb..71dd5a146 100644
+--- a/server/container_create_freebsd.go
++++ b/server/container_create_freebsd.go
+@@ -155,6 +155,7 @@ func (s *Server) addOCIBindMounts(ctx context.Context, ctr ctrfactory.Container,
+ 			if t.Mount {
+ 				specgen.AddMount(devfs.NewMount(dest))
+ 			}
++			// t.Link: createDeviceLinks makes the link.
+ 			log.Infof(ctx, "Host path %s is on devfs: %d devfs rules, devfs mount: %v", m.HostPath, len(t.Rules), t.Mount)
+ 			volumes = append(volumes, oci.ContainerVolume{
+ 				ContainerPath: dest,
+diff --git a/server/device_links_freebsd.go b/server/device_links_freebsd.go
+new file mode 100644
+index 000000000..b87f900bb
+--- /dev/null
++++ b/server/device_links_freebsd.go
+@@ -0,0 +1,40 @@
++package server
++
++import (
++	"context"
++	"fmt"
++	"path/filepath"
++
++	"github.com/cri-o/cri-o/internal/devfs"
++	ctrfactory "github.com/cri-o/cri-o/internal/factory/container"
++	"github.com/cri-o/cri-o/internal/log"
++)
++
++// createDeviceLinks makes, in the container's root file system, the links to
++// devices wanted at another path than their own (see devfs.Translation.Link):
++// the CRI devices of block volumes, and host path volumes of a device.
++func (s *Server) createDeviceLinks(ctx context.Context, ctr ctrfactory.Container, mountPoint string) error {
++	type want struct{ hostPath, destination string }
++	var wants []want
++	for _, d := range ctr.Config().GetDevices() {
++		wants = append(wants, want{d.GetHostPath(), d.GetContainerPath()})
++	}
++	for _, m := range ctr.Config().GetMounts() {
++		if m.GetHostPath() == "" || m.GetImage().GetImage() != "" {
++			continue
++		}
++		wants = append(wants, want{filepath.Join(s.config.BindMountPrefix, m.GetHostPath()), m.GetContainerPath()})
++	}
++	for _, w := range wants {
++		t, err := devfs.TranslateHostPath(w.hostPath, w.destination)
++		if err != nil || t == nil || t.Link == "" {
++			// Errors were reported when the spec was made.
++			continue
++		}
++		if err := devfs.CreateLink(mountPoint, w.destination, t.Link); err != nil {
++			return fmt.Errorf("device %s: %w", w.hostPath, err)
++		}
++		log.Infof(ctx, "Device %s: %s links to %s", w.hostPath, w.destination, t.Link)
++	}
++	return nil
++}
+diff --git a/server/device_links_other.go b/server/device_links_other.go
+new file mode 100644
+index 000000000..0b4fbb647
+--- /dev/null
++++ b/server/device_links_other.go
+@@ -0,0 +1,11 @@
++//go:build !freebsd
++
++package server
++
++import (
++	"context"
++
++	ctrfactory "github.com/cri-o/cri-o/internal/factory/container"
++)
++
++func (s *Server) createDeviceLinks(context.Context, ctrfactory.Container, string) error { return nil }
+-- 
+2.54.0 (Apple Git-157)
+

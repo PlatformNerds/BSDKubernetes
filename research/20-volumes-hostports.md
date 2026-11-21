@@ -130,9 +130,12 @@ env LOCAL_SSH_KEY=$HOME/.ssh/e2e_ed25519 KUBE_SSH_USER=bsdk8s ./ginkgo ... \
 
 **Result: 97/145; every non-block test passes (97/97),** including `[Slow]`, across the dir, dir-link,
 dir-bindmounted, dir-link-bindmounted and tmpfs types: fsGroup, two pods at once and one after the other, subPath,
-multiVolume, volumeIO, and the block-volmode "should fail to create pod" checks. The 48 failures are the `block`,
-`blockfs` and `blockfswith[out]format` types, whose setup runs `losetup` (and `mkfs -t ext4`). FreeBSD has no
-block devices (research/24), so they can't pass. Before: 72/145, and before 0041 none got past setup.
+multiVolume, volumeIO, and the block-volmode "should fail to create pod" checks. The 48 failures were the `block`,
+`blockfs` and `blockfswith[out]format` types, whose setup runs `losetup` (and `mkfs -t ext4`). Before: 72/145, and
+before 0041 none got past setup. **Since then all of them pass: 143/143** (the other 2 skip themselves, as on Linux);
+see "Block volumes" below. I had written here that they "can't pass" because FreeBSD has no block devices. That was
+wrong: FreeBSD has no *block* devices, but `md(4)` in vnode mode is its loop device, and disks are character
+devices that work as Linux's block devices do, given whole-sector I/O.
 
 ## Local PersistentVolumes with fsGroup (kubernetes 92f38fe72f8, patch 0032)
 
@@ -387,6 +390,38 @@ Limits:
   this CRI-O: 113 pass; the 5 failures are the CSI mock token test and the 4 below, as before.
 - The 4 HostPathType tests above still fail: their device nodes are inert nodes on a ZFS or tmpfs, not devfs, so
   they are still nullfs file mounts, which nullfs refuses.
+
+## Block volumes and formatted local disks (kubernetes 0044-0046, CRI-O 0031)
+
+*2026-11-21.* Kubernetes' block volumes (`volumeMode: Block`, `volumeDevices`) and local PVs of a disk (formatted by
+the kubelet) work on FreeBSD now. FreeBSD has no block devices: disks are character devices in devfs, read and
+written in whole sectors, with no buffer cache. `md(4)` in vnode mode (`mdconfig -a -t vnode -f file`) is the loop
+device. What changed, layer by layer:
+
+| Layer | Linux | FreeBSD |
+|---|---|---|
+| What is a disk (`hostutil.GetFileType`) | a block device | a character device that is a GEOM provider (disk, partition, label, `md`, zvol), read from `kern.geom.conftxt` without opening it. Local PVs of a disk, block volumes and HostPathType `BlockDevice` take FreeBSD disks |
+| Per-pod references below the volume's global map path | bind mounts of the device node, counted through the mount table | symbolic links to the device (nullfs can't mount a device node), counted as links that lead to a device; `FindGlobalMapPathUUIDFromPod` (after a kubelet restart) follows them |
+| Lock against removal | a loop device attached to the global map path | none: `md(4)` can't stack on a device, and an open device is busy anyway |
+| Format and check (`SafeFormatAndMount`) | `blkid`, `mkfs.<type>`, `fsck -a` | the same `blkid` and `mkfs.ext4` (e2fsprogs, now installed on the nodes and by `build-cluster.sh`), `e2fsck -p` or `fsck_ufs -p` (FreeBSD's `fsck` picks the checker from fstab, not the disk), `newfs -U` for ufs; ext2/3/4 mount as `ext2fs`, which handles all three. Before, the kubelet mounted without formatting |
+| The device in the container (CRI `devices`, at the pod's `devicePath`, e.g. `/mnt/volume1`) | a device node made there | the device unhidden in the container's devfs at its own name, and `devicePath` a symbolic link to it in the container's root file system (CRI-O makes it once the root file system is mounted; a path below `/dev` stays an error, the devfs would hide the link) |
+
+The e2e tests needed FreeBSD paths too (e2e only): `mdconfig` for `losetup` (and `mdconfig -d` retried while the
+kubelet's mount still holds the disk: `losetup -d` detaches on release), `mkfs.ext4` + `mount -t ext2fs` for the
+`blockfs` type, `test -c` instead of `test -b`, `ext2fs` as the file system name of an ext4 volume, md's 512-byte
+sectors where Linux runs `blockdev --getss`, and no `oflag=nocache` (FreeBSD's `dd` has none, and a raw disk has no
+cache). Their block reads and writes now use whole sectors (`dd bs=512 conv=sync`, then `head -c`), which a Linux
+block device accepts the same way; writing 18 bytes with `echo > /dev/md0` fails on a raw disk (`Invalid argument`).
+Applications that use raw block volumes (databases) already do sector-aligned I/O.
+
+**Result: local volumes 143/143** (`PersistentVolumes-local|[Driver: local]`, not Disruptive/Flaky/Serial/LinuxOnly/
+Feature, 2 more skip themselves: no fsGroup on block devices), from 97/145. The run left no `md` disks or mounts.
+
+Limits:
+- `test -b` is false for a FreeBSD disk: a program that insists on `S_ISBLK` won't take it. `lstat(2)` on the
+  `devicePath` shows a link; `stat(2)`, `open(2)`, `read(2)`, `write(2)` and `ioctl(2)` reach the disk.
+- I/O must be whole sectors (no buffer cache for disks).
+- The CSI hostpath driver's block volumes still fail: the driver itself runs `fallocate` + `losetup` (research/24).
 
 ## NFS: client, server pods, recycler (freebsd-src 0036, CRI-O a90bf43d4)
 

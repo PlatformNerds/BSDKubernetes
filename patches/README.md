@@ -47,6 +47,7 @@ clang 19 (`kernel-toolchain` without the clang/lld bootstrap), and booted once o
 | `bsdk8s/mount-nfs-linux-vers` (2026-11-19) | not built (`mount_nfs.c` is identical to 15.1's) | tested on 15.1 only |
 | `bsdk8s/linprocfs-mounts-lower` (2026-11-20; main has the relatime backport already) | ok (`linprocfs.ko`, `zfs.ko`, kernel) | not booted; tested on 15.1 only |
 | `bsdk8s/nfscl-linux-atime-opts` (2026-11-20) | ok (kernel) | not booted; tested on 15.1 only |
+| `bsdk8s/jail-allow-mknod` (2026-11-21; on `bsdk8s/allow-pf`, hand-ported: main's flag table differs) | ok (kernel, with `allow-pf`) | not booted; tested on 15.1 only (pods, hand-made jails) |
 
 main lacks our other 15.1-only patches (`allow.pf`, the arm64 musl brand, the SME trap fix, the cgroup view), so
 the node was drained and the tests ran on the host and in hand-made jails, not in pods.

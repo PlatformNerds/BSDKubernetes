@@ -246,6 +246,9 @@ Not Conformance, Serial, Slow, Disruptive, Flaky, Feature or LinuxOnly:
 - **NodeConformance on `kernel.bsdk8s24` (2026-11-20), not Serial/Disruptive/Flaky/LinuxOnly: 182/182.** This run
   checks for regressions from the container mount-table work (freebsd-src 0038-0042, CRI-O 0025: containers of
   FreeBSD images now get linprocfs on `/proc`; busybox `mount`). Nothing regressed.
+- **NodeConformance on `kernel.bsdk8s25` (2026-11-21), same skip set: 182/182.** Checks for regressions from
+  `allow.mknod` (freebsd-src 0043, which also refuses `mknod` in devfs for every jail), CRI-O 0026-0027, ocijail
+  0018 and the cluster default `default_capabilities = ["MKNOD"]`. Nothing regressed (3369 s).
 - **NFS (research/20):** NFS server pods needed the kernel (freebsd-src 0036, `nfsd` in an inherited vnet), CRI-O
   (0024, `allow.nfsd` for privileged pods) and a FreeBSD `volume/nfs` image. The PV tests also found two Linux
   leftovers: BusyBox's grep took no `\b` (now linked with `libregex`), and the PV recycler pod used a Linux image (now

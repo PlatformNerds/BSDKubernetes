@@ -421,7 +421,8 @@ Limits:
 - `test -b` is false for a FreeBSD disk: a program that insists on `S_ISBLK` won't take it. `lstat(2)` on the
   `devicePath` shows a link; `stat(2)`, `open(2)`, `read(2)`, `write(2)` and `ioctl(2)` reach the disk.
 - I/O must be whole sectors (no buffer cache for disks).
-- The CSI hostpath driver's block volumes still fail: the driver itself runs `fallocate` + `losetup` (research/24).
+- CSI block volumes work too, with csi-driver-host-path 0002 (`mdconfig` in the driver, publish as a link; csi-hostpath
+  36/36, research/24). kubernetes 0047 (e2e only) makes the ephemeral block check expect a character device.
 
 ## NFS: client, server pods, recycler (freebsd-src 0036, CRI-O a90bf43d4)
 

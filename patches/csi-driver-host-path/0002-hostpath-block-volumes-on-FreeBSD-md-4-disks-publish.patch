@@ -1,0 +1,273 @@
+From 176bd40ebc2269cef4652542360a53bc6f37f5b9 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 14:20:58 -0700
+Subject: [PATCH] hostpath: block volumes on FreeBSD (md(4) disks, publish as a
+ link)
+
+The block access type created its backing file with fallocate, attached
+it to a loop device and bind-mounted the device onto the publish target,
+through Kubernetes' volumepathhandler, which has no FreeBSD support.
+
+Move these steps behind small helpers. On FreeBSD the file is made with
+truncate(2), attached to an md(4) disk in vnode mode (mdconfig, FreeBSD's
+loop device; the driver runs privileged), and the publish target becomes
+a symbolic link to the disk: nullfs can't mount a device node, and the
+kubelet resolves the link on the host. Linux keeps its code.
+---
+ pkg/hostpath/block_freebsd.go | 97 +++++++++++++++++++++++++++++++++++
+ pkg/hostpath/block_other.go   | 51 ++++++++++++++++++
+ pkg/hostpath/hostpath.go      | 14 ++---
+ pkg/hostpath/nodeserver.go    |  8 +--
+ 4 files changed, 154 insertions(+), 16 deletions(-)
+ create mode 100644 pkg/hostpath/block_freebsd.go
+ create mode 100644 pkg/hostpath/block_other.go
+
+diff --git a/pkg/hostpath/block_freebsd.go b/pkg/hostpath/block_freebsd.go
+new file mode 100644
+index 0000000..8ba2265
+--- /dev/null
++++ b/pkg/hostpath/block_freebsd.go
+@@ -0,0 +1,97 @@
++/*
++Copyright 2026 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package hostpath
++
++import (
++	"fmt"
++	"os"
++	"os/exec"
++	"strings"
++
++	"k8s.io/klog/v2"
++	"k8s.io/mount-utils"
++)
++
++// Block volumes on FreeBSD. The backing file becomes a disk with md(4) in
++// vnode mode, FreeBSD's loop device; the driver runs privileged, so it sees
++// /dev/mdctl. FreeBSD has no block devices: disks are character devices, and
++// nullfs can't bind-mount a device node, so the publish target is a symbolic
++// link to the disk. The kubelet resolves it on the host and maps the disk
++// into the container (see the BSDKubernetes kubelet and CRI-O patches).
++
++// createBlockFile makes the backing file (sparse, like fallocate's result
++// reads as zeros).
++func createBlockFile(path string, size int64) error {
++	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
++	if err != nil {
++		return err
++	}
++	if err := f.Truncate(size); err != nil {
++		f.Close()
++		return err
++	}
++	return f.Close()
++}
++
++// attachFileDevice attaches path to an md(4) disk, unless one is attached
++// already, and returns the disk's path.
++func attachFileDevice(path string) (string, error) {
++	if dev, err := getLoopDevice(path); err == nil {
++		return dev, nil
++	}
++	out, err := exec.Command("mdconfig", "-a", "-t", "vnode", "-f", path).CombinedOutput()
++	if err != nil {
++		return "", fmt.Errorf("mdconfig -a -t vnode -f %s: %v: %s", path, err, out)
++	}
++	return "/dev/" + strings.TrimSpace(string(out)), nil
++}
++
++// getLoopDevice returns the md(4) disk attached to path.
++func getLoopDevice(path string) (string, error) {
++	out, err := exec.Command("mdconfig", "-l", "-f", path).CombinedOutput()
++	if err != nil {
++		return "", fmt.Errorf("mdconfig -l -f %s: %v: %s", path, err, out)
++	}
++	units := strings.Fields(string(out))
++	if len(units) == 0 {
++		return "", fmt.Errorf("no md device for %s", path)
++	}
++	return "/dev/" + units[0], nil
++}
++
++// detachFileDevice detaches the md(4) disks attached to path, if any.
++func detachFileDevice(path string) error {
++	out, err := exec.Command("mdconfig", "-l", "-f", path).CombinedOutput()
++	if err != nil {
++		return fmt.Errorf("mdconfig -l -f %s: %v: %s", path, err, out)
++	}
++	for _, unit := range strings.Fields(string(out)) {
++		klog.V(4).Infof("detaching %s from %s", unit, path)
++		if out, err := exec.Command("mdconfig", "-d", "-u", unit).CombinedOutput(); err != nil {
++			return fmt.Errorf("mdconfig -d -u %s: %v: %s", unit, err, out)
++		}
++	}
++	return nil
++}
++
++// publishBlock makes targetPath a link to the disk.
++func publishBlock(_ mount.Interface, device, targetPath string) error {
++	if err := os.Remove(targetPath); err != nil && !os.IsNotExist(err) {
++		return err
++	}
++	return os.Symlink(device, targetPath)
++}
+diff --git a/pkg/hostpath/block_other.go b/pkg/hostpath/block_other.go
+new file mode 100644
+index 0000000..bfbf854
+--- /dev/null
++++ b/pkg/hostpath/block_other.go
+@@ -0,0 +1,51 @@
++//go:build !freebsd
++
++/*
++Copyright 2026 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package hostpath
++
++import (
++	"fmt"
++
++	"k8s.io/kubernetes/pkg/volume/util/volumepathhandler"
++	"k8s.io/mount-utils"
++	utilexec "k8s.io/utils/exec"
++)
++
++func createBlockFile(path string, size int64) error {
++	out, err := utilexec.New().Command("fallocate", "-l", fmt.Sprintf("%dM", size/mib), path).CombinedOutput()
++	if err != nil {
++		return fmt.Errorf("%v, %v", err, string(out))
++	}
++	return nil
++}
++
++func attachFileDevice(path string) (string, error) {
++	return volumepathhandler.VolumePathHandler{}.AttachFileDevice(path)
++}
++
++func getLoopDevice(path string) (string, error) {
++	return volumepathhandler.VolumePathHandler{}.GetLoopDevice(path)
++}
++
++func detachFileDevice(path string) error {
++	return volumepathhandler.VolumePathHandler{}.DetachFileDevice(path)
++}
++
++func publishBlock(mounter mount.Interface, device, targetPath string) error {
++	return mounter.Mount(device, targetPath, "", []string{"bind"})
++}
+diff --git a/pkg/hostpath/hostpath.go b/pkg/hostpath/hostpath.go
+index c20c32c..8265cea 100644
+--- a/pkg/hostpath/hostpath.go
++++ b/pkg/hostpath/hostpath.go
+@@ -30,7 +30,6 @@ import (
+ 	"google.golang.org/grpc/status"
+ 	"k8s.io/apimachinery/pkg/api/resource"
+ 	"k8s.io/klog/v2"
+-	"k8s.io/kubernetes/pkg/volume/util/volumepathhandler"
+ 	utilexec "k8s.io/utils/exec"
+ 
+ 	"github.com/kubernetes-csi/csi-driver-host-path/pkg/state"
+@@ -195,15 +194,12 @@ func (hp *hostPath) createVolume(volID, name string, cap int64, volAccessType st
+ 			return nil, err
+ 		}
+ 	case state.BlockAccess:
+-		executor := utilexec.New()
+-		size := fmt.Sprintf("%dM", cap/mib)
+ 		// Create a block file.
+ 		_, err := os.Stat(path)
+ 		if err != nil {
+ 			if os.IsNotExist(err) {
+-				out, err := executor.Command("fallocate", "-l", size, path).CombinedOutput()
+-				if err != nil {
+-					return nil, fmt.Errorf("failed to create block device: %v, %v", err, string(out))
++				if err := createBlockFile(path, cap); err != nil {
++					return nil, fmt.Errorf("failed to create block device: %v", err)
+ 				}
+ 			} else {
+ 				return nil, fmt.Errorf("failed to stat block device: %v, %v", path, err)
+@@ -211,8 +207,7 @@ func (hp *hostPath) createVolume(volID, name string, cap int64, volAccessType st
+ 		}
+ 
+ 		// Associate block file with the loop device.
+-		volPathHandler := volumepathhandler.VolumePathHandler{}
+-		_, err = volPathHandler.AttachFileDevice(path)
++		_, err = attachFileDevice(path)
+ 		if err != nil {
+ 			// Remove the block file because it'll no longer be used again.
+ 			if err2 := os.Remove(path); err2 != nil {
+@@ -251,10 +246,9 @@ func (hp *hostPath) deleteVolume(volID string) error {
+ 	}
+ 
+ 	if vol.VolAccessType == state.BlockAccess {
+-		volPathHandler := volumepathhandler.VolumePathHandler{}
+ 		path := hp.getVolumePath(volID)
+ 		klog.V(4).Infof("deleting loop device for file %s if it exists", path)
+-		if err := volPathHandler.DetachFileDevice(path); err != nil {
++		if err := detachFileDevice(path); err != nil {
+ 			return fmt.Errorf("failed to remove loop device for file %s: %v", path, err)
+ 		}
+ 	}
+diff --git a/pkg/hostpath/nodeserver.go b/pkg/hostpath/nodeserver.go
+index 6dab1cc..86ebb17 100644
+--- a/pkg/hostpath/nodeserver.go
++++ b/pkg/hostpath/nodeserver.go
+@@ -28,7 +28,6 @@ import (
+ 	"google.golang.org/grpc/codes"
+ 	"google.golang.org/grpc/status"
+ 	"k8s.io/klog/v2"
+-	"k8s.io/kubernetes/pkg/volume/util/volumepathhandler"
+ 	mount "k8s.io/mount-utils"
+ )
+ 
+@@ -107,10 +106,8 @@ func (hp *hostPath) NodePublishVolume(ctx context.Context, req *csi.NodePublishV
+ 			return nil, status.Error(codes.InvalidArgument, "cannot publish a non-block volume as block volume")
+ 		}
+ 
+-		volPathHandler := volumepathhandler.VolumePathHandler{}
+-
+ 		// Get loop device from the volume path.
+-		loopDevice, err := volPathHandler.GetLoopDevice(vol.VolPath)
++		loopDevice, err := getLoopDevice(vol.VolPath)
+ 		if err != nil {
+ 			return nil, fmt.Errorf("failed to get the loop device: %w", err)
+ 		}
+@@ -140,8 +137,7 @@ func (hp *hostPath) NodePublishVolume(ctx context.Context, req *csi.NodePublishV
+ 			return &csi.NodePublishVolumeResponse{}, nil
+ 		}
+ 
+-		options := []string{"bind"}
+-		if err := mounter.Mount(loopDevice, targetPath, "", options); err != nil {
++		if err := publishBlock(mounter, loopDevice, targetPath); err != nil {
+ 			return nil, fmt.Errorf("failed to mount block device: %s at %s: %w", loopDevice, targetPath, err)
+ 		}
+ 	} else if req.GetVolumeCapability().GetMount() != nil {
+-- 
+2.54.0 (Apple Git-157)
+

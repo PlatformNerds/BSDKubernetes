@@ -53,12 +53,12 @@ pid 66523 (...): mount -t nullfs /var/lib/csi-hostpath-data/169d... /var/db/kube
 
 ## Results
 
-e2e `[Driver: csi-hostpath]`, not Disruptive/Flaky/Feature/LinuxOnly/Serial/Slow: **26/36**; every filesystem-volume test passes, the 10 failures are the block-volume ones (20/36 before the container mount table of research/20).
+e2e `[Driver: csi-hostpath]`, not Disruptive/Flaky/Feature/LinuxOnly/Serial/Slow: **36/36** (2026-11-21). It was 26/36, with the 10 block-volume tests failing, and 20/36 before the container mount table of research/20.
 
 | | |
 |---|---|
 | Filesystem volumes: dynamic provisioning, a PVC as data source (clone), expansion (offline, online, with the pod re-created), subPath (4), ReadWriteOncePod, CSINode volume limits, CSI and generic ephemeral volumes (two pods with the same volume, several volumes per pod, expansion, read-only and read/write checks) | **26 pass** (snapshots: below) |
-| Block volumes (10) | fail at provisioning: the driver makes block devices with `fallocate` + `losetup`. The kubelet's block-volume path (loop devices, device bind mounts) is Linux-only as well. Not pursued (below). |
+| Block volumes (10) | **pass** since 2026-11-21: the kubelet's block path works on FreeBSD (research/20, "Block volumes"), and csi-driver-host-path 0002 makes the backing file with `truncate(2)`, attaches it to an `md(4)` disk (`mdconfig`, now in the driver's image) and publishes a symbolic link to the disk instead of bind-mounting it. Before: they failed at provisioning (`fallocate` + `losetup`). |
 
 The ephemeral tests check a volume's options with `mount | grep /mnt/test | grep rw,` (or `ro,`), Linux's format. They pass since the container's mount table describes volumes like Linux's (research/20, "The mount table in a container"): `zroot/ROOT/default on /mnt/test type zfs (rw,relatime)`.
 
@@ -71,17 +71,17 @@ them. They come from external-snapshotter v8.5.0, the release of the e2e manifes
 for FreeBSD, so it's tagged as what it is. The image comes from `scripts/build-e2e-images-freebsd.sh`
 (`CSI_BINDIR=` with a `snapshot-controller` binary). Both replicas run, one per node.
 
-`[Driver: csi-hostpath]` snapshot tests (not Disruptive/Flaky/LinuxOnly/Serial): **7/8**. Taking a snapshot,
-restoring a volume from it, and the `[Feature:VolumeSnapshotDataSource]` provisioning pass. The failure is the
-block-volume variant. The driver makes snapshots with `tar`, which the FreeBSD base image has.
+`[Driver: csi-hostpath]` snapshot tests (not Disruptive/Flaky/LinuxOnly/Serial): **8/8** (7/8 before block volumes
+worked). Taking a snapshot, restoring a volume from it, and the `[Feature:VolumeSnapshotDataSource]` provisioning
+pass, for file system and block volumes. The driver makes snapshots with `tar`, which the FreeBSD base image has.
 
 ## Limits and next steps
 
 - **Block volumes (update 2026-11-21):** the kubelet and runtime side is done (research/20, "Block volumes":
   symlinks instead of device bind mounts, disks as GEOM providers, devices linked into the container's devfs;
-  local block volumes pass 143/143). What is left for CSI is the hostpath driver's own block path
-  (`fallocate` + `losetup` → `truncate` + `mdconfig`) and its publish target (a bind mount of the device). The
-  original reasoning follows.
+  local block volumes pass 143/143), and the hostpath driver's own block path too (csi-driver-host-path 0002:
+  `truncate` + `mdconfig`, publish target a link to the disk): csi-hostpath 36/36, snapshots 8/8. The
+  original reasoning follows, kept for the record.
 - **Block volumes: not pursued.** On Linux, a raw block PV is mapped by bind-mounting the device node onto
   regular files: the kubelet's global map path (a reference it counts through the mount table) and the
   driver's publish target, with a loop device held as a lock. nullfs can't mount a device node, and FreeBSD

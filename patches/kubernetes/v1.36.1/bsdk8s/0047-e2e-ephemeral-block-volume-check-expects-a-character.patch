@@ -1,0 +1,28 @@
+From dd3f80d490c31dfd26911cb5cbce6028bd80df0d Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 14:39:46 -0700
+Subject: [PATCH] e2e: ephemeral block volume check expects a character device
+ on FreeBSD
+
+---
+ test/e2e/storage/testsuites/ephemeral.go | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/test/e2e/storage/testsuites/ephemeral.go b/test/e2e/storage/testsuites/ephemeral.go
+index 571d381b423..a4a3f444a0c 100644
+--- a/test/e2e/storage/testsuites/ephemeral.go
++++ b/test/e2e/storage/testsuites/ephemeral.go
+@@ -214,6 +214,10 @@ func (p *ephemeralTestSuite) DefineTests(driver storageframework.TestDriver, pat
+ 			}
+ 			if pattern.VolMode == v1.PersistentVolumeBlock {
+ 				command = "if ! [ -b /mnt/test-0 ]; then echo /mnt/test-0 is not a block device; exit 1; fi"
++				// FreeBSD has no block devices: disks are character devices.
++				if e2evolume.PodOnFreeBSDNode(ctx, f.ClientSet, pod) {
++					command = "if ! [ -c /mnt/test-0 ]; then echo /mnt/test-0 is not a disk; exit 1; fi"
++				}
+ 			}
+ 			err := e2epod.VerifyExecInPodSucceed(ctx, f, pod, command)
+ 			framework.ExpectNoError(err, "while checking read/write mount")
+-- 
+2.54.0 (Apple Git-157)
+

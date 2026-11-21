@@ -377,6 +377,8 @@ if [ -n "$csibindir" ] && want csi; then
     if [ ! -x "$csibindir/$name" ]; then echo "WARNING: no $csibindir/$name for $ref"; continue; fi
     new "$base"
     install -m 755 "$csibindir/$name" "$m/$name"
+    # Block volumes: the driver attaches its backing files to md(4) disks.
+    if [ "$name" = hostpathplugin ]; then hostbin /sbin/mdconfig; fi
     buildah config --entrypoint "[\"/$name\"]" --cmd '[]' "$c"
     commit "$ref"
     echo "built $ref"

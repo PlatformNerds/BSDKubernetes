@@ -53,13 +53,14 @@ pid 66523 (...): mount -t nullfs /var/lib/csi-hostpath-data/169d... /var/db/kube
 
 ## Results
 
-e2e `[Driver: csi-hostpath]`, not Disruptive/Flaky/Feature/LinuxOnly/Serial/Slow: **20/36**.
+e2e `[Driver: csi-hostpath]`, not Disruptive/Flaky/Feature/LinuxOnly/Serial/Slow: **26/36**; every filesystem-volume test passes, the 10 failures are the block-volume ones (20/36 before the container mount table of research/20).
 
 | | |
 |---|---|
-| Filesystem volumes: dynamic provisioning, a PVC as data source (clone), expansion (offline, online, with the pod re-created), subPath (4), ReadWriteOncePod, CSINode volume limits, CSI and generic ephemeral volumes (two pods with the same volume, several volumes per pod, expansion) | **20 pass** (snapshots: below) |
-| Block volumes (9) | fail at provisioning: the driver makes block devices with `fallocate` + `losetup`. The kubelet's block-volume path (loop devices, device bind mounts) is Linux-only as well. Not attempted. |
-| Ephemeral `rw,`/`ro,` checks (7) | read Linux `mount(8)` output in the container, as with NFS (research/20) |
+| Filesystem volumes: dynamic provisioning, a PVC as data source (clone), expansion (offline, online, with the pod re-created), subPath (4), ReadWriteOncePod, CSINode volume limits, CSI and generic ephemeral volumes (two pods with the same volume, several volumes per pod, expansion, read-only and read/write checks) | **26 pass** (snapshots: below) |
+| Block volumes (10) | fail at provisioning: the driver makes block devices with `fallocate` + `losetup`. The kubelet's block-volume path (loop devices, device bind mounts) is Linux-only as well. Not pursued (below). |
+
+The ephemeral tests check a volume's options with `mount | grep /mnt/test | grep rw,` (or `ro,`), Linux's format. They pass since the container's mount table describes volumes like Linux's (research/20, "The mount table in a container"): `zroot/ROOT/default on /mnt/test type zfs (rw,relatime)`.
 
 ### Snapshots
 

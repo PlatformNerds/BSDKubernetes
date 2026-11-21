@@ -25,15 +25,19 @@ src=$work/busybox-$ver
 
 # The port's do-patch, post-patch and do-configure steps.
 for p in "$port"/files/patch-*; do patch -s -p0 -d "$src" < "$p"; done
-# Ours (local/): the df applet, which the port leaves out because it reads Linux's mount
-# table; upstream's busybox image has it, and tests run `df` (e.g. the memory emptyDir size).
+# Ours (local/): the df and mount applets, which the port leaves out because they read Linux's
+# mount table (and mount uses Linux's mount(2)); upstream's busybox image has them, and tests run
+# `df` (the memory emptyDir size) and `mount` (a volume's options: `mount | grep /mnt/test |
+# grep ro,`). On FreeBSD, mount lists /proc/mounts (linprocfs) in Linux's format and mounts the
+# way FreeBSD's mount(8) does.
 for p in "$(dirname "$port")"/local/patch-*; do patch -s -p0 -d "$src" < "$p"; done
 sed -i '' -e 's|\([[:<:]]\)sed\([[:blank:]]-n\)|\1gsed\2|' "$src/scripts/gen_build_files.sh"
 find "$src" -name '*.c' -print0 | xargs -0 sed -i '' -e 's|<alloca.h>|<stdlib.h>|; s|<malloc.h>|<stdlib.h>|'
 find "$src" -name '*.[ch]' -print0 | xargs -0 sed -i '' -e 's|"/proc|"/compat/linux/proc|'
 cp "$port/files/data-.config" "$src/.config"
 sed -i '' -e 's|^# CONFIG_DF is not set|CONFIG_DF=y|' \
-    -e 's|^# CONFIG_FEATURE_DF_FANCY is not set|CONFIG_FEATURE_DF_FANCY=y|' "$src/.config"
+    -e 's|^# CONFIG_FEATURE_DF_FANCY is not set|CONFIG_FEATURE_DF_FANCY=y|' \
+    -e 's|^# CONFIG_MOUNT is not set|CONFIG_MOUNT=y|' "$src/.config"
 # Link FreeBSD's libregex (the GNU-compatible regex grep(1) uses) statically, ahead of libc's
 # POSIX-only regcomp. Upstream's image is Alpine, whose musl regex takes \b, \w, \< ...; tests
 # use them (the NFS PV tests run `id -G | grep -E '\b777\b'`), and libc's regcomp rejects them

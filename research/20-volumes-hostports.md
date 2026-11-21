@@ -160,6 +160,46 @@ Verified on both nodes:
 
 Unit test: `server/submounts_freebsd_test.go` (6 cases).
 
+
+## The mount table in a container (freebsd-src 0038-0042, CRI-O be684e8d3, busybox `mount`)
+
+Tests check a volume's options from inside the pod the Linux way: `mount | grep /mnt/test | grep rw,`
+(or `ro,`), `mount | grep 'on /mnt/test' | awk '{print $6}'` for a PV's `mountOptions`, `grep " /dir "
+/proc/mounts` for its type. Twelve storage tests failed on that (7 csi-hostpath, 5 NFS). On FreeBSD:
+
+- A container (a jail) had no `/proc`, and FreeBSD's `mount(8)` showed only `/`: ocijail flags
+  container mounts `MNT_IGNORE`, so that the host's `mount` and `df` stay readable. `mount -v` shows
+  them as nullfs mounts of host paths, `(nullfs, local)`, never `rw`, with nothing about the volume's
+  file system or its NFS options, which belong to the host's mount.
+- Linux describes a bind mount by the file system behind it. linprocfs (Linux's `/proc`, which Linux
+  images already get) showed the nullfs mount instead.
+- "provision storage with mount options" did not fail on the output at all, as this document said
+  before: the PV's `mountOptions` are `relatime,vers=3`, and the NFS client refused `relatime`
+  ("mount option <relatime> is unknown"), so the pod never started.
+
+Fixes:
+
+| | |
+|---|---|
+| freebsd-src 0039 | linprocfs' `/proc/mounts` and `/proc/<pid>/mountinfo` look through nullfs (also nested) to the mount below and report its source and type, with `ro`/`noatime` from either mount; they add the options Linux shows that FreeBSD keeps only in the mount's option list: `relatime` and the NFS client's `vers=`, `rsize`/`wsize`, `hard`/`soft`, `proto=`, `timeo`, `retrans`. The table is read without `MNT_WAIT`, so a dead NFS server's mount no longer hangs it. |
+| freebsd-src 0038 | backport of OpenZFS 16858492e6e4: FreeBSD 15.1's ZFS listed `relatime=on` but ignored it (strict atime). The backport implements it, with the default off on FreeBSD as upstream chose; **the nodes set `relatime=on` on zroot** (Linux nodes' default). ZFS now also records relatime in the mount's options, as it does atime. |
+| freebsd-src 0040 | a bug: ZFS's property callbacks record options in `mnt_opt` while `VFS_MOUNT()` runs, and the kernel then replaces `mnt_opt` with the caller's list, so everything they recorded on a first mount was lost (the root file system showed no `relatime`). They now record in `mnt_optnew` while a mount is in progress. |
+| freebsd-src 0041 | updates swap a mount's option list under the mount interlock, which ZFS and linprocfs hold when they touch it. |
+| freebsd-src 0042 | the NFS client accepts Linux's access time options (`relatime`, `strictatime`, `lazytime`, `[no]diratime`). The server keeps NFS access times, so they ask nothing of the client, as on Linux. |
+| CRI-O be684e8d3 (0025) | containers of FreeBSD images get linprocfs on `/proc` too, unless the pod mounts something there. FreeBSD's tools (`ps`, `procstat`) don't use `/proc`. |
+| busybox image | BusyBox's `mount` applet, ported (`scripts/busybox-freebsd/local/patch-util-linux_mount.c`): it lists `/proc/mounts` in Linux's format (`getmntinfo(3)` without `/proc`) and mounts like FreeBSD's `mount(8)` (`mount_<type>` if there is one, else `nmount(2)`; `bind` is nullfs). Upstream's image is busybox, so its `mount` is this applet. |
+
+In a pod now:
+
+```
+zroot/ROOT/default on /mnt/test type zfs (rw,relatime)
+zroot/ROOT/default on /mnt/ro type zfs (ro,relatime)
+tmpfs on /var/run/secrets/kubernetes.io/serviceaccount type tmpfs (ro)
+```
+
+Results: NFS drivers 35/35 (NFS section below); csi-hostpath 26/36, all filesystem tests (research/24).
+Linux containers see the same table. Nodes boot `/boot/kernel.bsdk8s24`.
+
 ## Mount propagation: not available
 
 `[sig-node] Mount propagation should propagate mounts within defined scopes` fails, and can't pass on FreeBSD:
@@ -286,5 +326,5 @@ Getting it to pass turned up four more problems:
 | e2e (`NFS\|nfs`, without Disruptive/Flaky/Feature/LinuxOnly/Serial) | Result |
 |---|---|
 | `PersistentVolumes NFS` (PV/PVC pairs, multiple PVs, Recycle) | **12/12** |
-| In-tree `nfs` + `nfs3` drivers and `DynamicProvisioner External`, skipping the `nfs` (v4) Dynamic PV and Generic Ephemeral patterns | **30/35**. The 5 failures check Linux's `mount(8)` output inside the container: 4 ephemeral tests grep for `rw,`/`ro,`, and "provision storage with mount options" looks for `vers=3` in the mount's options. FreeBSD's `mount` prints `(nullfs, local)` and never `rw`. ocijail also flags container mounts `MNT_IGNORE` so that the host's `mount` and `df` stay readable, which hides them from `mount` in the container, and the NFS options belong to the host's mount, outside the jail. |
+| In-tree `nfs` + `nfs3` drivers and `DynamicProvisioner External`, skipping the `nfs` (v4) Dynamic PV and Generic Ephemeral patterns | **35/35** (2026-11-20; 30/35 before "The mount table in a container" above) |
 | `nfs` (v4) Dynamic PV / Generic Ephemeral | not run: unfs3 has no NFSv4 |

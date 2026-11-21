@@ -1,0 +1,70 @@
+From 457872835796d227ae1263adaa5646ca829a9d31 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 18:11:56 -0700
+Subject: [PATCH 41/41] vfs: replace a mount's options under the mount
+ interlock on update
+
+An update (and the forced read-only remount) freed mnt_opt and replaced
+it with the new list without the mount interlock, while ZFS's
+vfs_setmntopt() and vfs_clearmntopt() change mnt_opt with the interlock
+held, and linprocfs' mount table reads it with the interlock held. Swap
+the lists under the interlock and free the old one after.
+---
+ sys/kern/vfs_mount.c | 27 +++++++++++++++++++++------
+ 1 file changed, 21 insertions(+), 6 deletions(-)
+
+diff --git a/sys/kern/vfs_mount.c b/sys/kern/vfs_mount.c
+index 383ccf98c..ac4a89335 100644
+--- a/sys/kern/vfs_mount.c
++++ b/sys/kern/vfs_mount.c
+@@ -389,6 +389,25 @@ vfs_buildopts(struct uio *auio, struct vfsoptlist **options)
+ 	return (error);
+ }
+ 
++/*
++ * Make the options of an update of a mounted file system its options.
++ * Under the mount interlock: code that reads mnt_opt with it held (ZFS's
++ * vfs_setmntopt(), linprocfs' mount table) must not see the old list
++ * freed.
++ */
++static void
++vfs_swapopts(struct mount *mp)
++{
++	struct vfsoptlist *old;
++
++	MNT_ILOCK(mp);
++	old = mp->mnt_opt;
++	mp->mnt_opt = mp->mnt_optnew;
++	MNT_IUNLOCK(mp);
++	if (old != NULL)
++		vfs_freeopts(old);
++}
++
+ /*
+  * Merge the old mount options with the new ones passed
+  * in the MNT_UPDATE case.
+@@ -1560,9 +1579,7 @@ vfs_domount_update(
+ 		goto end;
+ 
+ 	mount_devctl_event("REMOUNT", mp, true);
+-	if (mp->mnt_opt != NULL)
+-		vfs_freeopts(mp->mnt_opt);
+-	mp->mnt_opt = mp->mnt_optnew;
++	vfs_swapopts(mp);
+ 	*optlist = NULL;
+ 	(void)VFS_STATFS(mp, &mp->mnt_stat);
+ 	/*
+@@ -3090,9 +3107,7 @@ vfs_remount_ro(struct mount *mp)
+ 		mp->mnt_flag &= ~(MNT_UPDATE | MNT_FORCE);
+ 		MNT_IUNLOCK(mp);
+ 		vfs_deallocate_syncvnode(mp);
+-		if (mp->mnt_opt != NULL)
+-			vfs_freeopts(mp->mnt_opt);
+-		mp->mnt_opt = mp->mnt_optnew;
++		vfs_swapopts(mp);
+ 	} else {
+ 		MNT_ILOCK(mp);
+ 		mp->mnt_flag &= ~(MNT_UPDATE | MNT_FORCE | MNT_RDONLY);
+-- 
+2.54.0 (Apple Git-157)
+

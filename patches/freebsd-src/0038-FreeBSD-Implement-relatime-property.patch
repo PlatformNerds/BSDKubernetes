@@ -1,0 +1,160 @@
+From 76077b3111952c9a6331487a0e721c97e1c8cd9b Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 18:00:01 -0700
+Subject: [PATCH 38/41] FreeBSD: Implement relatime property
+
+While FreeBSD does not support relatime natively, it seems trivial
+to implement it just as dataset property for consistency.  To not
+change the status quo, change its default to off on FreeBSD.  Now,
+if explicitly enabled, it should actually work.
+
+Reviewed-by: Brian Behlendorf <behlendorf1@llnl.gov>
+Signed-off-by: Alexander Motin <alexander.motin@TrueNAS.com>
+Closes #18385
+
+(cherry picked from openzfs/zfs commit 16858492e6e4, without its test
+runfile changes)
+---
+ .../os/freebsd/zfs/sys/zfs_vfsops_os.h        |  1 +
+ .../os/freebsd/zfs/sys/zfs_znode_impl.h       |  4 +-
+ .../module/os/freebsd/zfs/zfs_vfsops.c        |  8 ++++
+ .../module/os/freebsd/zfs/zfs_znode_os.c      | 43 +++++++++++++++++++
+ sys/contrib/openzfs/module/zcommon/zfs_prop.c | 11 +++--
+ 5 files changed, 63 insertions(+), 4 deletions(-)
+
+diff --git a/sys/contrib/openzfs/include/os/freebsd/zfs/sys/zfs_vfsops_os.h b/sys/contrib/openzfs/include/os/freebsd/zfs/sys/zfs_vfsops_os.h
+index 3ed311d49..62e78d82b 100644
+--- a/sys/contrib/openzfs/include/os/freebsd/zfs/sys/zfs_vfsops_os.h
++++ b/sys/contrib/openzfs/include/os/freebsd/zfs/sys/zfs_vfsops_os.h
+@@ -71,6 +71,7 @@ struct zfsvfs {
+ 	boolean_t	z_utf8;		/* utf8-only */
+ 	int		z_norm;		/* normalization flags */
+ 	boolean_t	z_atime;	/* enable atimes mount option */
++	boolean_t	z_relatime;	/* enable relatime mount option */
+ 	boolean_t	z_unmounted;	/* unmounted */
+ 	zfs_teardown_lock_t z_teardown_lock;
+ 	zfs_teardown_inactive_lock_t z_teardown_inactive_lock;
+diff --git a/sys/contrib/openzfs/include/os/freebsd/zfs/sys/zfs_znode_impl.h b/sys/contrib/openzfs/include/os/freebsd/zfs/sys/zfs_znode_impl.h
+index 15e3affba..9f8667536 100644
+--- a/sys/contrib/openzfs/include/os/freebsd/zfs/sys/zfs_znode_impl.h
++++ b/sys/contrib/openzfs/include/os/freebsd/zfs/sys/zfs_znode_impl.h
+@@ -174,11 +174,13 @@ zfs_exit(zfsvfs_t *zfsvfs, const char *tag)
+ 	(tp)->tv_nsec = (long)(stmp)[1];		\
+ }
+ #define	ZFS_ACCESSTIME_STAMP(zfsvfs, zp) \
+-	if ((zfsvfs)->z_atime && !((zfsvfs)->z_vfs->vfs_flag & VFS_RDONLY)) \
++	if ((zfsvfs)->z_atime && !((zfsvfs)->z_vfs->vfs_flag & VFS_RDONLY) && \
++	    (!(zfsvfs)->z_relatime || zfs_relatime_need_update(zp))) \
+ 		zfs_tstamp_update_setup_ext(zp, ACCESSED, NULL, NULL, B_FALSE);
+ 
+ extern void	zfs_tstamp_update_setup_ext(struct znode *,
+     uint_t, uint64_t [2], uint64_t [2], boolean_t have_tx);
++extern boolean_t zfs_relatime_need_update(const struct znode *);
+ extern void zfs_znode_free(struct znode *);
+ 
+ extern zil_replay_func_t *const zfs_replay_vector[TX_MAX_TYPE];
+diff --git a/sys/contrib/openzfs/module/os/freebsd/zfs/zfs_vfsops.c b/sys/contrib/openzfs/module/os/freebsd/zfs/zfs_vfsops.c
+index 79b784288..7f9c02678 100644
+--- a/sys/contrib/openzfs/module/os/freebsd/zfs/zfs_vfsops.c
++++ b/sys/contrib/openzfs/module/os/freebsd/zfs/zfs_vfsops.c
+@@ -494,6 +494,12 @@ atime_changed_cb(void *arg, uint64_t newval)
+ 	}
+ }
+ 
++static void
++relatime_changed_cb(void *arg, uint64_t newval)
++{
++	((zfsvfs_t *)arg)->z_relatime = (newval != 0);
++}
++
+ static void
+ xattr_changed_cb(void *arg, uint64_t newval)
+ {
+@@ -752,6 +758,8 @@ zfs_register_callbacks(vfs_t *vfsp)
+ 	 */
+ 	error = dsl_prop_register(ds,
+ 	    zfs_prop_to_name(ZFS_PROP_ATIME), atime_changed_cb, zfsvfs);
++	error = error ? error : dsl_prop_register(ds,
++	    zfs_prop_to_name(ZFS_PROP_RELATIME), relatime_changed_cb, zfsvfs);
+ 	error = error ? error : dsl_prop_register(ds,
+ 	    zfs_prop_to_name(ZFS_PROP_XATTR), xattr_changed_cb, zfsvfs);
+ 	error = error ? error : dsl_prop_register(ds,
+diff --git a/sys/contrib/openzfs/module/os/freebsd/zfs/zfs_znode_os.c b/sys/contrib/openzfs/module/os/freebsd/zfs/zfs_znode_os.c
+index b9f427b39..6f74c924e 100644
+--- a/sys/contrib/openzfs/module/os/freebsd/zfs/zfs_znode_os.c
++++ b/sys/contrib/openzfs/module/os/freebsd/zfs/zfs_znode_os.c
+@@ -1325,6 +1325,49 @@ zfs_znode_free(znode_t *zp)
+ 	zfs_znode_free_kmem(zp);
+ }
+ 
++/*
++ * Determine whether the znode's atime must be updated.  The logic mostly
++ * duplicates the Linux kernel's relatime_need_update() functionality.
++ * This function is only called if the underlying filesystem actually has
++ * atime updates enabled.
++ */
++boolean_t
++zfs_relatime_need_update(const znode_t *zp)
++{
++	uint64_t mtime[2], ctime[2];
++	sa_bulk_attr_t bulk[2];
++	zfsvfs_t *zfsvfs = zp->z_zfsvfs;
++	struct timespec now, tmp_atime, tmp_ts;
++	int count = 0;
++
++	SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_MTIME(zfsvfs), NULL, mtime, 16);
++	SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_CTIME(zfsvfs), NULL, ctime, 16);
++	if (sa_bulk_lookup(zp->z_sa_hdl, bulk, count) != 0)
++		return (B_TRUE);
++
++	ZFS_TIME_DECODE(&tmp_atime, zp->z_atime);
++	/*
++	 * In relatime mode, only update the atime if the previous atime
++	 * is earlier than either the ctime or mtime or if at least a day
++	 * has passed since the last update of atime.
++	 */
++	ZFS_TIME_DECODE(&tmp_ts, mtime);
++	/* CSTYLED */
++	if (timespeccmp(&tmp_ts, &tmp_atime, >=))
++		return (B_TRUE);
++
++	ZFS_TIME_DECODE(&tmp_ts, ctime);
++	/* CSTYLED */
++	if (timespeccmp(&tmp_ts, &tmp_atime, >=))
++		return (B_TRUE);
++
++	vfs_timestamp(&now);
++	if ((hrtime_t)now.tv_sec - (hrtime_t)tmp_atime.tv_sec >= 24*60*60)
++		return (B_TRUE);
++
++	return (B_FALSE);
++}
++
+ void
+ zfs_tstamp_update_setup_ext(znode_t *zp, uint_t flag, uint64_t mtime[2],
+     uint64_t ctime[2], boolean_t have_tx)
+diff --git a/sys/contrib/openzfs/module/zcommon/zfs_prop.c b/sys/contrib/openzfs/module/zcommon/zfs_prop.c
+index 9190ae036..bb6e975cf 100644
+--- a/sys/contrib/openzfs/module/zcommon/zfs_prop.c
++++ b/sys/contrib/openzfs/module/zcommon/zfs_prop.c
+@@ -497,9 +497,14 @@ zfs_prop_init(void)
+ 	/* inherit index (boolean) properties */
+ 	zprop_register_index(ZFS_PROP_ATIME, "atime", 1, PROP_INHERIT,
+ 	    ZFS_TYPE_FILESYSTEM, "on | off", "ATIME", boolean_table, sfeatures);
+-	zprop_register_index(ZFS_PROP_RELATIME, "relatime", 1, PROP_INHERIT,
+-	    ZFS_TYPE_FILESYSTEM, "on | off", "RELATIME", boolean_table,
+-	    sfeatures);
++	zprop_register_index(ZFS_PROP_RELATIME, "relatime",
++#ifdef __FreeBSD__
++	    0,	/* FreeBSD does not natively support relatime. */
++#else
++	    1,
++#endif
++	    PROP_INHERIT, ZFS_TYPE_FILESYSTEM, "on | off", "RELATIME",
++	    boolean_table, sfeatures);
+ 	zprop_register_index(ZFS_PROP_DEVICES, "devices", 1, PROP_INHERIT,
+ 	    ZFS_TYPE_FILESYSTEM | ZFS_TYPE_SNAPSHOT, "on | off", "DEVICES",
+ 	    boolean_table, sfeatures);
+-- 
+2.54.0 (Apple Git-157)
+

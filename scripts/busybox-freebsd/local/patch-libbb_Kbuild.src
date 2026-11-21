@@ -1,6 +1,6 @@
---- libbb/Kbuild.src.orig	2026-11-18 19:54:36
-+++ libbb/Kbuild.src	2026-11-18 19:54:36
-@@ -164,7 +164,7 @@
+--- libbb/Kbuild.src.orig	2026-11-20 18:04:39
++++ libbb/Kbuild.src	2026-11-20 18:04:39
+@@ -164,13 +164,13 @@
  lib-$(CONFIG_FEATURE_HTTPD_AUTH_MD5) += pw_encrypt.o
  lib-$(CONFIG_FEATURE_FTP_AUTHENTICATION) += pw_encrypt.o
  
@@ -9,3 +9,10 @@
  lib-$(CONFIG_MKFS_MINIX) += find_mount_point.o
  lib-$(CONFIG_MKFS_EXT2) += find_mount_point.o
  lib-$(CONFIG_MKE2FS) += find_mount_point.o
+ lib-$(CONFIG_MKFS_REISER) += find_mount_point.o
+ lib-$(CONFIG_FSCK_MINIX) += find_mount_point.o
+-lib-$(CONFIG_MOUNT) += find_mount_point.o
++# lib-$(CONFIG_MOUNT) += find_mount_point.o  (FreeBSD: mount doesn't use it, util-linux/mount.c)
+ 
+ lib-$(CONFIG_HWCLOCK) += rtc.o
+ lib-$(CONFIG_RTCWAKE) += rtc.o

@@ -98,6 +98,42 @@ Node 2's clock was 15 minutes behind node 1: its ntpd lost its pool servers to a
 host Mac slept). It now also syncs from node 1 (`server 192.168.100.1 iburst maxpoll 6`), so the nodes stay in
 step without the internet.
 
+## Local PersistentVolumes in e2e: hostexec over SSH (kubernetes 0041-0043)
+
+*2026-11-20.* The local volume tests (`PersistentVolumes-local`, `In-tree Volumes [Driver: local]`) prepare each
+volume on the node through the "hostexec" pod, which enters PID 1's mount namespace with `nsenter` (below). A jail
+can't leave its jail, so every one of them failed at setup, before Kubernetes' local volume code ran.
+
+- **0041 (e2e only):** on a `kubernetes.io/os=freebsd` node, hostexec runs its command as root over the e2e
+  framework's SSH helper instead (the provider's key: `LOCAL_SSH_KEY`, `KUBE_SSH_USER`, `sudo -n` when that user
+  isn't root). The commands then act on the node's own file systems, as `nsenter` does on Linux. Bind-mounted
+  volume types use `mount -t nullfs`. The rest of the commands run as written: `mkdir`, `ln -s`,
+  `mount -t tmpfs -o size=10m`, `umount`, `rm`, `find | xargs -r -0`.
+- **0043 (e2e only):** the tests delete the pod without waiting and unmount the volume 5 ms later. On Linux the
+  source of a bind mount can be unmounted while the bind is in use. On FreeBSD the kubelet's nullfs mount of the
+  volume holds the file system below it busy (`EBUSY`) until the kubelet unmounts it, a few seconds after the pod
+  is gone. On FreeBSD the teardown retries for up to three minutes. `umount -f` would pull the file system out from
+  under a pod that may still be running.
+- **0042 (kubelet), a real bug the tests exposed:** a pod given a block-mode volume never finished terminating.
+  Mapping it fails, as it must (FreeBSD has no block or loop devices). Unmapping it started with
+  `DetachFileDevice`, which returned "not supported", and the kubelet retried forever. FreeBSD now has its own
+  `volumepathhandler`: nothing can have been attached, so there is nothing to detach (Linux does the same when no
+  loop device holds the file). `AttachFileDevice` still fails. Deployed: kubelet `v1.36.1-bsdk8s+1994eece269` on
+  both nodes.
+
+Running the tests needs a key both nodes accept (on node 1: `~/.ssh/e2e_ed25519`, authorized for `bsdk8s`):
+
+```
+env LOCAL_SSH_KEY=$HOME/.ssh/e2e_ed25519 KUBE_SSH_USER=bsdk8s ./ginkgo ... \
+  --focus="PersistentVolumes-local|\[Driver: local\]" --skip="Disruptive|Flaky|Serial|LinuxOnly|Feature" ...
+```
+
+**Result: 97/145; every non-block test passes (97/97),** including `[Slow]`, across the dir, dir-link,
+dir-bindmounted, dir-link-bindmounted and tmpfs types: fsGroup, two pods at once and one after the other, subPath,
+multiVolume, volumeIO, and the block-volmode "should fail to create pod" checks. The 48 failures are the `block`,
+`blockfs` and `blockfswith[out]format` types, whose setup runs `losetup` (and `mkfs -t ext4`). FreeBSD has no
+block devices (research/24), so they can't pass. Before: 72/145, and before 0041 none got past setup.
+
 ## Local PersistentVolumes with fsGroup (kubernetes 92f38fe72f8, patch 0032)
 
 *2026-11-19.* A sig-storage run beyond the conformance set (no CSI or cloud drivers; 97 tests) passed 22. Of the 75

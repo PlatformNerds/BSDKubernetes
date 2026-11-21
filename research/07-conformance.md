@@ -243,6 +243,9 @@ Not Conformance, Serial, Slow, Disruptive, Flaky, Feature or LinuxOnly:
     the FreeBSD pause image the same way (`fake_registry_pause`). The images on both nodes were updated in place
     (originals `*-prev-registry`), and the mirror was refreshed. "should be able to pull image" uses
     `PullAlways`, which replaced the patched tag with the mirror's old copy until the mirror had the new one.
+- **NodeConformance on `kernel.bsdk8s24` (2026-11-20), not Serial/Disruptive/Flaky/LinuxOnly: 182/182.** This run
+  checks for regressions from the container mount-table work (freebsd-src 0038-0042, CRI-O 0025: containers of
+  FreeBSD images now get linprocfs on `/proc`; busybox `mount`). Nothing regressed.
 - **NFS (research/20):** NFS server pods needed the kernel (freebsd-src 0036, `nfsd` in an inherited vnet), CRI-O
   (0024, `allow.nfsd` for privileged pods) and a FreeBSD `volume/nfs` image. The PV tests also found two Linux
   leftovers: BusyBox's grep took no `\b` (now linked with `libregex`), and the PV recycler pod used a Linux image (now

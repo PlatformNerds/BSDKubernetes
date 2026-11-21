@@ -380,8 +380,9 @@ Pods on node 2:
 Limits:
 - Rules are applied when the container starts. A device that appears later (a driver loaded afterwards) stays
   hidden until the container restarts. Linux creates a container's device nodes at start too.
-- `additional_devices` in crio.conf and the `io.kubernetes.cri-o.Devices` annotation are still not implemented on
-  FreeBSD.
+- `additional_devices` in crio.conf and the `io.kubernetes.cri-o.Devices` annotation were accepted and ignored on
+  FreeBSD (a stub). CRI-O 0030 parses them with the Linux syntax and unhides them the same way; the access mode
+  (`rwm`) is accepted, but devfs has no per-container modes, so the node's own mode applies.
 - Volume e2e (`HostPath|Subpath|EmptyDir|Projected|ConfigMap|Secrets|Downward API`, 118 tests) on bsdk8s26 with
   this CRI-O: 113 pass; the 5 failures are the CSI mock token test and the 4 below, as before.
 - The 4 HostPathType tests above still fail: their device nodes are inert nodes on a ZFS or tmpfs, not devfs, so

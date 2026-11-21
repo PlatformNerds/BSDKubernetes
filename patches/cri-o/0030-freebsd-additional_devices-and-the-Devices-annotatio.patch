@@ -1,0 +1,356 @@
+From 533e3d73f36946ff719a2e95ec54208590bd763a Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 12:01:03 -0700
+Subject: [PATCH] freebsd: additional_devices and the Devices annotation unhide
+ devices in devfs
+
+internal/config/device had only a stub off Linux: additional_devices and
+io.kubernetes.cri-o.Devices were accepted and ignored. On FreeBSD parse
+them with the Linux syntax (the parser moves to parse.go), check that
+each device is on the host's devfs and keeps its own path, and unhide it
+in the container's devfs like CRI devices. The access mode is accepted
+but devfs has no per-container modes: the node's own mode applies.
+---
+ internal/config/device/device_freebsd.go      | 96 +++++++++++++++++++
+ internal/config/device/device_freebsd_test.go | 31 ++++++
+ internal/config/device/device_linux.go        | 63 ------------
+ internal/config/device/device_unsupported.go  |  2 +-
+ internal/config/device/parse.go               | 69 +++++++++++++
+ internal/factory/container/device_freebsd.go  | 23 ++---
+ 6 files changed, 207 insertions(+), 77 deletions(-)
+ create mode 100644 internal/config/device/device_freebsd.go
+ create mode 100644 internal/config/device/device_freebsd_test.go
+ create mode 100644 internal/config/device/parse.go
+
+diff --git a/internal/config/device/device_freebsd.go b/internal/config/device/device_freebsd.go
+new file mode 100644
+index 000000000..2995a9e4c
+--- /dev/null
++++ b/internal/config/device/device_freebsd.go
+@@ -0,0 +1,96 @@
++package device
++
++import (
++	"fmt"
++	"path/filepath"
++	"strings"
++
++	"github.com/cri-o/cri-o/internal/devfs"
++)
++
++// DeviceAnnotationDelim is the character used to separate devices in the
++// annotation `io.kubernetes.cri-o.Devices`.
++const DeviceAnnotationDelim = ","
++
++// Config holds the devices of additional_devices, given to all containers.
++type Config struct {
++	devices []Device
++}
++
++// Device is a host device for a container. A jail sees devices through its
++// devfs, so the device is unhidden there (see package devfs): it keeps its
++// name, and the container path must be its own path below /dev.
++type Device struct {
++	HostPath      string
++	ContainerPath string
++	// Rules are the devfs rules that unhide the device.
++	Rules []string
++}
++
++// New creates a new device Config.
++func New() *Config {
++	return &Config{devices: make([]Device, 0)}
++}
++
++// LoadDevices parses additional_devices.
++func (d *Config) LoadDevices(devsFromConfig []string) error {
++	devs, err := devicesFromStrings(devsFromConfig, nil)
++	if err != nil {
++		return err
++	}
++	d.devices = devs
++	return nil
++}
++
++// Devices returns the devices saved in the Config.
++func (d *Config) Devices() []Device {
++	return d.devices
++}
++
++// DevicesFromAnnotation parses io.kubernetes.cri-o.Devices
++// ($PATH{:$PATH}{:$MODE},...), allowing only allowedDevices.
++func DevicesFromAnnotation(annotation string, allowedDevices []string) ([]Device, error) {
++	allowedMap := make(map[string]struct{})
++	for _, d := range allowedDevices {
++		allowedMap[d] = struct{}{}
++	}
++	return devicesFromStrings(strings.Split(annotation, DeviceAnnotationDelim), allowedMap)
++}
++
++// devicesFromStrings parses $PATH{:$PATH}{:$MODE} entries. The mode is
++// accepted for compatibility; devfs has no per-container access modes, the
++// device node's own mode applies.
++func devicesFromStrings(devs []string, allowedDevices map[string]struct{}) ([]Device, error) {
++	res := make([]Device, 0, len(devs))
++	for _, d := range devs {
++		if d == "" {
++			continue
++		}
++		src, dst, _, err := parseDevice(d)
++		if err != nil {
++			return nil, err
++		}
++		if allowedDevices != nil {
++			if _, ok := allowedDevices[src]; !ok {
++				return nil, fmt.Errorf("device %s is specified but is not in allowed_devices", src)
++			}
++		}
++		resolved, err := filepath.EvalSymlinks(src)
++		if err != nil {
++			return nil, fmt.Errorf("%s is not a valid device: %w", src, err)
++		}
++		ds, err := devfs.HostSource(resolved)
++		if err != nil {
++			return nil, fmt.Errorf("%s is not a valid device: %w", src, err)
++		}
++		if ds == nil || ds.Rel == "." {
++			return nil, fmt.Errorf("%s is not a device on the host's devfs", src)
++		}
++		t, err := devfs.Translate(ds, src, dst)
++		if err != nil {
++			return nil, err
++		}
++		res = append(res, Device{HostPath: src, ContainerPath: dst, Rules: t.Rules})
++	}
++	return res, nil
++}
+diff --git a/internal/config/device/device_freebsd_test.go b/internal/config/device/device_freebsd_test.go
+new file mode 100644
+index 000000000..b3fde7593
+--- /dev/null
++++ b/internal/config/device/device_freebsd_test.go
+@@ -0,0 +1,31 @@
++package device
++
++import (
++	"reflect"
++	"testing"
++)
++
++func TestDevicesFromStringsFreeBSD(t *testing.T) {
++	devs, err := devicesFromStrings([]string{"/dev/full", "/dev/null:/dev/null:rw", ""}, nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	want := []Device{
++		{"/dev/full", "/dev/full", []string{"rule=path full unhide"}},
++		{"/dev/null", "/dev/null", []string{"rule=path null unhide"}},
++	}
++	if !reflect.DeepEqual(devs, want) {
++		t.Errorf("got %+v, want %+v", devs, want)
++	}
++	for _, bad := range []string{"/dev/full:/dev/other", "/tmp", "/dev", "/nonexistent", "/dev/full:x"} {
++		if _, err := devicesFromStrings([]string{bad}, nil); err == nil {
++			t.Errorf("%s: no error", bad)
++		}
++	}
++	if _, err := devicesFromStrings([]string{"/dev/full"}, map[string]struct{}{"/dev/fuse": {}}); err == nil {
++		t.Error("device not in allowed_devices: no error")
++	}
++	if devs, err := DevicesFromAnnotation("/dev/full,/dev/zero", []string{"/dev/full", "/dev/zero"}); err != nil || len(devs) != 2 {
++		t.Errorf("annotation: %v %v", devs, err)
++	}
++}
+diff --git a/internal/config/device/device_linux.go b/internal/config/device/device_linux.go
+index ab50fc8d4..c202bebb5 100644
+--- a/internal/config/device/device_linux.go
++++ b/internal/config/device/device_linux.go
+@@ -128,66 +128,3 @@ func devicesFromStrings(devsFromConfig []string, allowedDevices map[string]struc
+ func (d *Config) Devices() []Device {
+ 	return d.devices
+ }
+-
+-// ParseDevice parses device mapping string to a src, dest & permissions string.
+-func parseDevice(device string) (src, dst, permissions string, err error) {
+-	permissions = "rwm"
+-
+-	arr := strings.Split(device, ":")
+-	switch len(arr) {
+-	case 3:
+-		if !isValidDeviceMode(arr[2]) {
+-			return "", "", "", fmt.Errorf("invalid device mode: %s", arr[2])
+-		}
+-
+-		permissions = arr[2]
+-
+-		fallthrough
+-	case 2:
+-		if isValidDeviceMode(arr[1]) {
+-			permissions = arr[1]
+-		} else {
+-			if arr[1] != "" && arr[1][0] != '/' {
+-				return "", "", "", fmt.Errorf("invalid device mode: %s", arr[1])
+-			}
+-
+-			dst = arr[1]
+-		}
+-
+-		fallthrough
+-	case 1:
+-		src = arr[0]
+-	default:
+-		return "", "", "", fmt.Errorf("invalid device specification: %s", device)
+-	}
+-
+-	if dst == "" {
+-		dst = src
+-	}
+-
+-	return src, dst, permissions, nil
+-}
+-
+-// IsValidDeviceMode checks if the mode for device is valid or not.
+-// IsValid mode is a composition of r (read), w (write), and m (mknod).
+-func isValidDeviceMode(mode string) bool {
+-	legalDeviceMode := map[rune]bool{
+-		'r': true,
+-		'w': true,
+-		'm': true,
+-	}
+-
+-	if mode == "" {
+-		return false
+-	}
+-
+-	for _, c := range mode {
+-		if !legalDeviceMode[c] {
+-			return false
+-		}
+-
+-		legalDeviceMode[c] = false
+-	}
+-
+-	return true
+-}
+diff --git a/internal/config/device/device_unsupported.go b/internal/config/device/device_unsupported.go
+index 12c591e14..148be9ab5 100644
+--- a/internal/config/device/device_unsupported.go
++++ b/internal/config/device/device_unsupported.go
+@@ -1,4 +1,4 @@
+-//go:build !linux
++//go:build !linux && !freebsd
+ 
+ package device
+ 
+diff --git a/internal/config/device/parse.go b/internal/config/device/parse.go
+new file mode 100644
+index 000000000..b48ff686e
+--- /dev/null
++++ b/internal/config/device/parse.go
+@@ -0,0 +1,69 @@
++package device
++
++import (
++	"fmt"
++	"strings"
++)
++
++// ParseDevice parses device mapping string to a src, dest & permissions string.
++func parseDevice(device string) (src, dst, permissions string, err error) {
++	permissions = "rwm"
++
++	arr := strings.Split(device, ":")
++	switch len(arr) {
++	case 3:
++		if !isValidDeviceMode(arr[2]) {
++			return "", "", "", fmt.Errorf("invalid device mode: %s", arr[2])
++		}
++
++		permissions = arr[2]
++
++		fallthrough
++	case 2:
++		if isValidDeviceMode(arr[1]) {
++			permissions = arr[1]
++		} else {
++			if arr[1] != "" && arr[1][0] != '/' {
++				return "", "", "", fmt.Errorf("invalid device mode: %s", arr[1])
++			}
++
++			dst = arr[1]
++		}
++
++		fallthrough
++	case 1:
++		src = arr[0]
++	default:
++		return "", "", "", fmt.Errorf("invalid device specification: %s", device)
++	}
++
++	if dst == "" {
++		dst = src
++	}
++
++	return src, dst, permissions, nil
++}
++
++// IsValidDeviceMode checks if the mode for device is valid or not.
++// IsValid mode is a composition of r (read), w (write), and m (mknod).
++func isValidDeviceMode(mode string) bool {
++	legalDeviceMode := map[rune]bool{
++		'r': true,
++		'w': true,
++		'm': true,
++	}
++
++	if mode == "" {
++		return false
++	}
++
++	for _, c := range mode {
++		if !legalDeviceMode[c] {
++			return false
++		}
++
++		legalDeviceMode[c] = false
++	}
++
++	return true
++}
+diff --git a/internal/factory/container/device_freebsd.go b/internal/factory/container/device_freebsd.go
+index 99ee3ad93..1a4e12df4 100644
+--- a/internal/factory/container/device_freebsd.go
++++ b/internal/factory/container/device_freebsd.go
+@@ -11,19 +11,16 @@ import (
+ )
+ 
+ func (c *container) SpecAddDevices(configuredDevices, annotationDevices []devicecfg.Device, privilegedWithoutHostDevices, enableDeviceOwnershipFromSecurityContext bool) error {
+-	// TODO: implement internal/config/device for FreeBSD and add code here to modify the devfs mount accordingly.
+-
+-	// After that, add additional_devices from config
+-	//for i := range configuredDevices {
+-	//	d := &configuredDevices[i]
+-	//	c.specAddDevice(d.Device)
+-	//}
+-
+-	// Next, verify and add the devices from annotations
+-	//for i := range annotationDevices {
+-	//	d := &annotationDevices[i]
+-	//	c.specAddDevice(d.Device)
+-	//}
++	// additional_devices from the config, then the devices of the
++	// io.kubernetes.cri-o.Devices annotation: unhide them in the
++	// container's devfs (parsed and checked in internal/config/device).
++	for _, devs := range [][]devicecfg.Device{configuredDevices, annotationDevices} {
++		for i := range devs {
++			if err := devfs.AddRules(c.Spec().Config.Mounts, devs[i].Rules); err != nil {
++				return fmt.Errorf("device %s: %w", devs[i].HostPath, err)
++			}
++		}
++	}
+ 
+ 	// Then, add host devices if privileged
+ 	if err := c.specAddHostDevicesIfPrivileged(privilegedWithoutHostDevices); err != nil {
+-- 
+2.54.0 (Apple Git-157)
+

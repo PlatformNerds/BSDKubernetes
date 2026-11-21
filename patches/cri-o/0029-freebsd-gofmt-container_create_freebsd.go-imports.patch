@@ -1,0 +1,26 @@
+From c2fd74588438265d11fb11f7a338a0fb67047130 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 10:52:33 -0700
+Subject: [PATCH 29/29] freebsd: gofmt container_create_freebsd.go imports
+
+---
+ server/container_create_freebsd.go | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/server/container_create_freebsd.go b/server/container_create_freebsd.go
+index 28b3982b5..4f877a1fb 100644
+--- a/server/container_create_freebsd.go
++++ b/server/container_create_freebsd.go
+@@ -17,8 +17,8 @@ import (
+ 
+ 	"github.com/cri-o/cri-o/internal/config/device"
+ 	"github.com/cri-o/cri-o/internal/devfs"
+-	"github.com/cri-o/cri-o/internal/jailparam"
+ 	ctrfactory "github.com/cri-o/cri-o/internal/factory/container"
++	"github.com/cri-o/cri-o/internal/jailparam"
+ 	"github.com/cri-o/cri-o/internal/lib/sandbox"
+ 	"github.com/cri-o/cri-o/internal/log"
+ 	oci "github.com/cri-o/cri-o/internal/oci"
+-- 
+2.54.0 (Apple Git-157)
+

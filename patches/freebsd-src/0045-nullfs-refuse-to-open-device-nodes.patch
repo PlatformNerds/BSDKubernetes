@@ -1,0 +1,45 @@
+From cccc262bbaed003ef1572723ee21e6ac5cd8ff6b Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 10:44:46 -0700
+Subject: [PATCH] nullfs: refuse to open device nodes
+
+A nullfs mount of devfs (mount -t nullfs /dev /x, or a container
+runtime bind-mounting a host /dev into a jail) exposes every device of
+the host devfs, whatever the jail's devfs ruleset hides.  read(2) and
+write(2) on such a device fail with ENXIO, because the file gets vnops
+and devfs's dead_read/dead_write run, so the view looks harmless.  But
+open(2) runs the driver's d_open and ioctl(2) reaches d_ioctl through
+null_bypass() and devfs_ioctl(): a jailed root can, for example, issue
+DIOCGDELETE on a host disk.
+
+Fail the open of a VCHR vnode with ENXIO, the error read(2) already
+returns.  Device nodes outside devfs have no driver, so only devfs
+devices are affected, and those can't be read or written through
+nullfs today.
+---
+ sys/fs/nullfs/null_vnops.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/sys/fs/nullfs/null_vnops.c b/sys/fs/nullfs/null_vnops.c
+index ee7d89db6..9b8c95dd6 100644
+--- a/sys/fs/nullfs/null_vnops.c
++++ b/sys/fs/nullfs/null_vnops.c
+@@ -512,6 +512,15 @@ null_open(struct vop_open_args *ap)
+ 	struct vnode *vp, *ldvp;
+ 
+ 	vp = ap->a_vp;
++	/*
++	 * Devices are reached only through devfs, whose ruleset decides
++	 * which ones a jail sees.  Through nullfs, read(2) and write(2)
++	 * on a device already fail (the file gets vnops, not devfs's
++	 * fileops), but the driver's open and ioctl routines would
++	 * still run, past that ruleset.  Refuse the open.
++	 */
++	if (vp->v_type == VCHR)
++		return (ENXIO);
+ 	ldvp = NULLVPTOLOWERVP(vp);
+ 	retval = null_bypass(&ap->a_gen);
+ 	if (retval == 0) {
+-- 
+2.54.0 (Apple Git-157)
+

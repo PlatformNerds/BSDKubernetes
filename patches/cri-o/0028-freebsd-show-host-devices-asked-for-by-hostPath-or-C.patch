@@ -1,0 +1,473 @@
+From e563ca492c41fbadf6380e146a21b1cd4664016e Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 10:52:06 -0700
+Subject: [PATCH 28/29] freebsd: show host devices asked for by hostPath or CRI
+ devices through devfs
+
+A hostPath volume on the host's devfs was a nullfs mount: a view of every
+host device past the container's devfs ruleset, whose open and ioctl
+reached the drivers (the kernel now refuses opens through nullfs). Do what
+Linux's device cgroup does with devfs instead:
+
+- a device or device directory at its own path below /dev: unhide it in
+  the container's devfs;
+- hostPath /dev elsewhere (/host/dev): a second devfs with the ruleset
+  and rules of the container's /dev (all devices if privileged);
+- anything else (another name, another directory): an error.
+
+CRI devices (device plugins) are unhidden the same way. The privileged
+ruleset=0 now targets the /dev devfs, not the first devfs mount.
+---
+ internal/devfs/devfs_freebsd.go              | 170 +++++++++++++++++++
+ internal/devfs/devfs_freebsd_test.go         |  84 +++++++++
+ internal/factory/container/device_freebsd.go |  28 ++-
+ server/container_create.go                   |   1 +
+ server/container_create_freebsd.go           |  46 +++++
+ server/image_os_freebsd.go                   |   7 +
+ server/image_os_other.go                     |   2 +
+ 7 files changed, 337 insertions(+), 1 deletion(-)
+ create mode 100644 internal/devfs/devfs_freebsd.go
+ create mode 100644 internal/devfs/devfs_freebsd_test.go
+
+diff --git a/internal/devfs/devfs_freebsd.go b/internal/devfs/devfs_freebsd.go
+new file mode 100644
+index 000000000..61377ffc2
+--- /dev/null
++++ b/internal/devfs/devfs_freebsd.go
+@@ -0,0 +1,170 @@
++// Package devfs maps host devices that a container asks for (hostPath
++// volumes on the host's devfs, CRI devices) to the container's own devfs.
++//
++// A hostPath volume is a nullfs mount, and a nullfs view of the host's devfs
++// shows every host device, whatever the container's devfs ruleset hides. The
++// kernel refuses to open devices through nullfs (freebsd-src "nullfs: refuse
++// to open device nodes"), so such a view is useless as well. On Linux an
++// unprivileged container with hostPath /dev sees the host's device nodes, but
++// the device cgroup lets it open only the devices it was given; a privileged
++// container may open all of them.
++//
++// FreeBSD does the same with devfs itself:
++//   - a device, or a directory of devices, at its own path below /dev in the
++//     container is unhidden in the container's devfs;
++//   - the root of the host's devfs (hostPath /dev) at another path, such as
++//     /host/dev, becomes a second devfs mount with the ruleset and rules of
++//     the container's /dev, so it shows what /dev shows;
++//   - anything else is an error: devfs can't show a device under another name.
++//
++// Rules applied with "devfs rule apply" cover the devices that exist when the
++// container starts. A device created later (a driver loaded afterwards) stays
++// hidden, like Linux's device nodes, which are created at container start too.
++package devfs
++
++import (
++	"errors"
++	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
++
++	rspec "github.com/opencontainers/runtime-spec/specs-go"
++	"golang.org/x/sys/unix"
++)
++
++// ContainerDev is where the container's devfs is mounted.
++const ContainerDev = "/dev"
++
++// dirDepth is how many levels below a device directory get unhidden: a devfs
++// rule's "*" doesn't match "/".
++const dirDepth = 3
++
++// Source is a host path on a devfs.
++type Source struct {
++	// Rel is the path relative to the devfs mount point, "." for its root.
++	Rel string
++	Dir bool
++}
++
++// HostSource reports whether path (symbolic links already resolved) is on a
++// devfs, and where. It returns nil when it isn't, or when path doesn't exist.
++func HostSource(path string) (*Source, error) {
++	var st unix.Statfs_t
++	if err := unix.Statfs(path, &st); err != nil {
++		return nil, nil
++	}
++	if unix.ByteSliceToString(st.Fstypename[:]) != "devfs" {
++		return nil, nil
++	}
++	mnt := unix.ByteSliceToString(st.Mntonname[:])
++	rel, err := filepath.Rel(mnt, filepath.Clean(path))
++	if err != nil || rel == ".." || strings.HasPrefix(rel, "../") {
++		return nil, fmt.Errorf("%s is on the devfs at %s, but not below it", path, mnt)
++	}
++	fi, err := os.Stat(path)
++	if err != nil {
++		return nil, err
++	}
++	return &Source{Rel: rel, Dir: fi.IsDir()}, nil
++}
++
++// Translation is what a host path on devfs becomes in the container.
++type Translation struct {
++	// Rules are "rule=..." options for the container's /dev devfs mount.
++	Rules []string
++	// Mount is true when the source is the root of the host's devfs and the
++	// destination isn't /dev: mount another devfs there, with the options of
++	// the container's /dev (see SyncMounts).
++	Mount bool
++}
++
++// Translate maps src, a host path on devfs, to destination in the container.
++func Translate(src *Source, hostPath, destination string) (*Translation, error) {
++	destination = filepath.Clean(destination)
++	if src.Rel == "." {
++		if destination == ContainerDev {
++			return &Translation{}, nil
++		}
++		return &Translation{Mount: true}, nil
++	}
++	want := filepath.Join(ContainerDev, src.Rel)
++	if destination != want {
++		return nil, fmt.Errorf("%s is a device on the host's devfs; on FreeBSD a container can only get it at %s, not %s", hostPath, want, destination)
++	}
++	rules, err := UnhideRules(src.Rel, src.Dir)
++	if err != nil {
++		return nil, err
++	}
++	return &Translation{Rules: rules}, nil
++}
++
++// UnhideRules returns the devfs rules that unhide rel (relative to the
++// devfs root) and the directories above it; for a directory, also what is
++// below it, dirDepth levels deep.
++func UnhideRules(rel string, dir bool) ([]string, error) {
++	if rel == "" || rel == "." || strings.ContainsAny(rel, "*?[]\\ \t\n,") {
++		return nil, errors.New("unsupported devfs path " + fmt.Sprintf("%q", rel))
++	}
++	var rules []string
++	parts := strings.Split(rel, "/")
++	for i := range parts {
++		rules = append(rules, "rule=path "+strings.Join(parts[:i+1], "/")+" unhide")
++	}
++	if dir {
++		p := rel
++		for range dirDepth {
++			p += "/*"
++			rules = append(rules, "rule=path "+p+" unhide")
++		}
++	}
++	return rules, nil
++}
++
++// isContainerDev reports whether m is the container's /dev devfs mount.
++func isContainerDev(m *rspec.Mount) bool {
++	return m.Type == "devfs" && filepath.Clean(m.Destination) == ContainerDev
++}
++
++// AddRules appends rules to the options of the container's /dev devfs mount.
++func AddRules(mounts []rspec.Mount, rules []string) error {
++	if len(rules) == 0 {
++		return nil
++	}
++	for i := range mounts {
++		if isContainerDev(&mounts[i]) {
++			mounts[i].Options = append(mounts[i].Options, rules...)
++			return nil
++		}
++	}
++	return errors.New("the container has no devfs at " + ContainerDev + " to show host devices in")
++}
++
++// NewMount returns a devfs mount at destination; SyncMounts sets its options.
++func NewMount(destination string) rspec.Mount {
++	return rspec.Mount{Destination: destination, Type: "devfs", Source: "devfs"}
++}
++
++// SyncMounts gives every other devfs mount the options of the container's
++// /dev: its ruleset (ruleset=0 for privileged containers) and the rules
++// added to it. Call it once nothing changes /dev's options any more.
++func SyncMounts(mounts []rspec.Mount) {
++	var opts []string
++	found := false
++	for i := range mounts {
++		if isContainerDev(&mounts[i]) {
++			opts, found = mounts[i].Options, true
++			break
++		}
++	}
++	for i := range mounts {
++		if mounts[i].Type == "devfs" && !isContainerDev(&mounts[i]) {
++			if found {
++				mounts[i].Options = append([]string(nil), opts...)
++			} else if len(mounts[i].Options) == 0 {
++				// No /dev to copy from: the default jail ruleset, as /dev has.
++				mounts[i].Options = []string{"ruleset=4"}
++			}
++		}
++	}
++}
+diff --git a/internal/devfs/devfs_freebsd_test.go b/internal/devfs/devfs_freebsd_test.go
+new file mode 100644
+index 000000000..145424c54
+--- /dev/null
++++ b/internal/devfs/devfs_freebsd_test.go
+@@ -0,0 +1,84 @@
++package devfs
++
++import (
++	"reflect"
++	"testing"
++
++	rspec "github.com/opencontainers/runtime-spec/specs-go"
++)
++
++func TestTranslate(t *testing.T) {
++	for _, tc := range []struct {
++		src     Source
++		dest    string
++		want    *Translation
++		wantErr bool
++	}{
++		{Source{".", true}, "/dev", &Translation{}, false},
++		{Source{".", true}, "/dev/", &Translation{}, false},
++		{Source{".", true}, "/host/dev", &Translation{Mount: true}, false},
++		{Source{"fuse", false}, "/dev/fuse", &Translation{Rules: []string{"rule=path fuse unhide"}}, false},
++		{Source{"dri/card0", false}, "/dev/dri/card0", &Translation{Rules: []string{
++			"rule=path dri unhide", "rule=path dri/card0 unhide"}}, false},
++		{Source{"dri", true}, "/dev/dri", &Translation{Rules: []string{
++			"rule=path dri unhide", "rule=path dri/* unhide", "rule=path dri/*/* unhide", "rule=path dri/*/*/* unhide"}}, false},
++		{Source{"klog", false}, "/dev/kmsg", nil, true},
++		{Source{"fuse", false}, "/host/dev/fuse", nil, true},
++		{Source{"a b", false}, "/dev/a b", nil, true},
++		{Source{"x*", false}, "/dev/x*", nil, true},
++	} {
++		got, err := Translate(&tc.src, "/dev/"+tc.src.Rel, tc.dest)
++		if (err != nil) != tc.wantErr {
++			t.Errorf("%+v -> %s: err %v, want error %v", tc.src, tc.dest, err, tc.wantErr)
++			continue
++		}
++		if !reflect.DeepEqual(got, tc.want) {
++			t.Errorf("%+v -> %s: got %+v, want %+v", tc.src, tc.dest, got, tc.want)
++		}
++	}
++}
++
++func TestHostSource(t *testing.T) {
++	for _, tc := range []struct {
++		path string
++		want *Source
++	}{
++		{"/dev", &Source{".", true}},
++		{"/dev/null", &Source{"null", false}},
++		{"/tmp", nil},
++		{"/nonexistent-devfs-test", nil},
++	} {
++		got, err := HostSource(tc.path)
++		if err != nil || !reflect.DeepEqual(got, tc.want) {
++			t.Errorf("%s: got %+v, %v; want %+v", tc.path, got, err, tc.want)
++		}
++	}
++}
++
++func TestAddRulesAndSync(t *testing.T) {
++	mounts := []rspec.Mount{
++		{Destination: "/dev", Type: "devfs", Options: []string{"ruleset=4"}},
++		{Destination: "/dev/fd", Type: "fdescfs"},
++		NewMount("/host/dev"),
++	}
++	if err := AddRules(mounts, []string{"rule=path fuse unhide"}); err != nil {
++		t.Fatal(err)
++	}
++	mounts[0].Options = append(mounts[0].Options, "rule=path shm unhide mode 1777")
++	SyncMounts(mounts)
++	want := []string{"ruleset=4", "rule=path fuse unhide", "rule=path shm unhide mode 1777"}
++	if !reflect.DeepEqual(mounts[0].Options, want) || !reflect.DeepEqual(mounts[2].Options, want) {
++		t.Errorf("got %v and %v, want %v", mounts[0].Options, mounts[2].Options, want)
++	}
++	if mounts[1].Options != nil {
++		t.Errorf("fdescfs options changed: %v", mounts[1].Options)
++	}
++	// Changing one must not change the other.
++	mounts[2].Options[0] = "x"
++	if mounts[0].Options[0] != "ruleset=4" {
++		t.Error("options are shared")
++	}
++	if err := AddRules([]rspec.Mount{{Destination: "/dev", Type: "nullfs"}}, []string{"r"}); err == nil {
++		t.Error("AddRules without a devfs /dev: no error")
++	}
++}
+diff --git a/internal/factory/container/device_freebsd.go b/internal/factory/container/device_freebsd.go
+index c8420fd7a..99ee3ad93 100644
+--- a/internal/factory/container/device_freebsd.go
++++ b/internal/factory/container/device_freebsd.go
+@@ -2,8 +2,11 @@ package container
+ 
+ import (
+ 	"fmt"
++	"path/filepath"
+ 	"runtime"
+ 
++	"github.com/cri-o/cri-o/internal/devfs"
++
+ 	devicecfg "github.com/cri-o/cri-o/internal/config/device"
+ )
+ 
+@@ -43,7 +46,7 @@ func (c *container) specAddHostDevicesIfPrivileged(privilegedWithoutHostDevices
+ 
+ 	// Modify the devfs mount to add all devices
+ 	for i, m := range c.Spec().Config.Mounts {
+-		if m.Type == "devfs" {
++		if m.Type == "devfs" && filepath.Clean(m.Destination) == devfs.ContainerDev {
+ 			m.Options = []string{"ruleset=0"}
+ 			c.Spec().Config.Mounts[i] = m
+ 			return nil
+@@ -52,7 +55,30 @@ func (c *container) specAddHostDevicesIfPrivileged(privilegedWithoutHostDevices
+ 	return nil
+ }
+ 
++// specAddContainerConfigDevices unhides the CRI devices (from device
++// plugins, for example) in the container's devfs. devfs can't show a device
++// under another name, so the container path must be the device's own path.
++// Privileged containers already see every device.
+ func (c *container) specAddContainerConfigDevices(enableDeviceOwnershipFromSecurityContext bool) error {
++	if c.Privileged() {
++		return nil
++	}
++	for _, d := range c.Config().GetDevices() {
++		src, err := devfs.HostSource(d.GetHostPath())
++		if err != nil {
++			return fmt.Errorf("device %s: %w", d.GetHostPath(), err)
++		}
++		if src == nil || src.Rel == "." {
++			return fmt.Errorf("device %s: not a device on the host's devfs", d.GetHostPath())
++		}
++		t, err := devfs.Translate(src, d.GetHostPath(), d.GetContainerPath())
++		if err != nil {
++			return err
++		}
++		if err := devfs.AddRules(c.Spec().Config.Mounts, t.Rules); err != nil {
++			return fmt.Errorf("device %s: %w", d.GetHostPath(), err)
++		}
++	}
+ 	return nil
+ }
+ 
+diff --git a/server/container_create.go b/server/container_create.go
+index 28f26232e..d43d6c387 100644
+--- a/server/container_create.go
++++ b/server/container_create.go
+@@ -841,6 +841,7 @@ func (s *Server) createSandboxContainer(ctx context.Context, ctr container.Conta
+ 	}
+ 
+ 	addImageOSMounts(specgen, imgInfo.imgResult, containerConfig)
++	finishDevfsMounts(specgen)
+ 
+ 	err = ctr.SpecAddAnnotations(ctx, sb, containerVolumes, mountPoint, stopSignal, imgInfo.imgResult, s.config.CgroupManager().IsSystemd(), seccompRef, runtimePath)
+ 	if err != nil {
+diff --git a/server/container_create_freebsd.go b/server/container_create_freebsd.go
+index 8bab3a56f..28b3982b5 100644
+--- a/server/container_create_freebsd.go
++++ b/server/container_create_freebsd.go
+@@ -16,6 +16,7 @@ import (
+ 	crierrors "k8s.io/cri-api/pkg/errors"
+ 
+ 	"github.com/cri-o/cri-o/internal/config/device"
++	"github.com/cri-o/cri-o/internal/devfs"
+ 	"github.com/cri-o/cri-o/internal/jailparam"
+ 	ctrfactory "github.com/cri-o/cri-o/internal/factory/container"
+ 	"github.com/cri-o/cri-o/internal/lib/sandbox"
+@@ -78,8 +79,37 @@ func (s *Server) addOCIBindMounts(ctx context.Context, ctr ctrfactory.Container,
+ 	// Copy all mounts from default mounts, except for
+ 	// - mounts overridden by supplied mount;
+ 	// - all mounts under /dev if a supplied /dev is present.
++	// Host paths on the host's devfs become devfs rules or mounts; see
++	// package devfs. Find them first: a hostPath /dev at /dev must not
++	// replace the container's own devfs.
++	devfsMounts := map[*types.Mount]*devfs.Translation{}
++	for _, m := range mounts {
++		if m.HostPath == "" || m.GetImage().GetImage() != "" {
++			continue
++		}
++		src := filepath.Join(s.config.BindMountPrefix, m.HostPath)
++		if resolved, err := resolveSymbolicLink(s.config.BindMountPrefix, src); err == nil {
++			src = resolved
++		}
++		ds, err := devfs.HostSource(src)
++		if err != nil {
++			return nil, nil, nil, fmt.Errorf("host path %s: %w", m.HostPath, err)
++		}
++		if ds == nil {
++			continue
++		}
++		t, err := devfs.Translate(ds, m.HostPath, m.ContainerPath)
++		if err != nil {
++			return nil, nil, nil, err
++		}
++		devfsMounts[m] = t
++	}
++
+ 	mountSet := make(map[string]struct{})
+ 	for _, m := range mounts {
++		if _, ok := devfsMounts[m]; ok {
++			continue
++		}
+ 		mountSet[filepath.Clean(m.ContainerPath)] = struct{}{}
+ 	}
+ 	defaultMounts := specgen.Mounts()
+@@ -118,6 +148,22 @@ func (s *Server) addOCIBindMounts(ctx context.Context, ctr ctrfactory.Container,
+ 		if m.HostPath == "" {
+ 			return nil, nil, nil, fmt.Errorf("mount.HostPath is empty")
+ 		}
++		if t, ok := devfsMounts[m]; ok {
++			if err := devfs.AddRules(specgen.Config.Mounts, t.Rules); err != nil {
++				return nil, nil, nil, fmt.Errorf("host path %s: %w", m.HostPath, err)
++			}
++			if t.Mount {
++				specgen.AddMount(devfs.NewMount(dest))
++			}
++			log.Infof(ctx, "Host path %s is on devfs: %d devfs rules, devfs mount: %v", m.HostPath, len(t.Rules), t.Mount)
++			volumes = append(volumes, oci.ContainerVolume{
++				ContainerPath: dest,
++				HostPath:      m.HostPath,
++				Readonly:      m.Readonly,
++				Propagation:   m.Propagation,
++			})
++			continue
++		}
+ 		if m.HostPath == "/" && dest == "/" {
+ 			log.Warnf(ctx, "Configuration specifies mounting host root to the container root.  This is dangerous (especially with privileged containers) and should be avoided.")
+ 		}
+diff --git a/server/image_os_freebsd.go b/server/image_os_freebsd.go
+index 324a809df..20c024dff 100644
+--- a/server/image_os_freebsd.go
++++ b/server/image_os_freebsd.go
+@@ -13,6 +13,7 @@ import (
+ 	"github.com/opencontainers/runtime-tools/generate"
+ 	types "k8s.io/cri-api/pkg/apis/runtime/v1"
+ 
++	"github.com/cri-o/cri-o/internal/devfs"
+ 	"github.com/cri-o/cri-o/internal/storage"
+ )
+ 
+@@ -171,3 +172,9 @@ func (s *Server) checkImageOS(handler, imageName string, img *storage.ImageResul
+ 
+ 	return nil
+ }
++
++// finishDevfsMounts gives the devfs mounts made for hostPath volumes of the
++// host's /dev the options of the container's /dev, now that they are final.
++func finishDevfsMounts(specgen *generate.Generator) {
++	devfs.SyncMounts(specgen.Config.Mounts)
++}
+diff --git a/server/image_os_other.go b/server/image_os_other.go
+index 590bfaec7..0d2d38d4a 100644
+--- a/server/image_os_other.go
++++ b/server/image_os_other.go
+@@ -20,3 +20,5 @@ func imageOSFallbacks() []string { return nil }
+ 
+ // checkImageOS: there is no per-handler image OS on this platform.
+ func (s *Server) checkImageOS(_, _ string, _ *storage.ImageResult) error { return nil }
++
++func finishDevfsMounts(_ *generate.Generator) {}
+-- 
+2.54.0 (Apple Git-157)
+

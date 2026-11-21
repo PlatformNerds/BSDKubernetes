@@ -329,9 +329,63 @@ and nullfs mounts only directories, regular files and sockets (`Invalid argument
 - Letting nullfs cover device nodes would have to keep refusing devfs vnodes. Otherwise a hostPath to a real
   device would reach the device past the jail's devfs ruleset.
 
-The real gap is a hostPath to a real device (`/dev/kmsg` for node-problem-detector, `/dev/fuse`). On FreeBSD
-that should become a devfs rule that unhides the device in the container's devfs, as CRI-O's `devices` already
-does. It still fails today.
+The real gap was a hostPath to a real device (`/dev/fuse`, a GPU's `/dev/dri`). It is closed now; see the next
+section.
+
+## Host devices: hostPath on devfs and CRI `devices` (freebsd-src 0044-0045, CRI-O 0028-0029)
+
+*2026-11-21.* Working on the gap above found a hole first. A hostPath volume is a nullfs mount, and a hostPath
+`/dev` gave a container a nullfs view of the **host's** devfs: every host device, whatever the container's devfs
+ruleset hides. It looked harmless, because `read` and `write` fail (`Device not configured`): the file gets
+vnops, and devfs's `dead_read`/`dead_write` run. But `truss` showed `open` succeeding. `devfs_open` runs the
+driver's `d_open` (`/dev/klog` answered `Device busy`: the driver was reached), and `vn_ioctl` passes `VCHR` on
+through `null_bypass` to `devfs_ioctl`, which calls the driver's `d_ioctl`. An unprivileged pod with hostPath
+`/dev` could, for example, issue `DIOCGDELETE` on a host disk. Jails may also read `/dev/mem` once they can see it
+(`PRIV_KMEM_READ` is allowed in `prison_priv_check`). On Linux the device cgroup stops such a container from
+opening any device it wasn't given.
+
+**Kernel (0045, `kernel.bsdk8s26`):** `null_open` refuses a `VCHR` vnode with `ENXIO`, the error `read` already
+returned. Device nodes outside devfs have no driver, so only devfs devices are affected, and those couldn't be read
+or written through nullfs anyway. FIFOs and sockets through nullfs still work (checked).
+
+**A kernel panic on the way (0044).** Checking what host root can do through such a view, `dd if=/dev/mem bs=512
+count=1` *on the host* panicked node 2: `pmap_map_io_transient: TODO: Map out of DMAP data`. arm64 (and riscv)
+`memrw()` hands an offset outside the direct map to `uiomove_fromphys()`, whose `pmap_map_io_transient()` panics
+for such addresses. The direct map covers all RAM, so anything outside it is a hole or device memory: the access
+now fails with `EFAULT`. Main has the same code. (Pods never reached this: `/dev/mem` is hidden from them, and
+through nullfs the open fails.)
+
+**CRI-O (0028-0029):** host paths on devfs no longer become nullfs mounts. They do what the device cgroup does on
+Linux, with devfs:
+
+| Request | Becomes |
+|---|---|
+| a device, or a directory of devices, at its own path below `/dev` (hostPath `/dev/fuse` at `/dev/fuse`) | devfs rules that unhide it (and its parent directories; a directory's entries three levels deep) in the container's devfs |
+| hostPath `/dev` at `/dev` | nothing: the container's own devfs |
+| hostPath `/dev` elsewhere (`/host/dev`) | a second devfs mount with the ruleset and rules of the container's `/dev` (`ruleset=0` for privileged containers, which see every device, as on Linux) |
+| a device at another path (`/dev/klog` at `/dev/kmsg`) | an error: devfs can't show a device under another name |
+| CRI `devices` (device plugins) | the same unhide rules; privileged containers see everything already |
+
+Pods on node 2:
+
+| Pod | Result |
+|---|---|
+| hostPath `/dev/full` at `/dev/full` | `/dev/full` shown and readable; `/dev/mem` still hidden |
+| hostPath `/dev` at `/host/dev` | `/host/dev` lists what `/dev` lists (`fd null random ... zero`); `/host/dev/zero` readable |
+| hostPath `/dev/full` at `/dev/myfull` | `CreateContainerError`: "/dev/full is a device on the host's devfs; on FreeBSD a container can only get it at /dev/full, not /dev/myfull" |
+| hostPath `/dev/input` at `/dev/input` | `event0` ... `event2` shown |
+| privileged, hostPath `/dev` at `/host/dev` | every host device |
+| hostPath `/dev` at `/dev` | the usual `/dev` |
+
+Limits:
+- Rules are applied when the container starts. A device that appears later (a driver loaded afterwards) stays
+  hidden until the container restarts. Linux creates a container's device nodes at start too.
+- `additional_devices` in crio.conf and the `io.kubernetes.cri-o.Devices` annotation are still not implemented on
+  FreeBSD.
+- Volume e2e (`HostPath|Subpath|EmptyDir|Projected|ConfigMap|Secrets|Downward API`, 118 tests) on bsdk8s26 with
+  this CRI-O: 113 pass; the 5 failures are the CSI mock token test and the 4 below, as before.
+- The 4 HostPathType tests above still fail: their device nodes are inert nodes on a ZFS or tmpfs, not devfs, so
+  they are still nullfs file mounts, which nullfs refuses.
 
 ## NFS: client, server pods, recycler (freebsd-src 0036, CRI-O a90bf43d4)
 

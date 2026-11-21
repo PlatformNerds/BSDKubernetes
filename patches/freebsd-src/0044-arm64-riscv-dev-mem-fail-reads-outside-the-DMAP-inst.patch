@@ -1,0 +1,85 @@
+From dfd1f68f26a8e17e47a82191e533940c16170c03 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 10:42:50 -0700
+Subject: [PATCH] arm64, riscv: /dev/mem: fail reads outside the DMAP instead
+ of panicking
+
+memrw() hands a /dev/mem offset that is not in the DMAP to
+uiomove_fromphys().  On arm64 and riscv that calls
+pmap_map_io_transient(), which panics for any address outside the DMAP
+("pmap_map_io_transient: TODO: Map out of DMAP data").  The DMAP covers
+all of RAM, so such an offset is a hole or device memory, and a single
+read by root, e.g. "dd if=/dev/mem bs=512 count=1" on a VM whose RAM
+does not start at 0, brings the machine down.
+
+Return EFAULT for these offsets, as /dev/kmem already does for
+addresses it cannot reach.  The error of uiomove_fromphys() was also
+ignored, so nothing that worked before changes.
+---
+ sys/arm64/arm64/mem.c | 12 ++++++------
+ sys/riscv/riscv/mem.c | 12 ++++++------
+ 2 files changed, 12 insertions(+), 12 deletions(-)
+
+diff --git a/sys/arm64/arm64/mem.c b/sys/arm64/arm64/mem.c
+index 2a998ca1f..8b17bbd92 100644
+--- a/sys/arm64/arm64/mem.c
++++ b/sys/arm64/arm64/mem.c
+@@ -46,8 +46,6 @@ int
+ memrw(struct cdev *dev, struct uio *uio, int flags)
+ {
+ 	struct iovec *iov;
+-	struct vm_page m;
+-	vm_page_t marr;
+ 	vm_offset_t off, v;
+ 	vm_prot_t prot;
+ 	u_int cnt;
+@@ -109,10 +107,12 @@ memrw(struct cdev *dev, struct uio *uio, int flags)
+ 				break;
+ 			}
+ 
+-			/* Have uiomove_fromphys handle the data */
+-			m.phys_addr = trunc_page(v);
+-			marr = &m;
+-			uiomove_fromphys(&marr, off, cnt, uio);
++			/*
++			 * The DMAP covers all of RAM.  Anything else is a hole
++			 * or device memory, which pmap_map_io_transient() can't
++			 * map (it panics), so fail the access instead.
++			 */
++			error = EFAULT;
+ 			break;
+ 		}
+ 	}
+diff --git a/sys/riscv/riscv/mem.c b/sys/riscv/riscv/mem.c
+index 9792c01fa..5287f744e 100644
+--- a/sys/riscv/riscv/mem.c
++++ b/sys/riscv/riscv/mem.c
+@@ -48,8 +48,6 @@ memrw(struct cdev *dev, struct uio *uio, int flags)
+ 	ssize_t orig_resid;
+ 	vm_offset_t off, v;
+ 	struct iovec *iov;
+-	struct vm_page m;
+-	vm_page_t marr;
+ 	vm_prot_t prot;
+ 	u_int cnt;
+ 	int error;
+@@ -110,10 +108,12 @@ memrw(struct cdev *dev, struct uio *uio, int flags)
+ 				break;
+ 			}
+ 
+-			/* Have uiomove_fromphys handle the data */
+-			m.phys_addr = trunc_page(v);
+-			marr = &m;
+-			uiomove_fromphys(&marr, off, cnt, uio);
++			/*
++			 * The DMAP covers all of RAM.  Anything else is a hole
++			 * or device memory, which pmap_map_io_transient() can't
++			 * map (it panics), so fail the access instead.
++			 */
++			error = EFAULT;
+ 			break;
+ 		}
+ 	}
+-- 
+2.54.0 (Apple Git-157)
+

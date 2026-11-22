@@ -1,0 +1,257 @@
+From 70a4baab137c8d2f12c3df8c1be0d0e3dfa83ae8 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 17:42:58 -0700
+Subject: [PATCH 19/20] mount: copy device nodes from outside devfs into the
+ container
+
+A hostPath of a device node made with mknod(2) on a disk file system or
+tmpfs (Kubernetes' HostPathType CharDevice/BlockDevice tests) failed:
+nullfs mounts only directories, regular files and sockets. The kernel
+can't simply allow it either: a device vnode's v_rdev shares a union
+with v_mountedhere, so code that handles character devices would read
+the mount as a cdev.
+
+Such a node is inert (devices are reached only through devfs), so give
+the container a node of the same type, number, mode and owner, like the
+copy made for regular files when the kernel has no file mounts. Delete
+removes it and restores what the image had there. A devfs device is
+refused: a copy would be inert, not the device; runtimes expose those
+with devfs rules.
+---
+ ocijail/mount.cpp | 132 ++++++++++++++++++++++++++++++++++++++++++++++
+ test/run_test.py  |  55 +++++++++++++++++++
+ 2 files changed, 187 insertions(+)
+
+diff --git a/ocijail/mount.cpp b/ocijail/mount.cpp
+index fee9b00..bc97b99 100644
+--- a/ocijail/mount.cpp
++++ b/ocijail/mount.cpp
+@@ -5,6 +5,7 @@
+ #include <unistd.h>
+ #include <sys/mount.h>
+ #include <sys/socket.h>
++#include <sys/stat.h>
+ #include <sys/un.h>
+ #include <sys/uio.h>
+ #include <sys/wait.h>
+@@ -356,6 +357,125 @@ static void create_socket_node(const fs::path& path) {
+     }
+ }
+ 
++// A device node outside devfs (made with mknod(2) on a disk file system or
++// tmpfs) is inert: a device is reached only through devfs, so such a node is a
++// file with a type and a number. nullfs can't mount one, and the kernel can't
++// let it: in struct vnode, a device node's v_rdev shares a union with
++// v_mountedhere, so code that handles character devices would read the mount as
++// a cdev. Give the container a node of the same type, number, mode and owner
++// instead, the way regular files are copied when the kernel has no file mounts.
++// It isn't the same inode: a chmod(2) on either side doesn't show on the other.
++//
++// A device in devfs is refused: copying it into the container's root would give
++// an inert node, not the device. Runtimes expose host devices through devfs
++// rules (OCI linux.devices, CRI devices).
++static bool is_device_source(const json& mount) {
++    if (!mount.contains("source")) {
++        return false;
++    }
++    std::string source = mount["source"];
++    struct stat sb;
++    if (::stat(source.c_str(), &sb) < 0) {
++        return false;
++    }
++    if (!S_ISCHR(sb.st_mode) && !S_ISBLK(sb.st_mode)) {
++        return false;
++    }
++    struct statfs sfs;
++    if (::statfs(source.c_str(), &sfs) < 0) {
++        throw std::system_error(
++            errno, std::system_category(), "statfs " + source);
++    }
++    if (std::string_view{sfs.f_fstypename} == "devfs") {
++        throw std::runtime_error(
++            "mounting " + source +
++            ": a devfs device can't be bind-mounted; expose it with a devfs "
++            "rule (OCI linux.devices) instead");
++    }
++    return true;
++}
++
++static void copy_device_node(runtime_state& state,
++                             const fs::path& root_path,
++                             const fs::path& destination,
++                             const json& mount) {
++    std::string source = mount["source"];
++    struct stat src;
++    if (::stat(source.c_str(), &src) < 0) {
++        throw std::system_error(errno, std::system_category(), "stat " + source);
++    }
++    auto same = [&src](const struct stat& sb) {
++        return (sb.st_mode & S_IFMT) == (src.st_mode & S_IFMT) &&
++               sb.st_rdev == src.st_rdev &&
++               (sb.st_mode & ALLPERMS) == (src.st_mode & ALLPERMS) &&
++               sb.st_uid == src.st_uid && sb.st_gid == src.st_gid;
++    };
++
++    json entry = {{"destination", mount["destination"]},
++                  {"copy", destination.string()},
++                  {"saved", nullptr}};
++    struct stat dst;
++    if (::lstat(destination.c_str(), &dst) == 0) {
++        // With a read-only root, the prepare pass made the copy already and
++        // this pass sees it through the read-only alias.
++        if (same(dst)) {
++            return;
++        }
++        if (S_ISDIR(dst.st_mode)) {
++            throw std::runtime_error(
++                "destination for device node mount " + destination.string() +
++                " exists and is a directory");
++        }
++        auto [save_dir, save_path] = get_save_path(state, destination);
++        if (!fs::exists(save_dir)) {
++            fs::create_directories(save_dir);
++            state["remove_on_unmount"].push_back(save_dir);
++        }
++        fs::rename(destination, save_path);
++        entry["saved"] = save_path.string();
++    } else {
++        create_directories(root_path, destination.parent_path(), state);
++        state["remove_on_unmount"].push_back(destination);
++    }
++    if (::mknod(destination.c_str(), src.st_mode & (S_IFMT | ALLPERMS),
++                src.st_rdev) < 0) {
++        throw std::system_error(
++            errno, std::system_category(), "mknod " + destination.string());
++    }
++    // mknod(2) applies the umask.
++    if (::chmod(destination.c_str(), src.st_mode & ALLPERMS) < 0 ||
++        ::lchown(destination.c_str(), src.st_uid, src.st_gid) < 0) {
++        throw std::system_error(
++            errno, std::system_category(), "setting up " + destination.string());
++    }
++    state["device_copies"].push_back(entry);
++}
++
++// Undo copy_device_node for this mount, if it made a copy. Returns false if
++// the mount isn't a device node copy.
++static bool remove_device_copy(runtime_state& state, const json& mount) {
++    if (!state.contains("device_copies") || !mount.contains("destination")) {
++        return false;
++    }
++    for (auto& entry : state["device_copies"]) {
++        if (entry["destination"] != mount["destination"]) {
++            continue;
++        }
++        if (entry["saved"].is_string()) {
++            fs::path copy = entry["copy"].get<std::string>();
++            fs::path saved = entry["saved"].get<std::string>();
++            std::error_code ec;
++            fs::remove(copy, ec);
++            if (fs::exists(saved, ec)) {
++                fs::rename(saved, copy);
++            }
++        }
++        // Otherwise the copy is in remove_on_unmount.
++        return true;
++    }
++    return false;
++}
++
+ static bool create_mount_point(runtime_state& state,
+                                const fs::path& root_path,
+                                const fs::path& destination,
+@@ -424,6 +544,14 @@ static bool mount_volume(main_app& app,
+     bool is_socket_mount =
+         type == "nullfs" && fs::is_socket(mount["source"].get<std::string>());
+ 
++    // A device node outside devfs is copied, not mounted (see
++    // copy_device_node). The copy is made in the prepare pass when the root
++    // is read-only, since the second pass can't write to it.
++    if (type == "nullfs" && is_device_source(mount)) {
++        copy_device_node(state, root_path, destination, mount);
++        return file_mount_supported;
++    }
++
+     // Validate mount options before we perform any actions
+     std::vector<std::tuple<pseudo_option*, std::string>> pseudo_opts;
+     std::vector<std::tuple<std::string, std::string>> mount_opts;
+@@ -528,6 +656,10 @@ static void unmount_volume(main_app& app,
+                            const fs::path& root_path,
+                            const json& mount,
+                            const json& recorded) {
++    if (remove_device_copy(state, mount)) {
++        return;
++    }
++
+     // Prefer the path recorded at mount time (see mount_volumes); state
+     // written by older versions does not have it.
+     auto destination = recorded.is_string()
+diff --git a/test/run_test.py b/test/run_test.py
+index 933b3e5..aae6a45 100644
+--- a/test/run_test.py
++++ b/test/run_test.py
+@@ -439,6 +439,61 @@ class test_run(unittest.TestCase):
+             # the socket node ocijail created is gone
+             self.assertFalse(os.path.exists(dst))
+ 
++    def test_device_node_mount(self):
++        # A device node made with mknod(2) outside devfs, like the Kubernetes
++        # HostPathType CharDevice/BlockDevice tests use. nullfs can't mount
++        # it, so ocijail gives the container a node of the same type,
++        # number, mode and owner, and removes it (restoring what was there)
++        # on delete.
++        with tempfile.TemporaryDirectory() as root_dir, \
++             tempfile.TemporaryDirectory(dir="/tmp") as d:
++            shutil.copytree("/rescue", os.path.join(root_dir, "rescue"))
++            os.makedirs(os.path.join(root_dir, "etc"))
++            kept = os.path.join(root_dir, "etc", "kept")
++            with open(kept, "w") as f:
++                f.write("image file")
++            chardev = os.path.join(d, "achardev")
++            blkdev = os.path.join(d, "ablkdev")
++            os.mknod(chardev, 0o640 | 0o020000, os.makedev(89, 1))
++            os.chown(chardev, 0, 5)
++            os.mknod(blkdev, 0o600 | 0o060000, os.makedev(89, 2))
++            c = self.config()
++            c["root"]["path"] = root_dir
++            c["mounts"] = [
++                {"destination": "/mnt/test/c", "type": "nullfs",
++                 "source": chardev},
++                {"destination": "/etc/kept", "type": "nullfs",
++                 "source": blkdev},
++            ]
++            c["process"]["args"] = [
++                "sh", "-c", "ls -ln /mnt/test/c /etc/kept"]
++            c["process"]["env"] = ["PATH=/rescue"]
++            try:
++                ret, out, err = self.run_with_config(c)
++                self.assertEqual(ret, 0, err)
++                lines = out.splitlines()
++                self.assertRegex(lines[0], r"^brw------- +1 0 +0 +89, +0x2 ")
++                self.assertRegex(lines[1], r"^crw-r----- +1 0 +5 +89, +0x1 ")
++            finally:
++                self.delete(False)
++            # the copy and the directories made for it are gone, and the
++            # image's file is back
++            self.assertFalse(os.path.exists(os.path.join(root_dir, "mnt")))
++            with open(kept) as f:
++                self.assertEqual(f.read(), "image file")
++
++            # A devfs device is refused: a copy would be inert, not the
++            # device.
++            c["mounts"] = [
++                {"destination": "/mnt/null", "type": "nullfs",
++                 "source": "/dev/null"},
++            ]
++            c["process"]["args"] = ["true"]
++            ret, _, _ = self.run_with_config(c, expected_ret=1)
++            self.assertEqual(ret, 1)
++            self.delete(False)
++            self.assertFalse(os.path.exists(os.path.join(root_dir, "mnt")))
++
+     def test_process_user_umask(self):
+         c = self.config()
+         # If process.user.umask is set, this should be the value of umask inside
+-- 
+2.54.0 (Apple Git-157)
+

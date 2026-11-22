@@ -327,10 +327,8 @@ classifies the inert nodes correctly.
 
 **The 4 left** ("should be able to mount character/block device ... when HostPathType is CharDev/BlockDev/Unset")
 start a pod that bind-mounts the device node itself into the container. ocijail does that with a nullfs file mount,
-and nullfs mounts only directories, regular files and sockets (`Invalid argument`). I left it there on purpose:
-- The nodes these tests mount are inert, so there is little to gain.
-- Letting nullfs cover device nodes would have to keep refusing devfs vnodes. Otherwise a hostPath to a real
-  device would reach the device past the jail's devfs ruleset.
+and nullfs mounts only directories, regular files and sockets (`Invalid argument`). **They pass since ocijail
+0019-0020 (35/35)**; see "Device nodes outside devfs" below.
 
 The real gap was a hostPath to a real device (`/dev/fuse`, a GPU's `/dev/dri`). It is closed now; see the next
 section.
@@ -388,8 +386,31 @@ Limits:
   (`rwm`) is accepted, but devfs has no per-container modes, so the node's own mode applies.
 - Volume e2e (`HostPath|Subpath|EmptyDir|Projected|ConfigMap|Secrets|Downward API`, 118 tests) on bsdk8s26 with
   this CRI-O: 113 pass; the 5 failures are the CSI mock token test and the 4 below, as before.
-- The 4 HostPathType tests above still fail: their device nodes are inert nodes on a ZFS or tmpfs, not devfs, so
-  they are still nullfs file mounts, which nullfs refuses.
+- The 4 HostPathType tests above still failed here: their device nodes are inert nodes on a ZFS or tmpfs, not
+  devfs, so they were nullfs file mounts, which nullfs refuses. Fixed by ocijail 0019-0020 (next section).
+
+## Device nodes outside devfs: copied, not mounted (ocijail 0019-0020)
+
+*2026-11-21.* A hostPath to a device node made with `mknod` on a disk file system or tmpfs (the HostPathType
+CharDevice/BlockDevice tests) can't be a nullfs mount, and the kernel can't simply allow one: in `struct vnode`,
+`v_rdev` (the device of a `VCHR` vnode) shares a union with `v_mountedhere`. Mounting over a device node would put a
+`struct mount` pointer where generic code expects a `cdev`; `vn_fsync_buf()`, for one, reads
+`vp->v_rdev->si_mountpt` for every `VCHR` vnode. So no kernel change.
+
+Such a node is inert: since FreeBSD 5, a device is reached only through devfs. ocijail now gives the container a
+node of the same type, number, mode and owner (`mknod` in the container's root, then `chmod`/`lchown`), the way it
+already copies regular files when the kernel has no file mounts. `delete` removes it, with the directories made for
+it, and puts back what the image had at that path. A device **in devfs** is refused ("a devfs device can't be
+bind-mounted; expose it with a devfs rule"): its copy would be inert, not the device. CRI-O never sends those as
+mounts anyway (previous section).
+
+Differences from a Linux bind mount, all about the node's metadata: it isn't the same inode, so a `chmod`, `chown`
+or removal on one side doesn't show on the other, and the mount's `ro` option has no effect on it.
+
+| Check | Before | After |
+|---|---|---|
+| `HostPathType` e2e | 31/35 | **35/35** |
+| ocijail tests (node 1) | 32 | 33/33 (`test_device_node_mount`: char and block copies with mode and owner, the image's file restored, a devfs source refused) |
 
 ## Block volumes and formatted local disks (kubernetes 0044-0046, CRI-O 0031)
 

@@ -1,0 +1,28 @@
+From 124d25cb0d2af4abefa5c97eef95e164eb526541 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 17:45:41 -0700
+Subject: [PATCH 20/20] test: match FreeBSD ls(1)'s device numbers in
+ test_device_node_mount
+
+---
+ test/run_test.py | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/test/run_test.py b/test/run_test.py
+index aae6a45..d68cdd4 100644
+--- a/test/run_test.py
++++ b/test/run_test.py
+@@ -472,8 +472,8 @@ class test_run(unittest.TestCase):
+                 ret, out, err = self.run_with_config(c)
+                 self.assertEqual(ret, 0, err)
+                 lines = out.splitlines()
+-                self.assertRegex(lines[0], r"^brw------- +1 0 +0 +89, +0x2 ")
+-                self.assertRegex(lines[1], r"^crw-r----- +1 0 +5 +89, +0x1 ")
++                self.assertRegex(lines[0], r"^brw------- +1 0 +0 +0x5902 ")
++                self.assertRegex(lines[1], r"^crw-r----- +1 0 +5 +0x5901 ")
+             finally:
+                 self.delete(False)
+             # the copy and the directories made for it are gone, and the
+-- 
+2.54.0 (Apple Git-157)
+

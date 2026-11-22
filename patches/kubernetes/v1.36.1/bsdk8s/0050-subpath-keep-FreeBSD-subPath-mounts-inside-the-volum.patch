@@ -1,0 +1,71 @@
+From dc6f7ebf92726cb5b67bacf9e8b963ec32283025 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 03:38:39 -0700
+Subject: [PATCH] subpath: keep FreeBSD subPath mounts inside the volume
+
+doBindSubPath resolved the subPath's symlinks and nullfs-mounted the
+result without checking where it led. A pod that writes a symlink into
+its volume (e.g. -> /etc) got that host path mounted into a container
+using the subPath (CVE-2017-1002101 on FreeBSD).
+
+Require the resolved path to be within the resolved volume path, open
+it component by component without following symlinks (doSafeOpen), and
+after the nullfs mount check that the mounted root is that file (inode
+number, generation and type, which nullfs passes through), so a
+component swapped for a symlink between check and mount is refused.
+
+Found by the [Slow] [LinuxOnly] subpath "should fail if subpath ... is
+outside the volume" e2e tests (30 failures).
+---
+ pkg/volume/util/subpath/subpath_freebsd.go | 28 ++++++++++++++++++++++
+ 1 file changed, 28 insertions(+)
+
+diff --git a/pkg/volume/util/subpath/subpath_freebsd.go b/pkg/volume/util/subpath/subpath_freebsd.go
+index 0c441fbee2b..77e47953a9d 100644
+--- a/pkg/volume/util/subpath/subpath_freebsd.go
++++ b/pkg/volume/util/subpath/subpath_freebsd.go
+@@ -185,6 +185,25 @@ func doBindSubPath(mounter mount.Interface, subpath Subpath) (hostPath string, e
+ 	subpath.VolumePath = newVolumePath
+ 	subpath.Path = newPath
+ 
++	// The subpath may go through symlinks the pod created in its volume; they
++	// must not lead out of it (CVE-2017-1002101), or the container gets the host
++	// path they name.
++	if !mount.PathWithinBase(newPath, newVolumePath) {
++		return "", fmt.Errorf("subpath %q not within volume path %q", newPath, newVolumePath)
++	}
++	// Open it without following symlinks, to compare with what gets mounted:
++	// nullfs can't mount a file descriptor, and mount(8) resolves the path
++	// again, after a component may have been swapped for a symlink.
++	fd, err := doSafeOpen(newPath, newVolumePath)
++	if err != nil {
++		return "", fmt.Errorf("error opening subpath %v: %v", newPath, err)
++	}
++	defer syscall.Close(fd)
++	var want unix.Stat_t
++	if err := unix.Fstat(fd, &want); err != nil {
++		return "", fmt.Errorf("error running fstat on subpath %v: %v", newPath, err)
++	}
++
+ 	alreadyMounted, bindPathTarget, err := prepareSubpathTarget(mounter, subpath)
+ 	if err != nil {
+ 		return "", err
+@@ -211,6 +230,15 @@ func doBindSubPath(mounter mount.Interface, subpath Subpath) (hostPath string, e
+ 	if err = mounter.MountSensitiveWithoutSystemdWithMountFlags(subpath.Path, bindPathTarget, "nullfs", options, nil /* sensitiveOptions */, mountFlags); err != nil {
+ 		return "", fmt.Errorf("error mounting %s: %s", subpath.Path, err)
+ 	}
++	// nullfs passes the inode number and generation of the file below through
++	// (not the device). The mount is now fixed to that file.
++	var got unix.Stat_t
++	if err := unix.Stat(bindPathTarget, &got); err != nil {
++		return "", fmt.Errorf("error running stat on %s: %v", bindPathTarget, err)
++	}
++	if got.Ino != want.Ino || got.Gen != want.Gen || got.Mode&unix.S_IFMT != want.Mode&unix.S_IFMT {
++		return "", fmt.Errorf("subpath %s changed while it was mounted", subpath.Path)
++	}
+ 	success = true
+ 
+ 	klog.V(3).Infof("Bound SubPath %s into %s", subpath.Path, bindPathTarget)
+-- 
+2.54.0 (Apple Git-157)
+

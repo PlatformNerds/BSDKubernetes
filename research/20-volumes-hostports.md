@@ -239,6 +239,31 @@ tmpfs on /var/run/secrets/kubernetes.io/serviceaccount type tmpfs (ro)
 Results: NFS drivers 35/35 (NFS section below); csi-hostpath 26/36, all filesystem tests (research/24).
 Linux containers see the same table. Nodes boot `/boot/kernel.bsdk8s24`.
 
+## subPath could escape the volume (kubernetes 0050, a security fix)
+
+*2026-11-22, found by the `[Slow]` rerun.*
+
+- **The bug:** the FreeBSD subPath code (`pkg/volume/util/subpath/subpath_freebsd.go`, from the 2023 "WIP:
+  subpath mounts" commit in the series we build on) resolved a subPath's symlinks on the host with
+  `filepath.EvalSymlinks` and nullfs-mounted the result, without checking that it was still inside the volume.
+  A pod that writes a symlink into its volume (`ln -s /etc x`) and mounts `x` as a subPath in another container
+  got the host's `/etc` there. Any host path the kubelet can reach was exposed this way. It is CVE-2017-1002101,
+  which Linux has prevented since 2018 by opening each path component without following symlinks and
+  bind-mounting the resulting file descriptor.
+- **How it showed:** the 30 `[LinuxOnly]` subPath tests "should fail if subpath {directory,file,with
+  backstepping} is outside the volume" (10 drivers × 3) failed with "subpath container unexpectedly
+  terminated": the container started, with the host's `/bin` or `/bin/sh` mounted.
+- **The fix:**
+  - The resolved path must lie within the resolved volume path, or the container fails with
+    `CreateContainerConfigError` ("failed to prepare subPath"), as on Linux.
+  - nullfs can't mount a file descriptor, and mount(8) resolves the path again. So the kubelet opens the path
+    component by component without following symlinks (`doSafeOpen`). After the mount, it checks that the mount's
+    root is the same file: inode number, generation and type. nullfs passes these through from the file below; the
+    device differs, so `os.SameFile` can't be used. A component swapped for a symlink between the check and the
+    mount is unmounted and refused.
+- **Checked:** every subPath e2e test (not Serial/Disruptive/Feature/CSI): **156/156**, including the 30.
+  Before the fix, those 30 failed in the `[Slow]` run (research/07).
+
 ## Mount propagation: not available
 
 `[sig-node] Mount propagation should propagate mounts within defined scopes` fails, and can't pass on FreeBSD:

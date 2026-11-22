@@ -20,7 +20,7 @@ as **Linux containers** where the Linuxulator can handle them, and inside **bhyv
 | [research/04-linux-compat-bhyve.md](research/04-linux-compat-bhyve.md) | Linuxulator gap analysis; bhyve as a Kata-style microVM runtime |
 | [research/05-storage-security-controlplane.md](research/05-storage-security-controlplane.md) | ZFS snapshotters, CSI, security mapping, control plane, ecosystem |
 | [research/06-resource-limits.md](research/06-resource-limits.md) | **Implemented:** pod CPU/memory limits → rctl. Measured rctl semantics (`memoryuse:sigkill`, `pcpu` accuracy) |
-| [research/07-conformance.md](research/07-conformance.md) | **Conformance (2 nodes): 437/446 (98.0%)**; runs 4-15, sweeps beyond the conformance set (per SIG, NodeConformance, Serial, Slow, NFS, DRA 88/92), remaining gaps |
+| [research/07-conformance.md](research/07-conformance.md) | **Conformance (2 nodes): 437/446 (98.0%)**; runs 4-15, sweeps beyond the conformance set (per SIG, NodeConformance, Serial, Slow, NFS, DRA 92/93), remaining gaps |
 | [research/08-allow-pf.md](research/08-allow-pf.md) | **Kernel K14 `allow.pf` implemented:** kube-proxy runs as a normal pod (kernel + ocijail + CRI-O) |
 | [research/09-host-clusterip.md](research/09-host-clusterip.md) | Host-network clients and ClusterIPs on pf |
 | [research/10-linux-images.md](research/10-linux-images.md) | Linux container images on FreeBSD nodes via the Linuxulator |

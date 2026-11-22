@@ -190,7 +190,7 @@ Not Conformance, Serial, Slow, Disruptive, Flaky, Feature or LinuxOnly:
 | sig-apps | 48/48 |
 | sig-network | 67/68 (the known CLOSE_WAIT test, which reads Linux conntrack) |
 | sig-node | 27/28 without the pod-level resize tests (decided, research/17) and DRA |
-| `[DRA]` (not Serial, Slow, Disruptive, Alpha; includes the Beta `DRAExtendedResource`, `DRADeviceTaints`, `DRAPartitionableDevices`, `DRAPrioritizedList` tests) | before: every test needing a kubelet plugin failed (no DRA manager in the FreeBSD kubelet); now **88/92**; the 4 failures use the `resource.k8s.io` v1beta1/v1beta2 APIs, which this cluster's API server doesn't serve (only `v1`, the default) |
+| `[DRA]` (not Serial, Slow, Disruptive, Alpha; includes the Beta `DRAExtendedResource`, `DRADeviceTaints`, `DRAPartitionableDevices`, `DRAPrioritizedList` tests) | before: every test needing a kubelet plugin failed (no DRA manager in the FreeBSD kubelet); then 88/92, the 4 failures using the `resource.k8s.io` v1beta1/v1beta2 APIs, which the API server didn't serve (only `v1`, the 1.36 default). With `--runtime-config=resource.k8s.io/v1beta1=true,resource.k8s.io/v1beta2=true` (demo `build-cluster.sh` 00620ac): **92/93**, all 92 earlier tests passing. The 93rd, `DeviceTaintRule evicts pod` (`[Feature:OffByDefault]`), only runs once v1beta2 is served; it waits for kube-controller-manager to evict the pod, which needs the `DRADeviceTaintRules` feature gate this cluster leaves off (control plane, not FreeBSD; the kubelet side prepared and unprepared the claim) |
 | sig-scheduling Serial | 14/14 |
 | Serial tests of sig-node, apps, network, api-machinery, cli | 17/19, then 18/19 |
 | HostPathType + in-tree hostPath/hostPathSymlink/emptydir drivers | 41/57, then **43/57** (socket mounts, research/20); the other 14 are block/character devices, which need `mknod` (since: all pass, `allow.mknod` and ocijail's device node copies, HostPathType 35/35, research/20) |
@@ -242,7 +242,9 @@ Not Conformance, Serial, Slow, Disruptive, Flaky, Feature or LinuxOnly:
     which writes the CDI files with `base64 -d`. Our FreeBSD hostpathplugin image now carries FreeBSD's
     `base64` (bintrans(1)); without it every prepare failed.
   - 88/92; the 4 failures need `--runtime-config=resource.k8s.io/v1beta1=true,resource.k8s.io/v1beta2=true`,
-    which upstream sets only in its DRA jobs. Nothing FreeBSD-specific there.
+    which upstream sets only in its DRA jobs. Nothing FreeBSD-specific there. With that flag set (now in the
+    demo's `build-cluster.sh`): 92/93. The extra test, `DeviceTaintRule evicts pod`, is `[Feature:OffByDefault]`
+    and needs the `DRADeviceTaintRules` gate in kube-controller-manager, which this cluster leaves off.
   - NodeConformance afterwards (not Serial/Disruptive/Flaky/LinuxOnly, and also not Slow/Alpha/OffByDefault,
     hence 172 rather than 182 tests): 172/172.
   - `Mount propagation` can't pass: FreeBSD has no shared subtrees (research/20).

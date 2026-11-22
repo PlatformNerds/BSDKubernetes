@@ -382,7 +382,9 @@ if [ -n "$csibindir" ] && want csi; then
     new "$base"
     install -m 755 "$csibindir/$name" "$m/$name"
     # Block volumes: the driver attaches its backing files to md(4) disks.
-    if [ "$name" = hostpathplugin ]; then hostbin /sbin/mdconfig; fi
+    # The e2e proxy mode (DRA test driver, CSI mock driver) writes files in the plugin container
+    # with `base64 -d` (test/e2e/storage/drivers/proxy/io.go); the runtime base image lacks it.
+    if [ "$name" = hostpathplugin ]; then hostbin /sbin/mdconfig /usr/bin/base64; fi
     buildah config --entrypoint "[\"/$name\"]" --cmd '[]' "$c"
     commit "$ref"
     echo "built $ref"

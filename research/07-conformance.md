@@ -185,6 +185,7 @@ Not Conformance, Serial, Slow, Disruptive, Flaky, Feature or LinuxOnly:
 | sig-apps | 48/48 |
 | sig-network | 67/68 (the known CLOSE_WAIT test, which reads Linux conntrack) |
 | sig-node | 27/28 without the pod-level resize tests (decided, research/17) and DRA |
+| `[DRA]` (not Serial, Slow, Disruptive, Alpha; includes the Beta `DRAExtendedResource`, `DRADeviceTaints`, `DRAPartitionableDevices`, `DRAPrioritizedList` tests) | before: every test needing a kubelet plugin failed (no DRA manager in the FreeBSD kubelet); now **88/92**; the 4 failures use the `resource.k8s.io` v1beta1/v1beta2 APIs, which this cluster's API server doesn't serve (only `v1`, the default) |
 | sig-scheduling Serial | 14/14 |
 | Serial tests of sig-node, apps, network, api-machinery, cli | 17/19, then 18/19 |
 | HostPathType + in-tree hostPath/hostPathSymlink/emptydir drivers | 41/57, then **43/57** (socket mounts, research/20); the other 14 are block/character devices, which need `mknod` (since: all pass, `allow.mknod` and ocijail's device node copies, HostPathType 35/35, research/20) |
@@ -217,8 +218,22 @@ Not Conformance, Serial, Slow, Disruptive, Flaky, Feature or LinuxOnly:
     (research/17). Their pods set `spec.os.name: linux`, so they run under the Linuxulator. There the FreeBSD busybox
     tag is refused, and they check `cpu.weight`, which FreeBSD doesn't enforce. Each waits five minutes, so they
     also push a full sig-node run past its one-hour limit.
-  - `[DRA] control plane` tests deploy a test driver whose kubelet plugin isn't built for FreeBSD. Not looked at
-    further.
+- **Dynamic Resource Allocation (fixed).**
+  - The `[DRA]` kubelet tests failed with "no handler registered for plugin type: DRAPlugin". The FreeBSD
+    container manager never built the kubelet's DRA manager, so a DRA driver couldn't register, and pods with
+    ResourceClaims never started.
+  - Kubernetes 0049 wires it in as on Linux: the DRA manager, its plugin registration handler, prepare/unprepare,
+    claim CDI devices passed to the runtime, resource health updates. It also replaces the fake topology manager
+    with the real one under the `none` policy. The fake one's admission never called the device manager's
+    `Allocate`, so a pod asking for a device-plugin resource got no devices (not covered by a non-Serial e2e test).
+  - CRI-O 0032 injects CDI devices on FreeBSD (the stub ignored them). It applies the CDI spec's environment,
+    mounts and hooks. Each device node must be a device on the host's devfs; it is unhidden in the container's
+    devfs like the CRI `devices` field (CRI-O 0028-0031). Linux-only edits (network devices, Intel RDT) are refused.
+  - The e2e test driver runs inside e2e.test and reaches the node through a hostpathplugin pod in proxy mode,
+    which writes the CDI files with `base64 -d`. Our FreeBSD hostpathplugin image now carries FreeBSD's
+    `base64` (bintrans(1)); without it every prepare failed.
+  - 88/92; the 4 failures need `--runtime-config=resource.k8s.io/v1beta1=true,resource.k8s.io/v1beta2=true`,
+    which upstream sets only in its DRA jobs. Nothing FreeBSD-specific there.
   - `Mount propagation` can't pass: FreeBSD has no shared subtrees (research/20).
 - **Host paths didn't show the file systems below them (fixed).** No test checks this; it came up while looking at
   mount propagation. With the default ZFS layout, hostPath `/var` showed an empty `/var/log`. CRI-O 0023 mounts the

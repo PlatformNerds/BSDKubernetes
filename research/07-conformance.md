@@ -182,14 +182,14 @@ Not Conformance, Serial, Slow, Disruptive, Flaky, Feature or LinuxOnly:
 
 | SIG | Result |
 |---|---|
-| sig-cli | 50/59, then **58/59** |
+| sig-cli | 50/59, then 58/59, **59/59** on 2026-11-22 (kernel `bsdk8s26`) |
 | sig-auth | 7/7 |
 | sig-instrumentation | 4/6, then **6/6** |
-| sig-api-machinery | 63/63 |
+| sig-api-machinery | 63/63 (62/62 on 2026-11-22) |
 | sig-scheduling | none in this set |
 | sig-apps | 48/48 |
-| sig-network | 67/68 (the known CLOSE_WAIT test, which reads Linux conntrack) |
-| sig-node | 27/28 without the pod-level resize tests (decided, research/17) and DRA |
+| sig-network | 67/68 (the known CLOSE_WAIT test, which reads Linux conntrack); same on 2026-11-22 |
+| sig-node | 27/28 without the pod-level resize tests (decided, research/17) and DRA; **28/29** on 2026-11-22, the one failure `Mount propagation` (FreeBSD has no shared subtrees, research/20) |
 | `[DRA]` (not Serial, Slow, Disruptive, Alpha; includes the Beta `DRAExtendedResource`, `DRADeviceTaints`, `DRAPartitionableDevices`, `DRAPrioritizedList` tests) | before: every test needing a kubelet plugin failed (no DRA manager in the FreeBSD kubelet); then 88/92, the 4 failures using the `resource.k8s.io` v1beta1/v1beta2 APIs, which the API server didn't serve (only `v1`, the 1.36 default). With `--runtime-config=resource.k8s.io/v1beta1=true,resource.k8s.io/v1beta2=true` (demo `build-cluster.sh` 00620ac): **92/93**, all 92 earlier tests passing. The 93rd, `DeviceTaintRule evicts pod` (`[Feature:OffByDefault]`), only runs once v1beta2 is served; it waits for kube-controller-manager to evict the pod, which needs the `DRADeviceTaintRules` feature gate this cluster leaves off (control plane, not FreeBSD; the kubelet side prepared and unprepared the claim) |
 | sig-scheduling Serial | 14/14 |
 | Serial tests of sig-node, apps, network, api-machinery, cli | 17/19, then 18/19 |

@@ -55,7 +55,9 @@
 #                       csi-attacher, csi-resizer, csi-snapshotter, csi-snapshot-metadata,
 #                       csi-node-driver-registrar, livenessprobe,
 #                       csi-external-health-monitor-controller, and snapshot-controller for the
-#                       cluster), at the tags the e2e manifest names. hostpathplugin must be built against the BSDKubernetes
+#                       cluster; hello-populator and volume-data-source-validator for the
+#                       any-volume-data-source test), at the tags the e2e manifests name.
+#                       hostpathplugin must be built against the BSDKubernetes
 #                       kubernetes fork's k8s.io/mount-utils (it mounts through
 #                       bsdk8s-mount-proxy, components/mount-proxy).
 #   Also needs skopeo (agnhost's fake registry, from ghcr.io/platformnerds/pause:3.10.2).
@@ -414,6 +416,21 @@ if [ -n "$csibindir" ] && want csi; then
     commit "$snapref"
     echo "built $snapref"
   fi
+  # "should provision storage with any volume data source" (Serial) deploys a volume populator and
+  # the data-source validator (test/e2e/testing-manifests/storage-csi/any-volume-datasource). Both
+  # are plain Go: lib-volume-populator example/hello-populator (the controller also runs its own
+  # image as the populator pod) and volume-data-source-validator, at the manifests' tags.
+  avds=$src/test/e2e/testing-manifests/storage-csi/any-volume-datasource
+  for ref in $(sed -n 's|^ *image: \(registry.k8s.io/sig-storage/[^ ]*\)$|\1|p' \
+      "$avds/hello-populator-deploy.yaml" "$avds"/volume-data-source-validator/*.yaml | sort -u); do
+    name=${ref##*/}; name=${name%%:*}
+    if [ ! -x "$csibindir/$name" ]; then echo "WARNING: no $csibindir/$name for $ref"; continue; fi
+    new "$base"
+    install -m 755 "$csibindir/$name" "$m/$name"
+    buildah config --entrypoint "[\"/$name\"]" --cmd '[]' "$c"
+    commit "$ref"
+    echo "built $ref"
+  done
 fi
 
 # --- pause: reuse the control-plane pause image (scripts/build-images-freebsd.sh) -------------

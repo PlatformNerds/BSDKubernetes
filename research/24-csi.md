@@ -66,6 +66,20 @@ e2e `[Driver: csi-hostpath]`, not Disruptive/Flaky/Feature/LinuxOnly/Serial/Slow
 
 The ephemeral tests check a volume's options with `mount | grep /mnt/test | grep rw,` (or `ro,`), Linux's format. They pass since the container's mount table describes volumes like Linux's (research/20, "The mount table in a container"): `zroot/ROOT/default on /mnt/test type zfs (rw,relatime)`.
 
+Beyond that set (2026-11-22):
+
+- `[Driver: csi-hostpath]` with `[Slow]` and `Feature:` tests too (not Serial/Disruptive/Flaky): **87/87**.
+- `[Driver: csi-hostpath]` Serial (`--procs=1`; 16 selected, 7 skip themselves): **9/9**, including the
+  300-PVC creation and deletion performance tests. One failed at first, `should provision storage with any
+  volume data source`: it deploys `hello-populator` and `volume-data-source-validator`, which upstream
+  publishes for Linux only. Both are plain Go and build for FreeBSD unmodified (lib-volume-populator
+  v1.0.1 `example/hello-populator`, volume-data-source-validator v1.0.0); the image script builds them
+  from `CSI_BINDIR`. The test then passes.
+- The first Serial attempt crashed the e2e binary: the PVC deletion test checks errors with
+  `framework.ExpectNoError` inside a goroutine without `GinkgoRecover`, so one failed PVC delete panics the
+  process instead of failing the test (an upstream test bug). The test passed alone and in the full Serial
+  rerun; the error that triggered the panic was lost with the process and didn't recur.
+
 ### The CSI mock driver
 
 `CSI Mock` e2e (not Disruptive/Flaky/Feature/LinuxOnly/Serial/Slow): **47/47** (2026-11-22). These tests

@@ -17,8 +17,12 @@ storage operations on behalf of node plugins in containers. This is the FreeBSD 
 ## The design
 
 - **`bsdk8s-mount-proxy`** (`components/mount-proxy`): a host daemon (rc.d `bsdk8s_mount_proxy`).
-  - It listens on `<kubelet root>/plugins/bsdk8s-mount-proxy.sock`, mode 0600, root only. CSI plugin
-    pods already mount the kubelet's `plugins/` directory, so no manifest changes are needed.
+  - It listens on `<kubelet root>/plugins/bsdk8s-mount-proxy.sock` and
+    `<kubelet root>/plugins/kubernetes.io/csi/bsdk8s-mount-proxy.sock`, mode 0600, root only. CSI node
+    plugins mount one or the other: some the whole `plugins/` directory (csi-driver-host-path), most only
+    the kubelet's staging directory `plugins/kubernetes.io/csi/` and their own `plugins/<driver>/` (the
+    e2e mock driver, and drivers such as EBS or GCE PD). So no manifest changes are needed. (The second
+    socket is since 2026-11-22; the kubelet never lists that directory, so the extra file is harmless.)
   - Requests are JSON, one per connection: `mount`, `unmount` and `list`.
   - It identifies the caller from `LOCAL_PEERCRED`: the peer's pid, then the pid's jail (`ps -o jid`)
     and the jail's root (`jls`).
@@ -61,6 +65,23 @@ e2e `[Driver: csi-hostpath]`, not Disruptive/Flaky/Feature/LinuxOnly/Serial/Slow
 | Block volumes (10) | **pass** since 2026-11-21: the kubelet's block path works on FreeBSD (research/20, "Block volumes"), and csi-driver-host-path 0002 makes the backing file with `truncate(2)`, attaches it to an `md(4)` disk (`mdconfig`, now in the driver's image) and publishes a symbolic link to the disk instead of bind-mounting it. Before: they failed at provisioning (`fallocate` + `losetup`). |
 
 The ephemeral tests check a volume's options with `mount | grep /mnt/test | grep rw,` (or `ro,`), Linux's format. They pass since the container's mount table describes volumes like Linux's (research/20, "The mount table in a container"): `zroot/ROOT/default on /mnt/test type zfs (rw,relatime)`.
+
+### The CSI mock driver
+
+`CSI Mock` e2e (not Disruptive/Flaky/Feature/LinuxOnly/Serial/Slow): **47/47** (2026-11-22). These tests
+deploy the hostpath plugin as a "mock" driver and check what the kubelet sends it: service account tokens,
+fsGroup policy, attach, volume limits, storage capacity, expansion and its recovery, the reclaim policy.
+Before, the one of them in the volume sweep failed (research/20), and two things were missing:
+
+- The mock pod mounts `plugins/kubernetes.io/csi/` and `plugins/csi-mock/`, not `plugins/`, so it didn't find
+  the proxy. Its `NodePublishVolume` then ran `mount_nullfs` itself, in its jail: `Operation not permitted`.
+  Fixed by the second socket (above; kubernetes 0048 in mount-utils, the hostpath plugin rebuilt with it).
+- The mock's proxy mode (expansion and recovery tests) runs the driver inside the e2e binary and runs
+  `test -d`/`mkdir` with `kubectl exec` in a `busybox` container of the plugin pod. Its manifest pins
+  `e2e-test-images/busybox:1.36.1-1`, older than the framework's 1.37.0-1, so there was no FreeBSD image of it.
+  It is BusyBox 1.36.1 now, built from the FreeBSD port as it was at that release (freebsd-ports
+  `17a8c6880db7`, `scripts/busybox-freebsd/port-1.36.1`), with the image script's `BUSYBOX_TAG=1.36.1-1`.
+  Retagging 1.37 would have been simpler, but tests compare BusyBox's messages, so the tag names what's in it.
 
 ### Snapshots
 

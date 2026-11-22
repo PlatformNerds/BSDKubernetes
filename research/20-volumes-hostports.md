@@ -195,7 +195,7 @@ Verified on both nodes:
 | ... `/rootfs/dev` | empty | empty (devfs skipped) |
 | delete a pod with a memory emptyDir while the hostPath `/` pod runs | | 1.5 s, all 6 of its mounts gone |
 | delete the hostPath `/` pod | | its 10 extra mounts gone (301 → 278 mounts) |
-| volume e2e (`HostPath\|Subpath\|EmptyDir\|Projected\|ConfigMap\|Secrets\|Downward API`, 79 tests) | | 78 pass; the failure is a CSI mock driver test (no FreeBSD CSI sidecar images) |
+| volume e2e (`HostPath\|Subpath\|EmptyDir\|Projected\|ConfigMap\|Secrets\|Downward API`, 79 tests) | | 78 pass; the failure is a CSI mock driver test (no FreeBSD CSI sidecar images then; it passes since, research/24) |
 
 Unit test: `server/submounts_freebsd_test.go` (6 cases).
 
@@ -385,7 +385,8 @@ Limits:
   FreeBSD (a stub). CRI-O 0030 parses them with the Linux syntax and unhides them the same way; the access mode
   (`rwm`) is accepted, but devfs has no per-container modes, so the node's own mode applies.
 - Volume e2e (`HostPath|Subpath|EmptyDir|Projected|ConfigMap|Secrets|Downward API`, 118 tests) on bsdk8s26 with
-  this CRI-O: 113 pass; the 5 failures are the CSI mock token test and the 4 below, as before.
+  this CRI-O: 113 pass; the 5 failures are the CSI mock token test and the 4 below, as before. (Since 2026-11-22 all pass:
+  the mock driver reaches the mount proxy, research/24, and the 4 are copies, below.)
 - The 4 HostPathType tests above still failed here: their device nodes are inert nodes on a ZFS or tmpfs, not
   devfs, so they were nullfs file mounts, which nullfs refuses. Fixed by ocijail 0019-0020 (next section).
 

@@ -17,6 +17,9 @@
 #                       scripts/busybox-freebsd/build.sh at the version the busybox tag names
 #                       (tests compare its messages; the FreeBSD package may be a newer
 #                       release). Without it the package is used, with a warning on a mismatch.
+#     BUSYBOX_TAG=<tag> build the busybox image under this tag instead of manifest.go's. Some
+#                       e2e manifests pin an older one: the CSI mock driver's csi-mock-proxy.yaml
+#                       runs busybox:1.36.1-1 (ONLY=busybox BUSYBOX=<1.36.1 build> BUSYBOX_TAG=1.36.1-1).
 #     SAMPLE_APISERVER=<binary>, ETCD=<binary>
 #                       FreeBSD builds for the aggregator test's sample-apiserver Deployment. Use
 #                       the sources upstream's images were built from: sample-apiserver tag 1.29.2
@@ -57,7 +60,7 @@
 #                       regression-issue-74839 volume-nfs nfs-provisioner csi pause)
 set -eu
 src=$(cd "$1" && pwd); agnhost=$2; nnp=${3:-}
-busybox=${BUSYBOX:-}; sampleapiserver=${SAMPLE_APISERVER:-}; etcd=${ETCD:-}
+busybox=${BUSYBOX:-}; busyboxtag=${BUSYBOX_TAG:-}; sampleapiserver=${SAMPLE_APISERVER:-}; etcd=${ETCD:-}
 coredns=${COREDNS:-}; regression74839=${REGRESSION_74839:-}; nfsprovisioner=${NFS_PROVISIONER:-}; unfsd=${UNFSD:-}; csibindir=${CSI_BINDIR:-}
 want() { [ -z "${ONLY:-}" ] && return 0; case " $ONLY " in *" $1 "*) return 0;; esac; return 1; }
 img=$src/test/images
@@ -204,9 +207,10 @@ fi
 # The tag names the BusyBox release (1.37.0-1 -> 1.37.0), and tests compare its messages: 1.38
 # prefixes `sh -c` errors with "line 0:", which upstream's 1.37.0 image doesn't.
 bbver=$(chroot "$m" /usr/local/bin/busybox | sed -n '1s/^BusyBox v\([0-9.]*\).*/\1/p')
-case "$(mtag BusyBox)" in
+bbtag=${busyboxtag:-$(mtag BusyBox)}
+case "$bbtag" in
   "$bbver"|"$bbver"-*) ;;
-  *) echo "WARNING: busybox image $(mtag BusyBox) contains BusyBox $bbver;" \
+  *) echo "WARNING: busybox image $bbtag contains BusyBox $bbver;" \
        "build the matching release with scripts/busybox-freebsd/build.sh and pass BUSYBOX=" ;;
 esac
 # Upstream's busybox image *is* busybox: make its applets win over FreeBSD's (tests compare e.g.
@@ -216,7 +220,7 @@ for a in $(chroot "$m" /usr/local/bin/busybox --list); do
 done
 bbfill
 buildah config --cmd sh "$c"
-commit "$reg/busybox:$(mtag BusyBox)"
+commit "$reg/busybox:$bbtag"
 echo "built busybox (BusyBox $bbver)"
 fi
 

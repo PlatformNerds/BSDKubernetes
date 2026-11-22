@@ -8,7 +8,8 @@
 # "/bin/sh: can't create ..." to "/bin/sh: line 0: can't create ...".
 #
 # port-<version>/ holds sysutils/busybox from freebsd-ports as of the last commit at that
-# version (1.37.0: dbd2ad70f2f4, "mark as PIE_UNSAFE"). Runs on FreeBSD; needs gmake and gsed.
+# version (1.37.0: dbd2ad70f2f4, "mark as PIE_UNSAFE"; 1.36.1: 17a8c6880db7, "Sanitize MANPREFIX",
+# for the CSI mock driver's pinned busybox:1.36.1-1). Runs on FreeBSD; needs gmake and gsed.
 #
 #   scripts/busybox-freebsd/build.sh 1.37.0 <outdir>     # -> <outdir>/busybox
 set -eu

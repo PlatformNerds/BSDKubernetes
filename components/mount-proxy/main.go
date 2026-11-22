@@ -20,34 +20,59 @@ import (
 )
 
 var (
-	socketPath  = flag.String("socket", "/var/db/kubelet/plugins/bsdk8s-mount-proxy.sock", "unix socket to listen on")
+	socketPaths = flag.String("socket", "", "comma-separated unix sockets to listen on (default: bsdk8s-mount-proxy.sock in the kubelet's plugins/ and plugins/kubernetes.io/csi/)")
 	kubeletRoot = flag.String("kubelet-root-dir", "/var/db/kubelet", "the kubelet's root directory: mount targets must be below its pods/ or plugins/")
 )
 
-func main() {
-	flag.Parse()
-	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	if err := os.MkdirAll(filepath.Dir(*socketPath), 0o750); err != nil {
+// defaultSockets are where CSI node plugins can reach the proxy. Some mount
+// the whole plugins/ directory (csi-driver-host-path); most mount only
+// plugins/kubernetes.io/csi/ (the kubelet's staging directory) and their own
+// plugins/<driver>/ (the e2e mock driver, EBS, GCE PD, ...).
+func defaultSockets(root string) []string {
+	return []string{
+		filepath.Join(root, "plugins", "bsdk8s-mount-proxy.sock"),
+		filepath.Join(root, "plugins", "kubernetes.io", "csi", "bsdk8s-mount-proxy.sock"),
+	}
+}
+
+func listen(path string) net.Listener {
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		log.Fatal(err)
 	}
-	_ = os.Remove(*socketPath)
-	l, err := net.Listen("unix", *socketPath)
+	_ = os.Remove(path)
+	l, err := net.Listen("unix", path)
 	if err != nil {
 		log.Fatal(err)
 	}
 	// root only: the CSI plugin containers run as root
-	if err := os.Chmod(*socketPath, 0o600); err != nil {
+	if err := os.Chmod(path, 0o600); err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("listening on %s, kubelet root %s", *socketPath, *kubeletRoot)
-	for {
-		c, err := l.Accept()
-		if err != nil {
-			log.Printf("accept: %v", err)
-			continue
-		}
-		go serve(c.(*net.UnixConn))
+	return l
+}
+
+func main() {
+	flag.Parse()
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	paths := defaultSockets(*kubeletRoot)
+	if *socketPaths != "" {
+		paths = strings.Split(*socketPaths, ",")
 	}
+	for _, p := range paths {
+		l := listen(p)
+		log.Printf("listening on %s, kubelet root %s", p, *kubeletRoot)
+		go func() {
+			for {
+				c, err := l.Accept()
+				if err != nil {
+					log.Printf("accept: %v", err)
+					continue
+				}
+				go serve(c.(*net.UnixConn))
+			}
+		}()
+	}
+	select {}
 }
 
 func serve(c *net.UnixConn) {

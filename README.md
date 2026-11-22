@@ -20,7 +20,7 @@ as **Linux containers** where the Linuxulator can handle them, and inside **bhyv
 | [research/04-linux-compat-bhyve.md](research/04-linux-compat-bhyve.md) | Linuxulator gap analysis; bhyve as a Kata-style microVM runtime |
 | [research/05-storage-security-controlplane.md](research/05-storage-security-controlplane.md) | ZFS snapshotters, CSI, security mapping, control plane, ecosystem |
 | [research/06-resource-limits.md](research/06-resource-limits.md) | **Implemented:** pod CPU/memory limits → rctl. Measured rctl semantics (`memoryuse:sigkill`, `pcpu` accuracy) |
-| [research/07-conformance.md](research/07-conformance.md) | **Conformance (2 nodes): 437/446 (98.0%)**; runs 4-14, sweeps beyond the conformance set (per SIG, NodeConformance, Serial, Slow, NFS), remaining gaps |
+| [research/07-conformance.md](research/07-conformance.md) | **Conformance (2 nodes): 437/446 (98.0%)**; runs 4-14, sweeps beyond the conformance set (per SIG, NodeConformance, Serial, Slow, NFS, DRA 88/92), remaining gaps |
 | [research/08-allow-pf.md](research/08-allow-pf.md) | **Kernel K14 `allow.pf` implemented:** kube-proxy runs as a normal pod (kernel + ocijail + CRI-O) |
 | [research/09-host-clusterip.md](research/09-host-clusterip.md) | Host-network clients and ClusterIPs on pf |
 | [research/10-linux-images.md](research/10-linux-images.md) | Linux container images on FreeBSD nodes via the Linuxulator |
@@ -37,7 +37,7 @@ as **Linux containers** where the Linuxulator can handle them, and inside **bhyv
 | [research/21-rmlock-epoch-deadlock.md](research/21-rmlock-epoch-deadlock.md) | Node freeze under pod churn: an rmlock lost wakeup (kernel fix) |
 | [research/22-networkpolicy.md](research/22-networkpolicy.md) | NetworkPolicy with pf (bsd-netpol) |
 | [research/23-sctp.md](research/23-sctp.md) | SCTP: Services, NetworkPolicy, HostPorts |
-| [research/24-csi.md](research/24-csi.md) | **CSI on FreeBSD:** a mount proxy (like Windows' csi-proxy) instead of mount propagation; csi-hostpath e2e 20/36 (filesystem volumes), snapshots 7/8 |
+| [research/24-csi.md](research/24-csi.md) | **CSI on FreeBSD:** a mount proxy (like Windows' csi-proxy) instead of mount propagation; csi-hostpath e2e 36/36 (filesystem and block volumes), snapshots 8/8, CSI Mock 47/47 |
 | [patches/README.md](patches/README.md) | **Every patch, per project** (kubernetes, CRI-O, ocijail, FreeBSD, CNI plugins, nfs-provisioner, unfs3) |
 | [research/UPSTREAM-PINS.md](research/UPSTREAM-PINS.md) | Exact upstream commits the research was done against |
 | [patches/kubernetes/v1.36.1/](patches/kubernetes/v1.36.1/) | Doug Rabson's FreeBSD patch series for kubelet, kube-proxy and kubeadm (Apache-2.0, credit: dfr), and ours on top (`bsdk8s/`) |

@@ -22,6 +22,7 @@ Raw results: [`conformance/`](../conformance/) (gzipped JUnit + failure lists).*
 | run 11 (2 nodes, node 2 froze, 1h suite timeout) | 414 / 426 run | | | 1h |
 | run 12 (2 nodes) | 435 / 446 | 97.5% | 394 / 400 = 98.5% | 56m |
 | **run 13 (2 nodes)** | **437 / 446** | **98.0%** | **394 / 400 = 98.5%** | 54m |
+| run 15 (2 nodes, regression check after block volumes, device nodes, CSI, DRA) | 437 / 446 | 98.0% | 394 / 400 = 98.5% | 53m |
 
 Run 2 fixed 34 tests and regressed none. Run 3 (after the kube-proxy session-affinity fix and ocijail file mounts below devfs) fixed 8 more, again with no regressions. The only remaining non-`[LinuxOnly]` failures are in-place pod resize (6) and the two-node requirement (2).
 
@@ -120,6 +121,10 @@ Excluding `[LinuxOnly]` the count is unchanged at 394/400; the two new passes ar
 
 **Run 14** (2026-11-20, `kernel.bsdk8s23`, after the hostPath-submount, socket-mount, NFS, kubelet-teardown and
 pf-state-option changes): **437/446**, the same 9 failures as run 13. No regressions.
+
+**Run 15** (2026-11-22, `kernel.bsdk8s26`, after block volumes, `allow.mknod` and device nodes, the CSI mount
+proxy, DRA and device-plugin allocation): **437/446**, the same 9 failures as runs 13 and 14. No regressions
+(`conformance/run15-*`).
 
 **`[NodeConformance]` beyond the conformance set** (94 tests: NodeConformance, not Conformance, not
 Serial/Slow/Disruptive): 87/94, then **91/94**. The 4 probe-while-terminating tests (2 for regular containers, 2 for
@@ -237,7 +242,8 @@ Not Conformance, Serial, Slow, Disruptive, Flaky, Feature or LinuxOnly:
     `base64` (bintrans(1)); without it every prepare failed.
   - 88/92; the 4 failures need `--runtime-config=resource.k8s.io/v1beta1=true,resource.k8s.io/v1beta2=true`,
     which upstream sets only in its DRA jobs. Nothing FreeBSD-specific there.
-  - NodeConformance afterwards: 172/172.
+  - NodeConformance afterwards (not Serial/Disruptive/Flaky/LinuxOnly, and also not Slow/Alpha/OffByDefault,
+    hence 172 rather than 182 tests): 172/172.
   - `Mount propagation` can't pass: FreeBSD has no shared subtrees (research/20).
 - **Host paths didn't show the file systems below them (fixed).** No test checks this; it came up while looking at
   mount propagation. With the default ZFS layout, hostPath `/var` showed an empty `/var/log`. CRI-O 0023 mounts the
@@ -299,7 +305,10 @@ node 2 during the run.
 
 Corrected for the outage, run 9 matches run 7: **425/446, no regressions.**
 
-### Open: node 2 froze during the garbage-collector test
+### Node 2 froze during the garbage-collector test (solved: research/21)
+
+The cause was found later: an rmlock lost wakeup in the kernel, fixed by freebsd-src 0032 (research/21). The
+notes below are from before that.
 
 What happened:
 - **02:16:4x UTC:** the GC test started about 100 nginx pods; node 2 created 78 vnet jails in a few seconds.

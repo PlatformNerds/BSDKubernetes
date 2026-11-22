@@ -225,7 +225,10 @@ Not Conformance, Serial, Slow, Disruptive, Flaky, Feature or LinuxOnly:
   - Kubernetes 0049 wires it in as on Linux: the DRA manager, its plugin registration handler, prepare/unprepare,
     claim CDI devices passed to the runtime, resource health updates. It also replaces the fake topology manager
     with the real one under the `none` policy. The fake one's admission never called the device manager's
-    `Allocate`, so a pod asking for a device-plugin resource got no devices (not covered by a non-Serial e2e test).
+    `Allocate`, so a pod asking for a device-plugin resource got no devices. Checked: the Serial test
+    "supports extended resources together with ResourceClaim" passes with a FreeBSD build of
+    `sample-device-plugin` (build-e2e-images-freebsd.sh `SAMPLE_DEVICE_PLUGIN`), and a pod requesting
+    `example.com/resource` gets the plugin's `/tmp/Dev-1` mount.
   - CRI-O 0032 injects CDI devices on FreeBSD (the stub ignored them). It applies the CDI spec's environment,
     mounts and hooks. Each device node must be a device on the host's devfs; it is unhidden in the container's
     devfs like the CRI `devices` field (CRI-O 0028-0031). Linux-only edits (network devices, Intel RDT) are refused.
@@ -234,6 +237,7 @@ Not Conformance, Serial, Slow, Disruptive, Flaky, Feature or LinuxOnly:
     `base64` (bintrans(1)); without it every prepare failed.
   - 88/92; the 4 failures need `--runtime-config=resource.k8s.io/v1beta1=true,resource.k8s.io/v1beta2=true`,
     which upstream sets only in its DRA jobs. Nothing FreeBSD-specific there.
+  - NodeConformance afterwards: 172/172.
   - `Mount propagation` can't pass: FreeBSD has no shared subtrees (research/20).
 - **Host paths didn't show the file systems below them (fixed).** No test checks this; it came up while looking at
   mount propagation. With the default ZFS layout, hostPath `/var` showed an empty `/var/log`. CRI-O 0023 mounts the

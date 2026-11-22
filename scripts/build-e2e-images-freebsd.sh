@@ -36,6 +36,10 @@
 #                       0036: reads TCP with bpf(4), as FreeBSD gives raw sockets no TCP; the
 #                       pod needs CAP_NET_RAW, which CRI-O maps to /dev/bpf); the conntrack
 #                       invalid-state test.
+#     SAMPLE_DEVICE_PLUGIN=<binary>
+#                       FreeBSD build of test/images/sample-device-plugin (plain Go); the DRA test
+#                       "supports extended resources together with ResourceClaim" (Serial) deploys it
+#                       to exercise device-plugin allocation.
 #     NFS_PROVISIONER=<binary>
 #                       FreeBSD build of the in-tree NFS driver's dynamic provisioner
 #                       (registry.k8s.io/sig-storage/nfs-provisioner): kubernetes-sigs/
@@ -57,11 +61,11 @@
 #   Also needs skopeo (agnhost's fake registry, from ghcr.io/platformnerds/pause:3.10.2).
 #     ONLY="<names>"    build only these images (agnhost kitten nautilus busybox nonroot
 #                       glibc-dns-testing nonewprivs nginx sample-apiserver etcd
-#                       regression-issue-74839 volume-nfs nfs-provisioner csi pause)
+#                       regression-issue-74839 volume-nfs nfs-provisioner csi sample-device-plugin pause)
 set -eu
 src=$(cd "$1" && pwd); agnhost=$2; nnp=${3:-}
 busybox=${BUSYBOX:-}; busyboxtag=${BUSYBOX_TAG:-}; sampleapiserver=${SAMPLE_APISERVER:-}; etcd=${ETCD:-}
-coredns=${COREDNS:-}; regression74839=${REGRESSION_74839:-}; nfsprovisioner=${NFS_PROVISIONER:-}; unfsd=${UNFSD:-}; csibindir=${CSI_BINDIR:-}
+coredns=${COREDNS:-}; regression74839=${REGRESSION_74839:-}; nfsprovisioner=${NFS_PROVISIONER:-}; unfsd=${UNFSD:-}; csibindir=${CSI_BINDIR:-}; sampledp=${SAMPLE_DEVICE_PLUGIN:-}
 want() { [ -z "${ONLY:-}" ] && return 0; case " $ONLY " in *" $1 "*) return 0;; esac; return 1; }
 img=$src/test/images
 reg=registry.k8s.io/e2e-test-images
@@ -299,6 +303,17 @@ if [ -n "$regression74839" ] && want regression-issue-74839; then
   buildah config --entrypoint '["/regression-issue-74839"]' --cmd '' "$c"
   commit "$reg/regression-issue-74839:$(mtag RegressionIssue74839)"
   echo "built regression-issue-74839"
+fi
+
+# --- sample-device-plugin: the e2e device plugin (tag from its DaemonSet manifest) ------------
+if [ -n "$sampledp" ] && want sample-device-plugin; then
+  sdpref=$(sed -n 's|^ *- image: \(registry.k8s.io/e2e-test-images/sample-device-plugin:.*\)$|\1|p' \
+    "$src/test/e2e/testing-manifests/sample-device-plugin/sample-device-plugin.yaml" | head -1)
+  new "$base"
+  install -m 755 "$sampledp" "$m/sampledeviceplugin"
+  buildah config --entrypoint '["/sampledeviceplugin", "-alsologtostderr"]' --cmd '' "$c"
+  commit "$sdpref"
+  echo "built $sdpref"
 fi
 
 # --- volume/nfs: test/images/volume/nfs (nfs-utils + run_nfs.sh) -----------------------------

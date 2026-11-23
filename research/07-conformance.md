@@ -130,6 +130,9 @@ proxy, DRA and device-plugin allocation): **437/446**, the same 9 failures as ru
 kube-proxy anchor monitor, `SupplementalGroupsPolicy` user conversion, CRI-O log reopening and microsecond CPU
 accounting): **437/446**, the same 9 failures as runs 13 to 15. No regressions (`conformance/run16-*`).
 
+**Run 17** (2026-11-23, `kernel.bsdk8s29`, the cluster converted to IPv4/IPv6 dual-stack, research/26, with kube-proxy
+serializing its pf loads, kubernetes 0065): **437/446**, the same 9 failures as runs 13 to 16 (`conformance/run17-*`).
+
 **`[NodeConformance]` beyond the conformance set** (94 tests: NodeConformance, not Conformance, not
 Serial/Slow/Disruptive): 87/94, then **91/94**. The 4 probe-while-terminating tests (2 for regular containers, 2 for
 sidecars) failed with `CreateContainerError: /bin/bash: No such file or directory`. They run `/bin/bash`, which

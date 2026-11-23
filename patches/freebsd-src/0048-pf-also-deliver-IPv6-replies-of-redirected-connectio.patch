@@ -1,0 +1,43 @@
+From d3520c51f88c3d7173990d72d9ad89be179c7542 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 15:05:03 -0700
+Subject: [PATCH] pf: also deliver IPv6 replies of redirected connections to
+ the host's own address
+
+The IPv4 change before this one exempted replies of a host's connection to
+one of its own addresses, redirected by an outbound rule to another host,
+from ip_input()'s source address validation. ip6_input() has the same
+check (net.inet6.ip6.source_address_validation) and dropped the IPv6
+replies the same way: a Kubernetes node reaching its own NodePort on an
+IPv6 address timed out on a dual-stack cluster. Mark them M_FASTFWD_OURS
+too.
+
+Tested on 15.1 arm64: curl from a node to its own IPv6 address and a
+NodePort redirected to a pod on the other node: succeeds (before: timed
+out; with the sysctl off it succeeded, confirming the cause).
+---
+ sys/netpfil/pf/pf.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/sys/netpfil/pf/pf.c b/sys/netpfil/pf/pf.c
+index a9182b491..a154c7061 100644
+--- a/sys/netpfil/pf/pf.c
++++ b/sys/netpfil/pf/pf.c
+@@ -11254,6 +11254,14 @@ pf_test(sa_family_t af, int dir, int pflags, struct ifnet *ifp, struct mbuf **m0
+ 	    in_localip(pd.src->v4) && in_localip(pd.dst->v4))
+ 		pd.m->m_flags |= M_FASTFWD_OURS;
+ #endif
++#ifdef INET6
++	/* The same for IPv6 (ip6_input()'s net.inet6.ip6.source_address_validation). */
++	if (dir == PF_IN && action == PF_PASS && af == AF_INET6 && s != NULL &&
++	    s->direction == PF_OUT &&
++	    s->key[PF_SK_WIRE] != s->key[PF_SK_STACK] &&
++	    in6_localip(&pd.src->v6) && in6_localip(&pd.dst->v6))
++		pd.m->m_flags |= M_FASTFWD_OURS;
++#endif
+ 
+ 	if (action == PF_PASS && r->divert.port && !PACKET_LOOPED(&pd)) {
+ 		mtag = m_tag_alloc(MTAG_PF_DIVERT, 0,
+-- 
+2.54.0 (Apple Git-157)
+

@@ -88,6 +88,9 @@ upstream CI; here it runs on node 1:
 | should only allow access from service loadbalancer source ranges | The allowed ranges are the accept pod's IP and its node's IP. That node is node 1, which is also where the "outside the cluster" client runs, so that client is allowed. |
 | should be able to change the type and ports of a UDP service | With the backend scaled to 0 the test wants the UDP port refused. pf rejects the node's own packet on output, so `write(2)` returns EPERM, which the test counts as reachable. Linux does the same for a sender on the node (a REJECT in OUTPUT makes `sendmsg` fail with EPERM); a sender outside gets the ICMP port unreachable and passes. |
 
+The control-plane node carries kubeadm's `node.kubernetes.io/exclude-from-external-load-balancers` label, so
+only node 2 ever announced: as intended.
+
 Not done: a client outside both nodes (QEMU's 192.168.100.0/24 has only the two VMs), IPv6 pools, BGP.
 Delivery of traffic that arrives from outside for an address node 2 announces was verified in research/19
 (an external IP and a LoadBalancer IP routed by hand to a node, nginx logging the real client).

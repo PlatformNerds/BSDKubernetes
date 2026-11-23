@@ -95,7 +95,9 @@ port change that pf won't do (kubernetes patch 0035). Otherwise that failure is 
 
 The intra-pod test is skipped unless e2e gets `--num-nodes=2` (it checks the flag, not the
 cluster). Upstream skips node → pod and node → Service for SCTP everywhere (`DialFromNode` has no
-SCTP, kubernetes#96482). The dual-stack variant needs an IPv6 cluster.
+SCTP, kubernetes#96482). The dual-stack variant passes on the dual-stack cluster (research/26), where the pod → ClusterIP and
+endpoint → ClusterIP checks fail instead: dual-stack pods are multi-homed SCTP endpoints, and a second path to
+the pod's real address bypasses the Service translation (research/26, a limit Kubernetes shares).
 
 One bug was found only by timing. The first version of the pf patch translated the port on every
 packet but the first. The SCTP case of `pf_translate_compat()` never asked for the header to be

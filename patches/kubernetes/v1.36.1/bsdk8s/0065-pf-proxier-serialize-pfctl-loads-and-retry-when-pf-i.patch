@@ -1,0 +1,277 @@
+From fe11030d4f75b6704817b6972a15d99b7c5e0a8b Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 16:13:42 -0700
+Subject: [PATCH] pf proxier: serialize pfctl loads and retry when pf is busy
+
+On a dual-stack node kube-proxy runs one pf proxier per IP family and
+both sync at the same time. Loading an anchor takes a ticket for pf's
+address pool buffer, of which there is one for the whole system, so
+concurrent loads invalidated each other: 'DIOCADDADDR: Device busy' /
+'DIOCADDRULE: Device busy', hundreds per hour, and the Service whose
+anchor failed kept stale rules (or none), because the failure was only
+logged.
+
+Run every pfctl command that changes pf through runPfctl: one at a time
+per process, retried a few times while pf reports the device busy
+(bsd-netpol and the CNI portmap plugin also load rules). When an anchor
+still fails to load, syncProxyRules returns an error so the runner
+retries the sync.
+---
+ pkg/proxy/pf/pfctl.go      |  61 +++++++++++++++++++++
+ pkg/proxy/pf/pfctl_test.go | 106 +++++++++++++++++++++++++++++++++++++
+ pkg/proxy/pf/proxier.go    |  15 +++---
+ pkg/proxy/pf/udpstates.go  |   2 +-
+ 4 files changed, 177 insertions(+), 7 deletions(-)
+ create mode 100644 pkg/proxy/pf/pfctl.go
+ create mode 100644 pkg/proxy/pf/pfctl_test.go
+
+diff --git a/pkg/proxy/pf/pfctl.go b/pkg/proxy/pf/pfctl.go
+new file mode 100644
+index 00000000000..1f98d074a10
+--- /dev/null
++++ b/pkg/proxy/pf/pfctl.go
+@@ -0,0 +1,61 @@
++/*
++Copyright 2026 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package pf
++
++import (
++	"bytes"
++	"sync"
++	"time"
++
++	utilexec "k8s.io/utils/exec"
++)
++
++// pfctlMu serializes the pfctl commands of this process that change pf.
++// Loading rules takes a ticket for pf's address pool buffer, and pf has one
++// such buffer for the whole system (DIOCBEGINADDRS): a second load started
++// meanwhile invalidates the first one's ticket, which then fails with
++// "DIOCADDADDR: Device busy" (or DIOCADDRULE). A dual-stack kube-proxy runs
++// one proxier per IP family, and they sync at the same time.
++var pfctlMu sync.Mutex
++
++// pfctlBusyRetries is how often runPfctl retries a command that failed
++// because another process (the families of this kube-proxy are serialized
++// above, but bsd-netpol and the CNI portmap plugin also load rules) was
++// loading rules at the same moment.
++const pfctlBusyRetries = 5
++
++// sleep is replaced in tests.
++var sleep = time.Sleep
++
++// runPfctl runs a pfctl command that changes pf, with stdin as its input
++// (nil for none): one at a time in this process, and retried while pf
++// reports the device busy.
++func runPfctl(execer utilexec.Interface, stdin []byte, args ...string) ([]byte, error) {
++	pfctlMu.Lock()
++	defer pfctlMu.Unlock()
++	for attempt := 0; ; attempt++ {
++		cmd := execer.Command("pfctl", args...)
++		if stdin != nil {
++			cmd.SetStdin(bytes.NewReader(stdin))
++		}
++		out, err := cmd.CombinedOutput()
++		if err == nil || !bytes.Contains(out, []byte("Device busy")) || attempt == pfctlBusyRetries {
++			return out, err
++		}
++		sleep(time.Duration(attempt+1) * 20 * time.Millisecond)
++	}
++}
+diff --git a/pkg/proxy/pf/pfctl_test.go b/pkg/proxy/pf/pfctl_test.go
+new file mode 100644
+index 00000000000..b717d088230
+--- /dev/null
++++ b/pkg/proxy/pf/pfctl_test.go
+@@ -0,0 +1,106 @@
++/*
++Copyright 2026 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package pf
++
++import (
++	"errors"
++	"io"
++	"testing"
++	"time"
++
++	"k8s.io/utils/exec"
++	fakeexec "k8s.io/utils/exec/testing"
++)
++
++// fakePfctl returns an exec whose pfctl commands give results in turn, and
++// records each command's stdin.
++func fakePfctl(results []error, outputs []string, stdins *[]string) *fakeexec.FakeExec {
++	fe := &fakeexec.FakeExec{}
++	for i := range results {
++		i := i
++		fcmd := &fakeexec.FakeCmd{
++			CombinedOutputScript: []fakeexec.FakeAction{
++				func() ([]byte, []byte, error) { return []byte(outputs[i]), nil, results[i] },
++			},
++		}
++		fe.CommandScript = append(fe.CommandScript, func(cmd string, args ...string) exec.Cmd {
++			c := fakeexec.InitFakeCmd(fcmd, cmd, args...)
++			return &stdinRecorder{Cmd: c, fcmd: fcmd, stdins: stdins}
++		})
++	}
++	return fe
++}
++
++type stdinRecorder struct {
++	exec.Cmd
++	fcmd   *fakeexec.FakeCmd
++	stdins *[]string
++}
++
++func (r *stdinRecorder) CombinedOutput() ([]byte, error) {
++	if r.fcmd.Stdin != nil {
++		b, _ := io.ReadAll(r.fcmd.Stdin)
++		*r.stdins = append(*r.stdins, string(b))
++	}
++	return r.Cmd.CombinedOutput()
++}
++
++func TestRunPfctl(t *testing.T) {
++	sleep = func(time.Duration) {}
++	defer func() { sleep = time.Sleep }()
++	fail := errors.New("exit status 1")
++	busy := "pfctl: DIOCADDADDR: Device busy\n"
++
++	for _, tc := range []struct {
++		name    string
++		results []error
++		outputs []string
++		calls   int
++		wantErr bool
++	}{
++		{"ok", []error{nil}, []string{""}, 1, false},
++		{"busy, then ok", []error{fail, fail, nil}, []string{busy, busy, ""}, 3, false},
++		{"other error: no retry", []error{fail}, []string{"pfctl: syntax error\n"}, 1, true},
++		{"busy every time: gives up", make([]error, pfctlBusyRetries+1), nil, pfctlBusyRetries + 1, true},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			if tc.outputs == nil {
++				for i := range tc.results {
++					tc.results[i] = fail
++					tc.outputs = append(tc.outputs, busy)
++				}
++			}
++			var stdins []string
++			fe := fakePfctl(tc.results, tc.outputs, &stdins)
++			_, err := runPfctl(fe, []byte("rules\n"), "-a", "cni-rdr/x", "-f", "-")
++			if (err != nil) != tc.wantErr {
++				t.Errorf("err = %v, want error %v", err, tc.wantErr)
++			}
++			if fe.CommandCalls != tc.calls {
++				t.Errorf("%d pfctl calls, want %d", fe.CommandCalls, tc.calls)
++			}
++			if len(stdins) != tc.calls {
++				t.Errorf("stdin seen %d times, want %d", len(stdins), tc.calls)
++			}
++			for i, s := range stdins {
++				if s != "rules\n" {
++					t.Errorf("call %d got stdin %q", i, s)
++				}
++			}
++		})
++	}
++}
+diff --git a/pkg/proxy/pf/proxier.go b/pkg/proxy/pf/proxier.go
+index 88c04eaa291..dddf74229fe 100644
+--- a/pkg/proxy/pf/proxier.go
++++ b/pkg/proxy/pf/proxier.go
+@@ -17,7 +17,6 @@ limitations under the License.
+ package pf
+ 
+ import (
+-	"bytes"
+ 	"context"
+ 	"crypto/sha256"
+ 	"encoding/base32"
+@@ -991,7 +990,7 @@ func (proxier *Proxier) hostRedirectRule(af, proto, source string, destinationIP
+ // "-F all": that would also flush the global state table and source nodes.
+ func flushAnchor(execer utilexec.Interface, anchor string) error {
+ 	for _, what := range []string{"nat", "rules"} {
+-		if out, err := execer.Command("pfctl", "-a", anchor, "-F", what).CombinedOutput(); err != nil {
++		if out, err := runPfctl(execer, nil, "-a", anchor, "-F", what); err != nil {
+ 			return fmt.Errorf("pfctl -a %s -F %s: %w: %s", anchor, what, err, out)
+ 		}
+ 	}
+@@ -1055,6 +1054,7 @@ func (proxier *Proxier) syncProxyRules() error {
+ 		}
+ 	}
+ 
++	loadFailures := 0
+ 	// TODO: figure out if partial sync makes sense. For now, just re-write all the rules
+ 	proxier.svcPortMap.Update(proxier.serviceChanges)
+ 	proxier.endpointsMap.Update(proxier.endpointsChanges)
+@@ -1181,11 +1181,9 @@ func (proxier *Proxier) syncProxyRules() error {
+ 			klog.Infof("EOF")
+ 		}
+ 		input := proxier.pfData.Bytes()
+-		cmd := proxier.exec.Command("pfctl", "-a", "cni-rdr/"+svcInfo.anchorName, "-f", "-")
+-		cmd.SetStdin(bytes.NewReader(input))
+-		output, err := cmd.CombinedOutput()
+-		if err != nil {
++		if output, err := runPfctl(proxier.exec, input, "-a", "cni-rdr/"+svcInfo.anchorName, "-f", "-"); err != nil {
+ 			klog.Errorf("error loading rules input: '%s', output: %s, err: %v", input, output, err)
++			loadFailures++
+ 		}
+ 	}
+ 	proxier.killStaleUDPStates(udpFronts)
+@@ -1217,6 +1215,11 @@ func (proxier *Proxier) syncProxyRules() error {
+ 	if err := proxier.serviceHealthServer.SyncEndpoints(proxier.endpointsMap.LocalReadyEndpoints()); err != nil {
+ 		proxier.logger.Error(err, "Error syncing healthcheck endpoints")
+ 	}
++	// A Service whose anchor failed to load keeps its old rules (or none)
++	// until the next sync: ask the runner to retry.
++	if loadFailures > 0 {
++		return fmt.Errorf("%d pf anchor(s) failed to load", loadFailures)
++	}
+ 	return nil
+ }
+ 
+diff --git a/pkg/proxy/pf/udpstates.go b/pkg/proxy/pf/udpstates.go
+index bcab39bb3fd..75d53f2b2de 100644
+--- a/pkg/proxy/pf/udpstates.go
++++ b/pkg/proxy/pf/udpstates.go
+@@ -117,7 +117,7 @@ func (proxier *Proxier) killStaleUDPStates(frontends udpFrontends) {
+ 	}
+ 	for _, s := range staleUDPStates(parseRdrStates(string(out)), frontends) {
+ 		proxier.logger.V(2).Info("Killing stale UDP state", "state", s.key(), "endpoint", s.endpoint)
+-		if out, err := proxier.exec.Command("pfctl", "-k", "key", "-k", s.key()).CombinedOutput(); err != nil {
++		if out, err := runPfctl(proxier.exec, nil, "-k", "key", "-k", s.key()); err != nil {
+ 			klog.ErrorS(err, "Failed to kill stale UDP state", "state", s.key(), "output", string(out))
+ 		}
+ 	}
+-- 
+2.54.0 (Apple Git-157)
+

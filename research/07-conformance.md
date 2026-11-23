@@ -126,6 +126,10 @@ pf-state-option changes): **437/446**, the same 9 failures as run 13. No regress
 proxy, DRA and device-plugin allocation): **437/446**, the same 9 failures as runs 13 and 14. No regressions
 (`conformance/run15-*`).
 
+**Run 16** (2026-11-23, `kernel.bsdk8s27`, after file-system growth, the orphaned-volume cleanup retry, the
+kube-proxy anchor monitor, `SupplementalGroupsPolicy` user conversion, CRI-O log reopening and microsecond CPU
+accounting): **437/446**, the same 9 failures as runs 13 to 15. No regressions (`conformance/run16-*`).
+
 **`[NodeConformance]` beyond the conformance set** (94 tests: NodeConformance, not Conformance, not
 Serial/Slow/Disruptive): 87/94, then **91/94**. The 4 probe-while-terminating tests (2 for regular containers, 2 for
 sidecars) failed with `CreateContainerError: /bin/bash: No such file or directory`. They run `/bin/bash`, which

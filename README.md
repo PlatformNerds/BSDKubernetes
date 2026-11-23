@@ -4,7 +4,7 @@
 (kubectl, Helm, controllers, operators, GitOps) works against them. Pods run as **jails** by default,
 as **Linux containers** where the Linuxulator can handle them, and inside **bhyve microVMs** where it can't.
 
-> Status (Nov 2026): a two-node FreeBSD-native cluster passes **437/446 Kubernetes conformance tests (98.0%)**; the 9 failures are 6 in-place resize tests that read Linux cgroups and 3 `[LinuxOnly]` tests (run 15, research/07). Experimental, not production software.
+> Status (Nov 2026): a two-node FreeBSD-native cluster passes **437/446 Kubernetes conformance tests (98.0%)**; the 9 failures are 6 in-place resize tests that read Linux cgroups and 3 `[LinuxOnly]` tests (run 16, research/07). Experimental, not production software.
 
 ## Start here
 
@@ -20,7 +20,7 @@ as **Linux containers** where the Linuxulator can handle them, and inside **bhyv
 | [research/04-linux-compat-bhyve.md](research/04-linux-compat-bhyve.md) | Linuxulator gap analysis; bhyve as a Kata-style microVM runtime |
 | [research/05-storage-security-controlplane.md](research/05-storage-security-controlplane.md) | ZFS snapshotters, CSI, security mapping, control plane, ecosystem |
 | [research/06-resource-limits.md](research/06-resource-limits.md) | **Implemented:** pod CPU/memory limits → rctl. Measured rctl semantics (`memoryuse:sigkill`, `pcpu` accuracy) |
-| [research/07-conformance.md](research/07-conformance.md) | **Conformance (2 nodes): 437/446 (98.0%)**; runs 4-15, sweeps beyond the conformance set (per SIG, NodeConformance, Serial, Slow, NFS, DRA 92/93), remaining gaps |
+| [research/07-conformance.md](research/07-conformance.md) | **Conformance (2 nodes): 437/446 (98.0%)**; runs 4-16, sweeps beyond the conformance set (per SIG, NodeConformance, Serial, Slow, NFS, DRA 92/93), remaining gaps |
 | [research/08-allow-pf.md](research/08-allow-pf.md) | **Kernel K14 `allow.pf` implemented:** kube-proxy runs as a normal pod (kernel + ocijail + CRI-O) |
 | [research/09-host-clusterip.md](research/09-host-clusterip.md) | Host-network clients and ClusterIPs on pf |
 | [research/10-linux-images.md](research/10-linux-images.md) | Linux container images on FreeBSD nodes via the Linuxulator |

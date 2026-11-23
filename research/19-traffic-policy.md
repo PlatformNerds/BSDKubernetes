@@ -176,6 +176,27 @@ Final regression run (`[sig-network] Services`, the traffic-policy tests and "vi
 Serial, Disruptive, Slow and IPv6DualStack skipped), kube-proxy 97890f0e74f on `kernel.bsdk8s16`: **48/48 passed**
 (`~/e2e-svc3` on node 1).
 
+## Rules restored after they are removed (patches 0057-0058)
+
+*2026-11-23.* The pf proxier rewrites its anchors when Services or EndpointSlices change, and otherwise only once
+per `FullSyncPeriod` (an hour). The 30 s `syncPeriod` is just the retry interval after a failed sync.
+- The iptables and nftables proxiers notice their rules being deleted with a canary chain monitor. The pf proxier
+  had nothing like it.
+- Test on node 2: emptying every `cni-rdr/kube-svc-*` anchor broke the `kubernetes` Service (10.96.0.1:443) on that
+  node. It had not recovered after 87 s, and only came back once the kube-proxy pod was restarted.
+- Patch 0057: after each sync the proxier records the Service anchors pf lists. Every `syncPeriod` it lists them
+  again (one `pfctl -a cni-rdr -s Anchors`); if one is gone, it forces a full sync. pf lists an anchor only while it
+  holds rules, so the baseline is what pf listed after the sync, and anchors that are legitimately empty don't
+  trigger a sync. The same patch also sets the proxier's `syncPeriod` field, which had never been set.
+- Patch 0058: each IP family's proxier watches only its own anchors (`kube-svc-v4-*` / `kube-svc-v6-*`).
+- The same test now recovers in 22 s, with all 19 anchors back (`"PF rules of Services were removed, resyncing"`).
+  node 1's anchors, emptied by hand, came back the same way.
+- The e2e test `[sig-network] Networking should recreate its iptables rules if they are deleted [Disruptive]`
+  (kubernetes 0059-0060, e2e only) empties the anchors on a FreeBSD node instead of deleting `KUBE-*` chains, and
+  passes. Use `-F nat` and `-F rules`, not `-F all`: on an anchor, `-F all` clears the rules, then fails with
+  `Operation not supported by device`. The kubelet sets up no firewall rules on FreeBSD, so the test's kubelet
+  check doesn't apply there.
+
 ## Not done
 
 - **Rebalancing**: after a drained node comes back, both Envoy replicas stay on the other node until the next

@@ -1,0 +1,33 @@
+From 3a1920299c3c47ec81be68b9555179a3612ebd3c Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 23:38:00 -0700
+Subject: [PATCH] e2e: flush a pf anchor's nat and filter rules, not "all"
+
+pfctl -a <anchor> -F all clears the rules, then fails with
+"Operation not supported by device" on what an anchor can't hold.
+---
+ test/e2e/network/networking.go | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/test/e2e/network/networking.go b/test/e2e/network/networking.go
+index 6551beb757c..f1f53b0924a 100644
+--- a/test/e2e/network/networking.go
++++ b/test/e2e/network/networking.go
+@@ -568,11 +568,12 @@ var _ = common.SIGDescribe("Networking", func() {
+ 
+ 		if sshHostIsFreeBSD(ctx, f.ClientSet, host) {
+ 			// kube-proxy's pf proxier keeps each Service's rules in an
+-			// anchor below cni-rdr; empty them all. The kubelet sets up no
++			// anchor below cni-rdr; empty them all ("-F all" also tries
++			// to flush what an anchor can't hold and fails). The kubelet sets up no
+ 			// firewall rules on FreeBSD, so there is nothing of its own to
+ 			// check.
+ 			ginkgo.By("flushing all kube-proxy pf anchors on node " + host)
+-			result, err := e2essh.SSH(ctx, `for a in $(sudo pfctl -a cni-rdr -s Anchors 2>/dev/null | grep kube-svc-); do sudo pfctl -a "$a" -F all; done`, host, framework.TestContext.Provider)
++			result, err := e2essh.SSH(ctx, `for a in $(sudo pfctl -a cni-rdr -s Anchors 2>/dev/null | grep kube-svc-); do sudo pfctl -a "$a" -F nat && sudo pfctl -a "$a" -F rules || exit 1; done`, host, framework.TestContext.Provider)
+ 			if err != nil || result.Code != 0 {
+ 				e2essh.LogResult(result)
+ 				framework.Failf("couldn't flush pf anchors: %v", err)
+-- 
+2.54.0 (Apple Git-157)
+

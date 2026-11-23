@@ -1,0 +1,32 @@
+From 53c9f25ca9b7af9085a07d4286c35cb8c6633196 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 11:19:14 -0700
+Subject: [PATCH] e2e: KubeProxyNFAcct test checks the proxy mode before
+ reading Linux /proc
+
+The test read /proc/sys/net/ipv4/conf/all/route_localnet before deciding
+whether it applies, so on a non-Linux node (or any node without that file)
+it failed instead of skipping.
+---
+ test/e2e/network/kube_proxy.go | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/test/e2e/network/kube_proxy.go b/test/e2e/network/kube_proxy.go
+index 58f05e924f1..d31c5c20a6c 100644
+--- a/test/e2e/network/kube_proxy.go
++++ b/test/e2e/network/kube_proxy.go
+@@ -307,6 +307,11 @@ var _ = common.SIGDescribe("KubeProxy", func() {
+ 			framework.Failf("failed to get proxy mode: err: %v; stdout: %s", stdout, err)
+ 		}
+ 		proxyMode := strings.TrimSpace(stdout)
++		// The metric only exists in iptables mode. Check the mode before
++		// reading route_localnet, which is a Linux /proc file.
++		if proxyMode != string(config.ProxyModeIPTables) {
++			e2eskipper.Skipf("test requires iptables proxy mode, not %q", proxyMode)
++		}
+ 
+ 		// get value of route_localnet
+ 		stdout, err = e2epodoutput.RunHostCmd(fr.Namespace.Name, hostExecPodName, "cat /proc/sys/net/ipv4/conf/all/route_localnet")
+-- 
+2.54.0 (Apple Git-157)
+

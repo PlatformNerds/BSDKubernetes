@@ -50,6 +50,10 @@
 #                       times; the package's unfsd reports whole seconds, so clients keep stale
 #                       data after a same-size rewrite within the second). Without it the
 #                       package is used, with a warning.
+#     RESOURCE_CONSUMER_BINDIR=<dir>
+#                       FreeBSD builds of test/images/resource-consumer (plain Go):
+#                       consumer (the server) and consume-cpu (its consume-cpu/ helper);
+#                       the HPA tests ([Feature:HPA]) run it. stress comes from the package.
 #     CSI_BINDIR=<dir>  FreeBSD builds of the csi-hostpath e2e driver's images, one binary per
 #                       image, named like the image (hostpathplugin, csi-provisioner,
 #                       csi-attacher, csi-resizer, csi-snapshotter, csi-snapshot-metadata,
@@ -63,11 +67,12 @@
 #   Also needs skopeo (agnhost's fake registry, from ghcr.io/platformnerds/pause:3.10.2).
 #     ONLY="<names>"    build only these images (agnhost kitten nautilus busybox nonroot
 #                       glibc-dns-testing nonewprivs nginx sample-apiserver etcd
-#                       regression-issue-74839 volume-nfs nfs-provisioner csi sample-device-plugin pause)
+#                       regression-issue-74839 volume-nfs nfs-provisioner csi sample-device-plugin
+#                       resource-consumer pause)
 set -eu
 src=$(cd "$1" && pwd); agnhost=$2; nnp=${3:-}
 busybox=${BUSYBOX:-}; busyboxtag=${BUSYBOX_TAG:-}; sampleapiserver=${SAMPLE_APISERVER:-}; etcd=${ETCD:-}
-coredns=${COREDNS:-}; regression74839=${REGRESSION_74839:-}; nfsprovisioner=${NFS_PROVISIONER:-}; unfsd=${UNFSD:-}; csibindir=${CSI_BINDIR:-}; sampledp=${SAMPLE_DEVICE_PLUGIN:-}
+coredns=${COREDNS:-}; rcbindir=${RESOURCE_CONSUMER_BINDIR:-}; regression74839=${REGRESSION_74839:-}; nfsprovisioner=${NFS_PROVISIONER:-}; unfsd=${UNFSD:-}; csibindir=${CSI_BINDIR:-}; sampledp=${SAMPLE_DEVICE_PLUGIN:-}
 want() { [ -z "${ONLY:-}" ] && return 0; case " $ONLY " in *" $1 "*) return 0;; esac; return 1; }
 img=$src/test/images
 reg=registry.k8s.io/e2e-test-images
@@ -236,6 +241,23 @@ new "$reg/busybox:$(mtag BusyBox)"
 buildah config --user 1234 "$c"
 commit "$reg/nonroot:$(mtag NonRoot)"
 echo "built nonroot"
+fi
+
+# --- resource-consumer: test/images/resource-consumer/Dockerfile (base + stress + /consumer,
+# /consume-cpu/consume-cpu; the server runs "./consume-cpu/consume-cpu" and "stress") --------
+if want resource-consumer; then
+if [ -x "$rcbindir/consumer" ] && [ -x "$rcbindir/consume-cpu" ]; then
+  new "$base"
+  pkgs stress
+  install -m 755 "$rcbindir/consumer" "$m/consumer"
+  mkdir -p "$m/consume-cpu"
+  install -m 755 "$rcbindir/consume-cpu" "$m/consume-cpu/consume-cpu"
+  buildah config --workingdir / --port 8080 --entrypoint '["/consumer"]' --cmd '[]' "$c"
+  commit "$reg/resource-consumer:$(mtag ResourceConsumer)"
+  echo "built resource-consumer"
+else
+  echo "WARNING: no RESOURCE_CONSUMER_BINDIR with consumer and consume-cpu; skipping resource-consumer"
+fi
 fi
 
 # --- glibc-dns-testing (formerly jessie-dnsutils): dig/host/nslookup + getent + nc ----------

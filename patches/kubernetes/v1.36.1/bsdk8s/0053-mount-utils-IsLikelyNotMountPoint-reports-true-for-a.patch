@@ -1,0 +1,61 @@
+From 78ad86758a9c6a4c3cc8fa31a4a076660731cd7f Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 18:52:33 -0700
+Subject: [PATCH] mount-utils: IsLikelyNotMountPoint reports true for a missing
+ path on FreeBSD
+
+On Linux IsLikelyNotMountPoint returns (true, err) when the path can't
+be checked, a missing path included. The FreeBSD version returned
+(false, err). The CSI plugin's isDirMounted accepts os.IsNotExist and
+returns !notMnt, so after NodeUnpublishVolume removed the target
+directory, removeMountDir saw it as mounted and silently kept
+vol_data.json and the volume directory. Every CSI pod volume leaked its
+directory (and so its pod directory); after a kubelet restart the
+volumes were reconstructed and TearDown was retried forever once the
+driver was gone ("driver name ... not found in the list of registered
+CSI drivers").
+---
+ staging/src/k8s.io/mount-utils/mount_freebsd.go      | 6 +++++-
+ staging/src/k8s.io/mount-utils/mount_freebsd_test.go | 6 ++++++
+ 2 files changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/staging/src/k8s.io/mount-utils/mount_freebsd.go b/staging/src/k8s.io/mount-utils/mount_freebsd.go
+index 69975177a67..af03c7933ce 100644
+--- a/staging/src/k8s.io/mount-utils/mount_freebsd.go
++++ b/staging/src/k8s.io/mount-utils/mount_freebsd.go
+@@ -120,10 +120,14 @@ func (mounter *Mounter) List() ([]MountPoint, error) {
+ 	return res, nil
+ }
+ 
++// IsLikelyNotMountPoint reports true with the error when file can't be
++// checked, a missing path included, as Linux does: callers such as the CSI
++// plugin's isDirMounted accept os.IsNotExist and use the boolean, and false
++// there meant "mounted", so the volume directory was never removed.
+ func (mounter *Mounter) IsLikelyNotMountPoint(file string) (bool, error) {
+ 	isMountPoint, err := mounter.IsMountPoint(file)
+ 	if err != nil {
+-		return false, err
++		return true, err
+ 	}
+ 	return !isMountPoint, nil
+ }
+diff --git a/staging/src/k8s.io/mount-utils/mount_freebsd_test.go b/staging/src/k8s.io/mount-utils/mount_freebsd_test.go
+index 05b0fda7ef0..c623ce7d553 100644
+--- a/staging/src/k8s.io/mount-utils/mount_freebsd_test.go
++++ b/staging/src/k8s.io/mount-utils/mount_freebsd_test.go
+@@ -84,6 +84,12 @@ func TestIsMountPointFromMountTable(t *testing.T) {
+ 	if _, err := m.IsMountPoint(missing); !os.IsNotExist(err) {
+ 		t.Errorf("IsMountPoint(%s) error = %v; want not exist", missing, err)
+ 	}
++	if notMnt, err := m.IsLikelyNotMountPoint(missing); !notMnt || !os.IsNotExist(err) {
++		t.Errorf("IsLikelyNotMountPoint(%s) = %v, %v; want true, not exist", missing, notMnt, err)
++	}
++	if notMnt, err := m.IsLikelyNotMountPoint("/"); notMnt || err != nil {
++		t.Errorf("IsLikelyNotMountPoint(/) = %v, %v; want false", notMnt, err)
++	}
+ 	if fstype, ok := mountTypeWithoutStat("/"); !ok || fstype == "" {
+ 		t.Errorf("mountTypeWithoutStat(/) = %q, %v", fstype, ok)
+ 	}
+-- 
+2.54.0 (Apple Git-157)
+

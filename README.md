@@ -33,7 +33,7 @@ as **Linux containers** where the Linuxulator can handle them, and inside **bhyv
 | [research/17-pod-os-field.md](research/17-pod-os-field.md) | Pods with `spec.os.name: linux` on FreeBSD nodes; in-place resize |
 | [research/18-proc-pid1-fd.md](research/18-proc-pid1-fd.md) | `/proc/1` and `/proc/<pid>/fd` for Linux containers |
 | [research/19-traffic-policy.md](research/19-traffic-policy.md) | Service traffic policies in the pf kube-proxy |
-| [research/20-volumes-hostports.md](research/20-volumes-hostports.md) | Volumes (fsGroup, hostPath submounts and sockets, NFS servers and dynamic NFS, block volumes, device nodes, the subPath escape fix), host ports |
+| [research/20-volumes-hostports.md](research/20-volumes-hostports.md) | Volumes (fsGroup, hostPath submounts and sockets, NFS servers and dynamic NFS, block volumes, growing file systems, device nodes, the subPath escape fix, leaked CSI volume directories, node log rotation), host ports |
 | [research/21-rmlock-epoch-deadlock.md](research/21-rmlock-epoch-deadlock.md) | Node freeze under pod churn: an rmlock lost wakeup (kernel fix) |
 | [research/22-networkpolicy.md](research/22-networkpolicy.md) | NetworkPolicy with pf (bsd-netpol) |
 | [research/23-sctp.md](research/23-sctp.md) | SCTP: Services, NetworkPolicy, HostPorts |

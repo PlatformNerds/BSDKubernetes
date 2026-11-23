@@ -471,6 +471,72 @@ Limits:
 - CSI block volumes work too, with csi-driver-host-path 0002 (`mdconfig` in the driver, publish as a link; csi-hostpath
   36/36, research/24). kubernetes 0047 (e2e only) makes the ephemeral block check expect a character device.
 
+## Growing file systems (kubernetes 0051-0052)
+
+*2026-11-23.* FreeBSD built mount-utils' `resizefs_unsupported.go`, so every expansion the kubelet does itself
+failed with `Resize is not supported for this build`. That covers a local PV of a disk, and any in-tree volume the
+kubelet formats. CSI drivers grow their own file systems in NodeExpandVolume, so csi-hostpath expansion already worked.
+
+kubernetes 0051 adds `resizefs_freebsd.go`:
+- **UFS:** grown with `growfs -y`, which works while the file system is mounted.
+- **ext2/3/4:** grown with `resize2fs` (e2fsprogs).
+- **NeedResize:** compares the media size from `diskinfo` with the UFS size from `dumpfs` (`size` fragments × `fsize`).
+  It skips read-only mounts.
+
+Checked by hand:
+- A local PV of `/dev/md77` with `fsType: ufs`, formatted by the kubelet, grew online from 63 MB to 126 MB.
+- The kubelet logged `MountVolume.NodeExpandVolume succeeded`.
+- The pod then wrote 90 MB, and its earlier file was intact. `fsck_ufs` was clean afterwards.
+
+Limit: **ext file systems grow only while unmounted.** FreeBSD's ext2fs has no online resize, so `resize2fs` on a
+mounted ext4 volume fails opening the device (`Operation not permitted`). The kubelet reports that error. Use UFS
+(`fsType: ufs`) for volumes that must grow online.
+
+The e2e `PersistentVolumes-expansion loopback local block volume` test (kubernetes 0052, e2e only):
+- It ran the Linux `dd oflag=append` and `losetup -c`. That loopback file system is mounted on the directory that
+  holds its backing file, so `loopDir/file` names a file *inside* the mounted file system. Upstream's `dd` appends to
+  that inner file, and the test passes without growing anything.
+- On FreeBSD it now grows the `md(4)` device itself (`mdconfig -r`, from its `diskinfo` size). A vnode md may be
+  larger than its backing file, which grows as the new blocks are written.
+- Its AfterEach unmounted the volume while the test pod still ran. On FreeBSD the container's nullfs mount keeps it
+  busy (`Device busy` for three minutes), so the pod is now deleted first.
+- The test passes. Its PV is the mounted directory, for which the kubelet's NodeExpand is a no-op, so it doesn't
+  exercise `growfs`: the hand check above does.
+
+Along the way: mount-utils' `TestSafeFormatAndMount` expected the Linux `fsck -a` and `mkfs.xfs -f`. On FreeBSD it
+panicked and stopped the package's tests; the FreeBSD commands are now mapped, and every mount-utils test passes on
+FreeBSD.
+
+## CSI volume directories leaked (kubernetes 0053)
+
+*2026-11-23.* Every CSI pod volume on FreeBSD left its directory behind:
+`pods/<uid>/volumes/kubernetes.io~csi/<pv>/vol_data.json`, which kept the pod directory too. The nodes had 378
+and 372 of them.
+
+- **Why:** mount-utils' `IsLikelyNotMountPoint` returned `(false, ENOENT)` for a missing path on FreeBSD, where Linux
+  returns `(true, ENOENT)`. After NodeUnpublishVolume removes the target directory, the CSI plugin's `isDirMounted`
+  accepts `ENOENT` and uses the boolean, so `removeMountDir` took the volume for mounted and silently kept its files.
+  TearDown still reported success.
+- **How it showed up:** after a kubelet restart, the kubelet rebuilds these volumes from disk. Once the test's CSI
+  driver was gone, it retried TearDown every two minutes, for good (`driver name ... not found in the list of
+  registered CSI drivers`: 144,000 log lines on one node).
+- **Fix:** kubernetes 0053 returns `true` with the error, as Linux does, and a unit test covers it.
+- **Cleanup:** the stale directories (nothing mounted, pod gone) were removed with the kubelet stopped. After
+  csi-hostpath tests on the new kubelet, no CSI volume directory remains, and the kubelet's orphan cleanup took the
+  pod directories from 391 to 20 and from 359 to 3.
+
+## Node logs are rotated (CRI-O 0033)
+
+*2026-11-23.* Nothing rotated `/var/log/kubelet.log` or `/var/log/crio.log`. After eight days they had reached 535
+and 577 MB (kubelet) and 105 and 162 MB (CRI-O).
+
+- **kubelet:** its rc script already runs it under `daemon(8) -o ... -H`, which reopens the file on SIGHUP.
+- **CRI-O:** it opened its `--log` file once. CRI-O 0033 also reopens the file on SIGHUP; SIGHUP still reloads the
+  configuration too.
+- **Rotation:** `/usr/local/etc/newsyslog.conf.d/kubernetes.conf` (demo `build-cluster.sh` 2e08622) rotates both at
+  100 MB and keeps 7 bzip2 copies. It signals the `daemon(8)` supervisor for the kubelet and crio itself.
+- Both nodes rotated without a restart, and the pods kept running.
+
 ## NFS: client, server pods, recycler (freebsd-src 0036, CRI-O a90bf43d4)
 
 *2026-11-19.* Kubelet's NFS client already worked: `mount_nfs` from the host, then nullfs into the container.

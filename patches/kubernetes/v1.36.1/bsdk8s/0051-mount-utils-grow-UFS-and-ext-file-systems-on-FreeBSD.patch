@@ -1,0 +1,337 @@
+From 32c19029f71567279e8f3ca78fc9f01beb6f1be8 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 18:46:25 -0700
+Subject: [PATCH 51/52] mount-utils: grow UFS and ext file systems on FreeBSD
+
+FreeBSD built resizefs_unsupported.go, so every in-tree file system
+expansion (local PVs on a raw block device, NodeExpand for volumes the
+kubelet formats) failed with "Resize is not supported for this build".
+
+resizefs_freebsd.go grows UFS with growfs(8), which works while the file
+system is mounted, and ext2/3/4 with resize2fs from e2fsprogs. FreeBSD
+has no online ext resize: resize2fs on a mounted ext volume fails with
+EPERM opening the device, and that error is returned. NeedResize
+compares diskinfo(8)'s media size with the UFS size from dumpfs(8)
+(size fragments * fsize) and skips read-only mounts (statfs MNT_RDONLY).
+
+TestSafeFormatAndMount expected the Linux fsck -a and mkfs.xfs -f; on
+FreeBSD the formatter runs e2fsck -p and mkfs.xfs, so the expected
+commands are mapped (the test panicked and aborted the package's tests).
+Also gofmt mount_freebsd.go.
+---
+ .../src/k8s.io/mount-utils/mount_freebsd.go   |   1 -
+ .../k8s.io/mount-utils/resizefs_freebsd.go    | 181 ++++++++++++++++++
+ .../mount-utils/resizefs_freebsd_test.go      |  55 ++++++
+ .../mount-utils/resizefs_unsupported.go       |   2 +-
+ .../mount-utils/safe_format_and_mount_test.go |  16 ++
+ 5 files changed, 253 insertions(+), 2 deletions(-)
+ create mode 100644 staging/src/k8s.io/mount-utils/resizefs_freebsd.go
+ create mode 100644 staging/src/k8s.io/mount-utils/resizefs_freebsd_test.go
+
+diff --git a/staging/src/k8s.io/mount-utils/mount_freebsd.go b/staging/src/k8s.io/mount-utils/mount_freebsd.go
+index 037301b37a5..69975177a67 100644
+--- a/staging/src/k8s.io/mount-utils/mount_freebsd.go
++++ b/staging/src/k8s.io/mount-utils/mount_freebsd.go
+@@ -281,7 +281,6 @@ func nullfsMountRefs(path string, mps []MountPoint) []string {
+ 	return refs
+ }
+ 
+-
+ // SafeFormatAndMount has no IsMountPoint of its own (as on Linux): the embedded
+ // Interface's applies. A stub here that always failed used to shadow it.
+ 
+diff --git a/staging/src/k8s.io/mount-utils/resizefs_freebsd.go b/staging/src/k8s.io/mount-utils/resizefs_freebsd.go
+new file mode 100644
+index 00000000000..f57291ea7bc
+--- /dev/null
++++ b/staging/src/k8s.io/mount-utils/resizefs_freebsd.go
+@@ -0,0 +1,181 @@
++//go:build freebsd
++
++/*
++Copyright 2026 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package mount
++
++import (
++	"fmt"
++	"strconv"
++	"strings"
++
++	"golang.org/x/sys/unix"
++	"k8s.io/klog/v2"
++	utilexec "k8s.io/utils/exec"
++)
++
++// Growing file systems on FreeBSD. UFS grows while mounted (growfs(8)).
++// ext2/3/4 are grown with resize2fs from e2fsprogs, but FreeBSD has no
++// online ext resize: resize2fs only works while the file system is not
++// mounted, so an online expansion of an ext volume fails with resize2fs's
++// error.
++
++// ResizeFs Provides support for resizing file systems
++type ResizeFs struct {
++	exec utilexec.Interface
++}
++
++// NewResizeFs returns new instance of resizer
++func NewResizeFs(exec utilexec.Interface) *ResizeFs {
++	return &ResizeFs{exec: exec}
++}
++
++func (resizefs *ResizeFs) diskFormat(devicePath string) (string, error) {
++	m := &SafeFormatAndMount{Exec: resizefs.exec}
++	return m.GetDiskFormat(devicePath)
++}
++
++// Resize perform resize of file system
++func (resizefs *ResizeFs) Resize(devicePath string, deviceMountPath string) (bool, error) {
++	format, err := resizefs.diskFormat(devicePath)
++	if err != nil {
++		return false, fmt.Errorf("ResizeFS.Resize - error checking format for device %s: %v", devicePath, err)
++	}
++	// If disk has no format, there is no need to resize the disk because
++	// the formatter by default will use the whole disk anyways.
++	if format == "" {
++		return false, nil
++	}
++
++	klog.V(3).Infof("ResizeFS.Resize - Expanding mounted volume %s", devicePath)
++	switch format {
++	case "ufs":
++		return resizefs.run(devicePath, "growfs", "-y", devicePath)
++	case "ext2", "ext3", "ext4":
++		return resizefs.run(devicePath, "resize2fs", devicePath)
++	}
++	return false, fmt.Errorf("ResizeFS.Resize - resize of format %s is not supported for device %s mounted at %s", format, devicePath, deviceMountPath)
++}
++
++func (resizefs *ResizeFs) run(devicePath, cmd string, args ...string) (bool, error) {
++	output, err := resizefs.exec.Command(cmd, args...).CombinedOutput()
++	if err != nil {
++		return false, fmt.Errorf("resize of device %s failed: %v. %s output: %s", devicePath, err, cmd, string(output))
++	}
++	klog.V(2).Infof("Device %s resized successfully", devicePath)
++	return true, nil
++}
++
++// NeedResize check whether mounted volume needs resize
++func (resizefs *ResizeFs) NeedResize(devicePath string, deviceMountPath string) (bool, error) {
++	// Do nothing if the file system is mounted read-only.
++	if deviceMountPath != "" {
++		var st unix.Statfs_t
++		if err := unix.Statfs(deviceMountPath, &st); err == nil && st.Flags&unix.MNT_RDONLY != 0 {
++			klog.V(3).Infof("ResizeFs.needResize - no resize possible since filesystem %s is readonly", devicePath)
++			return false, nil
++		}
++	}
++
++	format, err := resizefs.diskFormat(devicePath)
++	if err != nil {
++		return false, fmt.Errorf("ResizeFS.Resize - error checking format for device %s: %v", devicePath, err)
++	}
++	if format == "" {
++		return false, nil
++	}
++
++	switch format {
++	case "ext2", "ext3", "ext4":
++		// As on Linux, let resize2fs do the check.
++		return true, nil
++	case "ufs":
++		deviceSize, err := resizefs.getDeviceSize(devicePath)
++		if err != nil {
++			return false, err
++		}
++		blockSize, fsSize, err := resizefs.getUFSSize(devicePath)
++		klog.V(5).Infof("UFS size: filesystem size=%d, block size=%d, err=%v", fsSize, blockSize, err)
++		if err != nil {
++			return false, err
++		}
++		if deviceSize <= fsSize+blockSize {
++			return false, nil
++		}
++		return true, nil
++	default:
++		return false, fmt.Errorf("could not parse fs info of given filesystem format: %s. Supported fs types are: ufs, ext2, ext3, ext4", format)
++	}
++}
++
++// getDeviceSize returns the media size in bytes from diskinfo(8), whose
++// third field is the media size.
++func (resizefs *ResizeFs) getDeviceSize(devicePath string) (uint64, error) {
++	output, err := resizefs.exec.Command("diskinfo", devicePath).CombinedOutput()
++	outStr := strings.TrimSpace(string(output))
++	if err != nil {
++		return 0, fmt.Errorf("failed to read size of device %s: %s: %s", devicePath, err, outStr)
++	}
++	fields := strings.Fields(outStr)
++	if len(fields) < 3 {
++		return 0, fmt.Errorf("failed to parse size of device %s: %q", devicePath, outStr)
++	}
++	size, err := strconv.ParseUint(fields[2], 10, 64)
++	if err != nil {
++		return 0, fmt.Errorf("failed to parse size of device %s %s: %s", devicePath, outStr, err)
++	}
++	return size, nil
++}
++
++// getUFSSize returns the block size and the size in bytes of the UFS file
++// system on devicePath, from the superblock dumpfs(8) prints.
++func (resizefs *ResizeFs) getUFSSize(devicePath string) (uint64, uint64, error) {
++	output, err := resizefs.exec.Command("dumpfs", devicePath).CombinedOutput()
++	if err != nil {
++		return 0, 0, fmt.Errorf("failed to read size of filesystem on %s: %s: %s", devicePath, err, string(output))
++	}
++	return parseDumpfsSize(string(output))
++}
++
++// parseDumpfsSize reads "bsize", "fsize" and the file system "size" (in
++// fragments) from dumpfs output. These are key/value pairs on the header
++// lines, e.g. "ncg 4 size 16384 blocks 15751".
++func parseDumpfsSize(out string) (uint64, uint64, error) {
++	vals := map[string]uint64{}
++	for _, line := range strings.Split(out, "\n") {
++		if strings.HasPrefix(line, "cs[") || strings.HasPrefix(line, "cg ") {
++			break // per-cylinder-group details follow the superblock
++		}
++		f := strings.Fields(line)
++		for i := 0; i+1 < len(f); i++ {
++			switch f[i] {
++			case "bsize", "fsize", "size":
++				if _, seen := vals[f[i]]; seen {
++					continue
++				}
++				if v, err := strconv.ParseUint(f[i+1], 10, 64); err == nil {
++					vals[f[i]] = v
++				}
++			}
++		}
++	}
++	bsize, fsize, size := vals["bsize"], vals["fsize"], vals["size"]
++	if bsize == 0 || fsize == 0 || size == 0 {
++		return 0, 0, fmt.Errorf("could not find bsize/fsize/size in dumpfs output")
++	}
++	return bsize, size * fsize, nil
++}
+diff --git a/staging/src/k8s.io/mount-utils/resizefs_freebsd_test.go b/staging/src/k8s.io/mount-utils/resizefs_freebsd_test.go
+new file mode 100644
+index 00000000000..1148b19ce12
+--- /dev/null
++++ b/staging/src/k8s.io/mount-utils/resizefs_freebsd_test.go
+@@ -0,0 +1,55 @@
++//go:build freebsd
++
++/*
++Copyright 2026 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package mount
++
++import "testing"
++
++// Header of dumpfs(8) on a 64 MiB UFS2 file system made by newfs -U.
++const dumpfs64M = `magic	19540119 (UFS2)
++last mounted time	Mon Nov 23 01:39:28 2026
++last modified time	Mon Nov 23 01:39:28 2026
++superblock location	65536	id	[ 6b039950 fd87530d ]
++ncg	4	size	16384	blocks	15751
++bsize	32768	shift	15	mask	0xffff8000
++fsize	4096	shift	12	mask	0xfffff000
++frag	8	shift	3	fsbtodb	3
++minfree	8%	optim	time	symlinklen 120
++maxbsize 32768	maxbpg	4096	maxcontig 32	contigsumsize 16
++nbfree	1966	ndir	2	nifree	8700	nffree	21
++bpg	513	fpg	4104	ipg	2176	unrefs	0
++cs[].cs_(nbfree,ndir,nifree,nffree):
++	(498,2,2172,13) (500,0,2176,8)
++
++cg 0:
++magic	90255	tell	10000	time	Mon Nov 23 01:39:28 2026
++cgx	0	ndblk	4104	niblk	2176	initiblk 2176	unrefs 0
++`
++
++func TestParseDumpfsSize(t *testing.T) {
++	bsize, size, err := parseDumpfsSize(dumpfs64M)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if bsize != 32768 || size != 64<<20 {
++		t.Errorf("got bsize %d size %d, want 32768 %d", bsize, size, 64<<20)
++	}
++	if _, _, err := parseDumpfsSize("magic 19540119 (UFS2)\n"); err == nil {
++		t.Error("expected an error for output without sizes")
++	}
++}
+diff --git a/staging/src/k8s.io/mount-utils/resizefs_unsupported.go b/staging/src/k8s.io/mount-utils/resizefs_unsupported.go
+index 813e4a3eb55..ca9d0a6191b 100644
+--- a/staging/src/k8s.io/mount-utils/resizefs_unsupported.go
++++ b/staging/src/k8s.io/mount-utils/resizefs_unsupported.go
+@@ -1,4 +1,4 @@
+-//go:build !linux
++//go:build !linux && !freebsd
+ 
+ /*
+ Copyright 2021 The Kubernetes Authors.
+diff --git a/staging/src/k8s.io/mount-utils/safe_format_and_mount_test.go b/staging/src/k8s.io/mount-utils/safe_format_and_mount_test.go
+index 07279554a4f..376e46634b9 100644
+--- a/staging/src/k8s.io/mount-utils/safe_format_and_mount_test.go
++++ b/staging/src/k8s.io/mount-utils/safe_format_and_mount_test.go
+@@ -222,6 +222,9 @@ func TestSafeFormatAndMount(t *testing.T) {
+ 		fakeMounter := ErrorMounter{NewFakeMounter(nil), 0, test.mountErrs}
+ 		fakeExec := &testingexec.FakeExec{ExactOrder: true}
+ 		for _, script := range test.execScripts {
++			if runtime.GOOS == "freebsd" {
++				script = freeBSDExecArgs(script)
++			}
+ 			fakeCmd := &testingexec.FakeCmd{}
+ 			cmdAction := makeFakeCmd(fakeCmd, script.command, script.args...)
+ 			outputAction := makeFakeOutput(script.output, script.err)
+@@ -285,6 +288,19 @@ func TestSafeFormatAndMount(t *testing.T) {
+ 	}
+ }
+ 
++// freeBSDExecArgs maps the Linux commands the cases expect to the ones the
++// FreeBSD formatter runs (mount_format_freebsd.go): ext file systems are
++// checked with e2fsck in preen mode, and mkfs.xfs gets no -f.
++func freeBSDExecArgs(e ExecArgs) ExecArgs {
++	switch {
++	case e.command == "fsck" && len(e.args) == 2 && e.args[0] == "-a":
++		e.command, e.args = "e2fsck", []string{"-p", e.args[1]}
++	case e.command == "mkfs.xfs" && len(e.args) > 0 && e.args[0] == "-f":
++		e.args = e.args[1:]
++	}
++	return e
++}
++
+ func makeFakeCmd(fakeCmd *testingexec.FakeCmd, cmd string, args ...string) testingexec.FakeCommandAction {
+ 	c := cmd
+ 	a := args
+-- 
+2.54.0 (Apple Git-157)
+

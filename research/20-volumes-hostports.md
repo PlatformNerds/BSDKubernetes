@@ -671,4 +671,18 @@ Getting it to pass turned up four more problems:
 |---|---|
 | `PersistentVolumes NFS` (PV/PVC pairs, multiple PVs, Recycle) | **12/12** |
 | In-tree `nfs` + `nfs3` drivers and `DynamicProvisioner External`, skipping the `nfs` (v4) Dynamic PV and Generic Ephemeral patterns | **35/35** (2026-11-20; 30/35 before "The mount table in a container" above) |
-| `nfs` (v4) Dynamic PV / Generic Ephemeral | not run: unfs3 has no NFSv4 |
+| `nfs` (v4) Dynamic PV / Generic Ephemeral | not run: unfs3 has no NFSv4 (19 tests; see below) |
+
+**NFSv4 for the e2e provisioner: tried and stopped (2026-11-23).** These 19 tests need the e2e provisioner pod, which is
+unprivileged, to serve NFSv4. Only the test harness is affected: NFS volumes from a real NFSv3 or v4.x server, the
+kernel nfsd in a privileged pod, and NFSv3 dynamic provisioning all work (above). The candidate was
+[kuleuven/nfs4go](https://github.com/kuleuven/nfs4go), a user-space NFSv4.0-4.2 server in Go. Its file-system layer
+reported every file as inode 0 outside Linux, and its handles are built from inode numbers; it was ported to FreeBSD
+(real inode numbers, link counts, owners, extended attributes), not published. Against FreeBSD's client, served
+unprivileged on node 1 and mounted `vers=4.0` from node 2, the mount and root listing worked, but the first file
+create failed: `open(2)` returned EISDIR after the server answered the LOOKUP with ENOENT, and no OPEN was ever sent.
+Reading its code also turned up an OPEN replay check that ignores the open-owner and leaves the current handle on the
+parent directory, and a nil dereference of the create mode (no panic recovery, so it would take the server down). It
+has no file locking and is tested with Linux clients only. Stopped there: making a third-party server work with
+FreeBSD's client to run 19 harness tests isn't worth it. Options if needed later: a native NFSv4 user-space server,
+or letting the provisioner use the kernel nfsd, which would need the pod to be privileged and so change the test.

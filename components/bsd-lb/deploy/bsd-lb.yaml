@@ -1,0 +1,142 @@
+# bsd-lb: LoadBalancer Services on bare-metal FreeBSD nodes (research/25).
+# The controller assigns addresses from POOL; on each node network one speaker answers ARP for each
+# address, and kube-proxy's pf rules deliver the traffic. POOL must be free addresses on the nodes' L2
+# network (the subnet of their InternalIP).
+# Usage: sed -e "s|\${IMAGE}|localhost/bsd-lb:dev|" -e "s|\${POOL}|192.168.100.200-192.168.100.250|" \
+#          bsd-lb.yaml | kubectl apply -f -
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: bsd-lb-controller, namespace: kube-system}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: bsd-lb-speaker, namespace: kube-system}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: bsd-lb-controller}
+rules:
+- apiGroups: [""]
+  resources: [services]
+  verbs: [get, list, watch, update]
+- apiGroups: [""]
+  resources: [services/status]
+  verbs: [update]
+- apiGroups: ["", events.k8s.io]
+  resources: [events]
+  verbs: [create, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: bsd-lb-speaker}
+rules:
+- apiGroups: [""]
+  resources: [services, nodes]
+  verbs: [get, list, watch]
+- apiGroups: [discovery.k8s.io]
+  resources: [endpointslices]
+  verbs: [list, watch]
+- apiGroups: ["", events.k8s.io]
+  resources: [events]
+  verbs: [create, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: bsd-lb-speaker, namespace: kube-system}
+rules:
+- apiGroups: [coordination.k8s.io]
+  resources: [leases]
+  verbs: [get, list, watch, create, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: bsd-lb-controller}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: bsd-lb-controller}
+subjects:
+- {kind: ServiceAccount, name: bsd-lb-controller, namespace: kube-system}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: bsd-lb-speaker}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: bsd-lb-speaker}
+subjects:
+- {kind: ServiceAccount, name: bsd-lb-speaker, namespace: kube-system}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: bsd-lb-speaker, namespace: kube-system}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: bsd-lb-speaker}
+subjects:
+- {kind: ServiceAccount, name: bsd-lb-speaker, namespace: kube-system}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bsd-lb-controller
+  namespace: kube-system
+  labels: {app: bsd-lb-controller}
+spec:
+  replicas: 1
+  # One allocator at a time.
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: bsd-lb-controller}
+  template:
+    metadata:
+      labels: {app: bsd-lb-controller}
+    spec:
+      serviceAccountName: bsd-lb-controller
+      priorityClassName: system-cluster-critical
+      nodeSelector: {kubernetes.io/os: freebsd}
+      tolerations:
+      - {key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule}
+      containers:
+      - name: controller
+        image: ${IMAGE}
+        imagePullPolicy: IfNotPresent
+        args: [-mode=controller, "-pool=${POOL}"]
+        securityContext:
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+          runAsUser: 65534
+          capabilities: {drop: [ALL]}
+        resources:
+          requests: {cpu: 10m, memory: 32Mi}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: bsd-lb-speaker
+  namespace: kube-system
+  labels: {app: bsd-lb-speaker}
+spec:
+  selector:
+    matchLabels: {app: bsd-lb-speaker}
+  updateStrategy:
+    rollingUpdate: {maxUnavailable: 1}
+  template:
+    metadata:
+      labels: {app: bsd-lb-speaker}
+    spec:
+      serviceAccountName: bsd-lb-speaker
+      priorityClassName: system-node-critical
+      # ARP on the node's interface: host network, and NET_RAW, for which CRI-O gives the
+      # container /dev/bpf.
+      hostNetwork: true
+      nodeSelector: {kubernetes.io/os: freebsd}
+      tolerations:
+      - operator: Exists
+      containers:
+      - name: speaker
+        image: ${IMAGE}
+        imagePullPolicy: IfNotPresent
+        args: [-mode=speaker]
+        env:
+        - name: NODE_NAME
+          valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+        - name: POD_NAMESPACE
+          valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+        securityContext:
+          capabilities: {drop: [ALL], add: [NET_RAW]}
+        resources:
+          requests: {cpu: 10m, memory: 32Mi}

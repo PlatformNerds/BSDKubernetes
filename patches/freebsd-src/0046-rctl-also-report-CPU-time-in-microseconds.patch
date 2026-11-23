@@ -1,0 +1,60 @@
+From 5953cba05a92574b668e1a051b0e7d62b43c2aaf Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 02:08:12 -0700
+Subject: [PATCH] rctl: also report CPU time in microseconds
+
+rctl -u (rctl_get_racct(2)) reports cputime in whole seconds, although
+the kernel accounts it in microseconds.  A container runtime that turns
+it into a CPU usage rate over a short window gets steps of a whole
+second: over the 15 second window Kubernetes' metrics-server uses, a
+container's CPU usage reads 0, 67 or 133 millicores while it really uses
+63, and the horizontal pod autoscaler, which keeps the highest
+recommendation over its scale-down window, never scales down.
+
+Add a cputime_us entry with the CPU time in microseconds.  cputime keeps
+its meaning, and rctl(8) prints the new entry like the others.
+---
+ sys/kern/kern_rctl.c | 10 ++++++++++
+ usr.bin/rctl/rctl.8  |  5 +++++
+ 2 files changed, 15 insertions(+)
+
+diff --git a/sys/kern/kern_rctl.c b/sys/kern/kern_rctl.c
+index 682ba86d2..7f20572b8 100644
+--- a/sys/kern/kern_rctl.c
++++ b/sys/kern/kern_rctl.c
+@@ -1601,6 +1601,16 @@ rctl_racct_to_sbuf(struct racct *racct, int sloppy)
+ 			amount /= 1000000;
+ 		sbuf_printf(sb, "%s=%jd,", rctl_resource_name(i), amount);
+ 	}
++	/*
++	 * cputime is shown in whole seconds.  Also show the CPU time the
++	 * kernel keeps, in microseconds, for consumers measuring CPU usage
++	 * over short windows (a container's CPU usage measured over 15
++	 * seconds moves in steps of 1/15 of a CPU otherwise).
++	 */
++	RACCT_LOCK();
++	amount = racct->r_resources[RACCT_CPU];
++	RACCT_UNLOCK();
++	sbuf_printf(sb, "cputime_us=%jd,", amount);
+ 	sbuf_setpos(sb, sbuf_len(sb) - 1);
+ 	return (sb);
+ }
+diff --git a/usr.bin/rctl/rctl.8 b/usr.bin/rctl/rctl.8
+index 6f2e37851..47d72c35c 100644
+--- a/usr.bin/rctl/rctl.8
++++ b/usr.bin/rctl/rctl.8
+@@ -84,6 +84,11 @@ or
+ .Pc
+ matching the
+ .Ar filter .
++Besides the resources listed below,
++.Sy cputime_us
++shows the CPU time in microseconds
++.Sy ( cputime
++shows it in whole seconds).
+ .It Fl h
+ "Human-readable" output.
+ Use unit suffixes: Byte, Kilobyte, Megabyte,
+-- 
+2.54.0 (Apple Git-157)
+

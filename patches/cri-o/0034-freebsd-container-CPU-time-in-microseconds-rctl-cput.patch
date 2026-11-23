@@ -1,0 +1,61 @@
+From 1e5cd87c6d895f8d6cd1d38dd16cc5813c92b8bc Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 02:11:14 -0700
+Subject: [PATCH] freebsd: container CPU time in microseconds (rctl cputime_us)
+
+Container and pod CPU usage came from rctl's cputime, in whole seconds.
+Over metrics-server's 15 s window a container's usage then reads 0, 67
+or 133 millicores while it uses 63, and the horizontal pod autoscaler,
+which keeps the highest recommendation over its scale-down window,
+didn't scale down. Use cputime_us (CPU time in microseconds, BSDKubernetes
+freebsd-src 0046) when the kernel reports it, else cputime as before.
+---
+ internal/config/cgmgr/cgmgr_freebsd.go |  9 ++++++---
+ internal/config/jail/stats.go          | 11 ++++++++---
+ 2 files changed, 14 insertions(+), 6 deletions(-)
+
+diff --git a/internal/config/cgmgr/cgmgr_freebsd.go b/internal/config/cgmgr/cgmgr_freebsd.go
+index d6b00bf92..4e6976e74 100644
+--- a/internal/config/cgmgr/cgmgr_freebsd.go
++++ b/internal/config/cgmgr/cgmgr_freebsd.go
+@@ -114,9 +114,12 @@ func (*NullCgroupManager) ContainerCgroupStats(sbParent, containerID string) (*s
+ 		return nil, fmt.Errorf("unable to read accounting for %s: %w", containerID, err)
+ 	}
+ 
+-	if val, ok := entries["cputime"]; ok {
+-		// Cumulative CPU time, in seconds. XXX add 1 to make
+-		// metrics-server happy - it treats zero cpu usage as a failure
++	// Cumulative CPU time: cputime_us (microseconds) where the kernel
++	// reports it, else cputime (whole seconds). XXX add 1 to make
++	// metrics-server happy - it treats zero cpu usage as a failure
++	if val, ok := entries["cputime_us"]; ok {
++		res.CpuStats.CpuUsage.TotalUsage = val*1000 + 1
++	} else if val, ok := entries["cputime"]; ok {
+ 		res.CpuStats.CpuUsage.TotalUsage = val*1000000000 + 1
+ 	}
+ 	if val, ok := entries["memoryuse"]; ok {
+diff --git a/internal/config/jail/stats.go b/internal/config/jail/stats.go
+index 42c16420f..ffad0a131 100644
+--- a/internal/config/jail/stats.go
++++ b/internal/config/jail/stats.go
+@@ -74,9 +74,14 @@ func getRacct(filter string) (map[string]uint64, error) {
+ 
+ func racctToCPUStats(entries map[string]uint64) *cgmgr.CPUStats {
+ 	cpu := &cgmgr.CPUStats{}
+-	if val, ok := entries["cputime"]; ok {
+-		// Cumulative CPU time, in seconds. XXX add 1 to make
+-		// metrics-server happy - it treats zero cpu usage as a failure
++	// Cumulative CPU time: cputime_us (microseconds) where the kernel
++	// reports it (BSDKubernetes freebsd-src 0046), else cputime (whole
++	// seconds, which a rate over metrics-server's 15 s window turns into
++	// steps of 67 millicores). XXX add 1 to make metrics-server happy - it
++	// treats zero cpu usage as a failure
++	if val, ok := entries["cputime_us"]; ok {
++		cpu.TotalUsageNano = val*1000 + 1
++	} else if val, ok := entries["cputime"]; ok {
+ 		cpu.TotalUsageNano = val*1000000000 + 1
+ 	}
+ 	return cpu
+-- 
+2.54.0 (Apple Git-157)
+

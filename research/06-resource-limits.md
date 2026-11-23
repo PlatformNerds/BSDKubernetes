@@ -241,6 +241,32 @@ No container restarted.
 - **Which process dies.** When the pod limit trips, the process that crossed it is killed (racctd's per-process
   sample), not the largest one, as a Linux OOM kill would pick.
 
+## CPU usage to the microsecond (freebsd-src 0046, CRI-O 0034; 2026-11-23)
+
+Container and pod CPU usage (the CRI's `usageCoreNanoSeconds`, what metrics-server and the horizontal pod
+autoscaler use) came from rctl's `cputime`, which is whole seconds.
+- metrics-server turns it into a rate over 15 s, so a container's usage moved in steps of 67 millicores. A pod
+  using 63m read 0, 67 or 133m.
+- The HPA keeps the highest recommendation over its scale-down stabilization window, so one high reading kept
+  the extra replicas. Two `[Feature:HPA]` behaviour tests failed: they never scaled down.
+- The kernel already accounts CPU time in microseconds (`RACCT_IN_MILLIONS`); `rctl_racct_to_sbuf()` divides
+  it down to seconds for display.
+
+freebsd-src 0046 (branches `bsdk8s/rctl-cputime-us[-15.1]`) adds a `cputime_us` entry, the CPU time in
+microseconds, to `rctl -u` and `rctl_get_racct(2)`. `cputime` keeps its meaning, and `rctl(8)` prints the new
+entry like the others (`-h` humanizes it). CRI-O 0034 uses `cputime_us` when the kernel reports it, and
+`cputime` otherwise.
+- Running processes' CPU time is updated by racctd once a second, so a reading can be up to a second old.
+  Over a 15 s window at 63m that is an error of a few millicores, not 67.
+- Measured: a pod burning 63m now reads 64-65m, steadily.
+- Both nodes boot `kernel.bsdk8s27`.
+
+The HPA tests also needed a FreeBSD `resource-consumer` image (scripts/build-e2e-images-freebsd.sh,
+`RESOURCE_CONSUMER_BINDIR`) and kubernetes 0062. Its `consume-cpu` throttles itself by its own CPU use, read
+through a package that has only stubs outside Linux. On FreeBSD it saw no use and spun: asked for 250m it used
+about 600m. It now uses `getrusage(2)`, as the Windows version uses `GetProcessTimes`.
+- `[Feature:HPA]`, not Slow: 0/23 (no image), then 12/23, then 21/23, now **23/23**.
+
 ## Upstream candidates (fork-first, then upstream; see docs/FORKS.md)
 
 1. ocijail `jail: fix config::set type validation`: **opened as [dfr/ocijail#39](https://github.com/dfr/ocijail/pull/39)** (2026-11-14).
@@ -251,7 +277,8 @@ No container restarted.
 
 - `OOMKilled` reason: add a `memoryuse:devctl` rule plus CRI-O FreeBSD exit-reason mapping, or kernel K5.
 - ~~Pod-level limits on the sandbox (parent) jail~~: done (above). Pod-level resize still open.
-- CPU stats: racct `cputime` has 1-second resolution, so `usageNanoCores` (metrics-server, HPA) is coarse.
+- ~~CPU stats: racct `cputime` has 1-second resolution, so `usageNanoCores` (metrics-server, HPA) is coarse.~~
+  Done 2026-11-23: rctl reports `cputime_us` (below).
 - ~~`UpdateContainerResources` (in-place resize) → `ocijail update` → rctl rule swap.~~ Done (above).
 - cpuset (CPU manager static policy) → `cpuset -j`.
 - Kernel K2 (accurate CPU limits below 500m) and K3 (CPU requests).

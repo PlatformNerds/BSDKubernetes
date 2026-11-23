@@ -524,6 +524,9 @@ and 372 of them.
 - **Cleanup:** the stale directories (nothing mounted, pod gone) were removed with the kubelet stopped. After
   csi-hostpath tests on the new kubelet, no CSI volume directory remains, and the kubelet's orphan cleanup took the
   pod directories from 391 to 20 and from 359 to 3.
+- **Regression check:** the change affects every plugin's teardown. On the new kubelet: local volumes 143/143 (as
+  before), csi-hostpath 36/36, and HostPath, EmptyDir and subPath all pass (120/120 without `[Slow]`). No md disks,
+  mounts or volume directories were left.
 
 ## Node logs are rotated (CRI-O 0033)
 

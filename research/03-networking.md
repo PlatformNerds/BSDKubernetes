@@ -448,7 +448,7 @@ for dummynet shaping (bandwidth plugin).
 | 5 | No NetworkPolicy engine | **Critical** (security) | Host-side pf anchors per pod epair, selector tables, named-port resolution; ANP tiers as ordered anchors | 6–8 wks |
 | 6 | Multi-node pod networking | **Critical** | Routed + FRR/BIRD agent (first), flannel port (vxlan/host-gw/wireguard) second | 3–5 wks each |
 | 7 | No eBPF, so no Cilium/Hubble/eBPF-based tooling | Medium (ecosystem expectation) | Accept it. pf + pflow + pflog + DTrace for observability, "bsd-hubble" exporter | 4–6 wks for observability |
-| 8 | MetalLB speaker Linux-only | Medium | MetalLB controller + FreeBSD speaker (OpenBGPD/FRR/CARP) | 3–4 wks |
+| 8 | MetalLB speaker Linux-only | Medium | **Done (layer 2), research/25:** `components/bsd-lb`, an address-pool controller and an ARP speaker on bpf(4); BGP not done | — |
 | 9 | Envoy unavailable, so the Envoy-based ingress/gateway/mesh stack is out | Medium | Traefik/HAProxy/NGINX Gateway Fabric natively; Envoy-based stacks only in bhyve microVM pods | 0 (choice) / port Envoy = months |
 | 10 | Service mesh init containers rely on iptables | Medium | pf-based redirect CNI chain plugin (pf `rdr-to 127.0.0.1` in the pod's own VNET; that is the one legitimate in-pod pf use) | 3–4 wks |
 | 11 | epair lacks TSO/LRO, so throughput and CPU cost are worse than veth | Low–Med | Jumbo MTU. Later add TSO/LRO passthrough to epair (kernel, small) or switch to `ng_eiface` | kernel: 2–4 wks |

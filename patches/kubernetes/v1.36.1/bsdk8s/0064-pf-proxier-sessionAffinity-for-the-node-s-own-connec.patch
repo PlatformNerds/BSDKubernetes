@@ -1,0 +1,171 @@
+From 33a30716627db557a5cb168fc968a4b43e3f6b95 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 12:19:52 -0700
+Subject: [PATCH] pf proxier: sessionAffinity for the node's own connections on
+ kernels that support it
+
+The host-side redirects (outbound rdr-to for ClusterIPs, externalIPs,
+LoadBalancer IPs and the node's own NodePorts) never set sticky-address,
+because stock FreeBSD 15 pf records the client's address instead of the
+target for outbound rdr-to source tracking. Kernels with the fix advertise
+kern.features.pf_rdr_out_sticky; set sticky-address there, so
+sessionAffinity: ClientIP holds for host-network clients too.
+---
+ pkg/proxy/pf/proxier.go        | 27 +++++++++++++++++----------
+ pkg/proxy/pf/proxier_test.go   | 21 +++++++++++++++++++--
+ pkg/proxy/pf/sysctl_freebsd.go |  7 +++++++
+ pkg/proxy/pf/sysctl_other.go   |  2 ++
+ 4 files changed, 45 insertions(+), 12 deletions(-)
+
+diff --git a/pkg/proxy/pf/proxier.go b/pkg/proxy/pf/proxier.go
+index 33a10ef92fc..88c04eaa291 100644
+--- a/pkg/proxy/pf/proxier.go
++++ b/pkg/proxy/pf/proxier.go
+@@ -153,6 +153,11 @@ type Proxier struct {
+ 	sctpRdrPorts func() (bool, error)
+ 	sctpWarned   sets.Set[string]
+ 
++	// outboundSticky: pf keeps sticky-address mappings right for outbound
++	// rdr-to (kern.features.pf_rdr_out_sticky), so sessionAffinity can be
++	// honoured for the node's own connections too.
++	outboundSticky bool
++
+ 	logger klog.Logger
+ }
+ 
+@@ -199,6 +204,7 @@ func NewProxier(ctx context.Context,
+ 		nodePortAddresses:   nodePortAddresses,
+ 		networkInterfacer:   proxyutil.RealNetwork{},
+ 		sctpRdrPorts:        pfSCTPRdrPorts,
++		outboundSticky:      pfOutboundSticky(),
+ 		sctpWarned:          sets.New[string](),
+ 		logger:              logger,
+ 	}
+@@ -790,7 +796,7 @@ func (proxier *Proxier) writeServiceRules(r *serviceRules) {
+ 		}
+ 	}
+ 	if r.internal != nil {
+-		proxier.hostRedirectRule(af, proto, "any", r.clusterIP, r.port, r.internal)
++		proxier.hostRedirectRule(af, proto, "any", r.clusterIP, r.port, r.internal, r.sticky)
+ 	} else {
+ 		// internalTrafficPolicy: Local and no local endpoint: drop,
+ 		// as on Linux, rather than send it to the default route.
+@@ -800,13 +806,13 @@ func (proxier *Proxier) writeServiceRules(r *serviceRules) {
+ 	for _, d := range dests {
+ 		if nodeTarget != nil {
+ 			if d.isNodePort {
+-				proxier.hostNodePortRule(af, proto, d.ip, d.port, nodeTarget)
++				proxier.hostNodePortRule(af, proto, d.ip, d.port, nodeTarget, r.sticky)
+ 			} else {
+ 				source := "any"
+ 				if d.firewalled {
+ 					source = lbSourceTable
+ 				}
+-				proxier.hostRedirectRule(af, proto, source, d.ip, d.port, nodeTarget)
++				proxier.hostRedirectRule(af, proto, source, d.ip, d.port, nodeTarget, r.sticky)
+ 			}
+ 		}
+ 		// externalTrafficPolicy: Local and no local endpoint: drop,
+@@ -950,12 +956,12 @@ func (proxier *Proxier) hairpinSNATRule(af, proto string, endpointIP string, tar
+ // address validation drops unless pf delivers them (the bsdk8s pf change
+ // "deliver replies of redirected connections to the host's own address");
+ // on other kernels this rule is harmless: such connections failed anyway.
+-func (proxier *Proxier) hostNodePortRule(af, proto string, nodeIP net.IP, nodePort int, t *pfTarget) {
++func (proxier *Proxier) hostNodePortRule(af, proto string, nodeIP net.IP, nodePort int, t *pfTarget, sticky bool) {
+ 	proxier.splitRedirect([]interface{}{
+ 		"pass out quick on lo0", af, "proto", proto,
+ 		"from any to", nodeIP.String(),
+ 		"port", strconv.Itoa(nodePort),
+-	}, t, false)
++	}, t, sticky && proxier.outboundSticky)
+ }
+ 
+ // hostRedirectRule redirects traffic the node itself sends to a ClusterIP
+@@ -968,16 +974,17 @@ func (proxier *Proxier) hostNodePortRule(af, proto string, nodeIP net.IP, nodePo
+ // the address of the interface the Service CIDR routes through, so on a
+ // multi-homed node route the Service CIDR via the node IP's interface.
+ //
+-// No sticky-address: pf (15.x) records the wrong address for outbound rdr-to
+-// source tracking and would redirect every later connection of a client to
+-// the client itself (fixed by the bsdk8s pf patch, not yet upstream), so
++// sticky-address only where the kernel says it works for outbound rdr-to
++// (kern.features.pf_rdr_out_sticky, the bsdk8s pf fix, not yet upstream):
++// stock 15.x pf records the client's own address for these and would redirect
++// every later connection of a client to the client itself. Without it,
+ // sessionAffinity is not honoured for host-network clients.
+-func (proxier *Proxier) hostRedirectRule(af, proto, source string, destinationIP net.IP, destinationPort int, t *pfTarget) {
++func (proxier *Proxier) hostRedirectRule(af, proto, source string, destinationIP net.IP, destinationPort int, t *pfTarget, sticky bool) {
+ 	proxier.splitRedirect([]interface{}{
+ 		"pass out quick", af, "proto", proto,
+ 		"from", source, "to", destinationIP.String(),
+ 		"port", strconv.Itoa(destinationPort),
+-	}, t, false)
++	}, t, sticky && proxier.outboundSticky)
+ }
+ 
+ // flushAnchor removes all translation and filter rules of an anchor. Not
+diff --git a/pkg/proxy/pf/proxier_test.go b/pkg/proxy/pf/proxier_test.go
+index 853a7e58d72..d9fb135ea7f 100644
+--- a/pkg/proxy/pf/proxier_test.go
++++ b/pkg/proxy/pf/proxier_test.go
+@@ -58,13 +58,30 @@ func TestRedirectRule(t *testing.T) {
+ 
+ func TestHostRedirectRule(t *testing.T) {
+ 	p := &Proxier{pfData: proxyutil.NewLineBuffer()}
+-	p.hostRedirectRule("inet", "udp", "any", net.ParseIP("10.96.0.10"), 53, target(nil, []string{"10.244.0.206", "10.244.0.207"}, 53))
+-	p.hostRedirectRule("inet", "tcp", "any", net.ParseIP("10.96.0.1"), 443, target(nil, []string{"192.168.100.1"}, 6443))
++	p.hostRedirectRule("inet", "udp", "any", net.ParseIP("10.96.0.10"), 53, target(nil, []string{"10.244.0.206", "10.244.0.207"}, 53), false)
++	p.hostRedirectRule("inet", "tcp", "any", net.ParseIP("10.96.0.1"), 443, target(nil, []string{"192.168.100.1"}, 6443), false)
+ 	want := "pass out quick inet proto udp from any to 10.96.0.10 port 53 rdr-to { 10.244.0.206, 10.244.0.207 } port 53 round-robin\n" +
+ 		"pass out quick inet proto tcp from any to 10.96.0.1 port 443 rdr-to { 192.168.100.1 } port 6443 round-robin\n"
+ 	if got := p.pfData.String(); got != want {
+ 		t.Errorf("got  %q\nwant %q", got, want)
+ 	}
++
++	// sessionAffinity: sticky-address only on kernels whose pf handles it
++	// for outbound rdr-to.
++	for _, kernelFix := range []bool{false, true} {
++		p := &Proxier{pfData: proxyutil.NewLineBuffer(), outboundSticky: kernelFix}
++		p.hostRedirectRule("inet", "tcp", "any", net.ParseIP("10.96.0.20"), 80, target(nil, []string{"10.244.0.5", "10.244.1.6"}, 8080), true)
++		p.hostNodePortRule("inet", "tcp", net.ParseIP("192.168.100.1"), 30080, target(nil, []string{"10.244.0.5", "10.244.1.6"}, 8080), true)
++		sticky := ""
++		if kernelFix {
++			sticky = " sticky-address"
++		}
++		want := "pass out quick inet proto tcp from any to 10.96.0.20 port 80 rdr-to { 10.244.0.5, 10.244.1.6 } port 8080 round-robin" + sticky + "\n" +
++			"pass out quick on lo0 inet proto tcp from any to 192.168.100.1 port 30080 rdr-to { 10.244.0.5, 10.244.1.6 } port 8080 round-robin" + sticky + "\n"
++		if got := p.pfData.String(); got != want {
++			t.Errorf("outboundSticky=%v:\ngot  %q\nwant %q", kernelFix, got, want)
++		}
++	}
+ }
+ 
+ // checkOrder fails if a translation rule follows a filter rule: pf refuses
+diff --git a/pkg/proxy/pf/sysctl_freebsd.go b/pkg/proxy/pf/sysctl_freebsd.go
+index f93ced4c968..0bd19a899ae 100644
+--- a/pkg/proxy/pf/sysctl_freebsd.go
++++ b/pkg/proxy/pf/sysctl_freebsd.go
+@@ -26,3 +26,10 @@ func pfSCTPRdrPorts() (bool, error) {
+ 	v, err := unix.SysctlUint32("net.pf.sctp_rdr_ports")
+ 	return err == nil && v != 0, err
+ }
++
++// pfOutboundSticky reports whether pf's sticky-address works with outbound
++// rdr-to (kern.features.pf_rdr_out_sticky, set by kernels with the fix).
++func pfOutboundSticky() bool {
++	v, err := unix.SysctlUint32("kern.features.pf_rdr_out_sticky")
++	return err == nil && v != 0
++}
+diff --git a/pkg/proxy/pf/sysctl_other.go b/pkg/proxy/pf/sysctl_other.go
+index 73fcbb435eb..053e03a8ce8 100644
+--- a/pkg/proxy/pf/sysctl_other.go
++++ b/pkg/proxy/pf/sysctl_other.go
+@@ -23,3 +23,5 @@ import "errors"
+ func pfSCTPRdrPorts() (bool, error) {
+ 	return false, errors.New("pf is FreeBSD-only")
+ }
++
++func pfOutboundSticky() bool { return false }
+-- 
+2.54.0 (Apple Git-157)
+

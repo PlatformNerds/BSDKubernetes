@@ -73,6 +73,7 @@ bsdk8s kernels have carried the fix since the first one (freebsd-src 0002), but 
 Both nodes boot `kernel.bsdk8s28`. All 19 affinity tests (`--focus='[Aa]ffinity'`, `[LinuxOnly]` included):
 **17/19**, every LoadBalancer, NodePort and ClusterIP affinity test passing. The 2 failures are
 `[Feature:IPv6DualStack]` "Secondary IP Family" tests, and this cluster is single-stack IPv4.
+Regression on `bsdk8s28` with the new kube-proxy: sig-network `[Conformance]` **47/47**.
 
 ## e2e
 

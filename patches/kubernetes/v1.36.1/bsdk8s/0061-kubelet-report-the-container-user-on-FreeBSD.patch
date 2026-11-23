@@ -1,0 +1,50 @@
+From 283b77af4811ee1160c39bed469104cd031c6dcd Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 23:59:47 -0700
+Subject: [PATCH] kubelet: report the container user on FreeBSD
+
+toKubeContainerUser was a stub returning nil on FreeBSD, so the
+container status never had a user although CRI-O reports one (uid, gid,
+supplementary groups) and the node advertises the
+SupplementalGroupsPolicy feature. Convert it as on Linux: the CRI's
+"linux" user is the POSIX one, which FreeBSD containers have the same
+way.
+---
+ .../kuberuntime_container_freebsd.go          | 20 ++++++++++++++++++-
+ 1 file changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/pkg/kubelet/kuberuntime/kuberuntime_container_freebsd.go b/pkg/kubelet/kuberuntime/kuberuntime_container_freebsd.go
+index 121e172f0de..d8fc7391736 100644
+--- a/pkg/kubelet/kuberuntime/kuberuntime_container_freebsd.go
++++ b/pkg/kubelet/kuberuntime/kuberuntime_container_freebsd.go
+@@ -154,8 +154,26 @@ func toKubeContainerResources(statusResources *runtimeapi.ContainerResources) *k
+ 	}
+ }
+ 
++// toKubeContainerUser converts the user CRI-O reports for a container. The
++// CRI and the API call it "linux", but it is the POSIX uid, gid and
++// supplementary groups, which FreeBSD containers have the same way (and the
++// pod's securityContext sets them through the same fields). The SupplementalGroupsPolicy
++// feature reports it in the container status.
+ func toKubeContainerUser(statusUser *runtimeapi.ContainerUser) *kubecontainer.ContainerUser {
+-	return nil
++	if statusUser == nil {
++		return nil
++	}
++
++	user := &kubecontainer.ContainerUser{}
++	if statusUser.GetLinux() != nil {
++		user.Linux = &kubecontainer.LinuxContainerUser{
++			UID:                statusUser.GetLinux().GetUid(),
++			GID:                statusUser.GetLinux().GetGid(),
++			SupplementalGroups: statusUser.GetLinux().GetSupplementalGroups(),
++		}
++	}
++
++	return user
+ }
+ 
+ func (m *kubeGenericRuntimeManager) GetContainerSwapBehavior(pod *v1.Pod, container *v1.Container) types.SwapBehavior {
+-- 
+2.54.0 (Apple Git-157)
+

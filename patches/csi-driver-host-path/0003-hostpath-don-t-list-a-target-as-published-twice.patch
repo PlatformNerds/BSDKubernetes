@@ -1,0 +1,40 @@
+From e1ea7ea1c67ada5c04cbc05552902aaaaec8ae3f Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 21:40:12 -0700
+Subject: [PATCH] hostpath: don't list a target as published twice
+
+NodePublishVolume appended the target path to vol.Published on every
+call. It returns early for a target that is already a mount point, but
+a block volume published as a symbolic link (FreeBSD, patch 0002) is
+published again: the kubelet republishes after a restart. The path was
+then listed twice, NodeUnpublishVolume removed one entry, and the
+volume stayed "still published": NodeUnstageVolume and DeleteVolume
+failed for good (e2e: disruptive, block volume deleted while the
+kubelet is down).
+---
+ pkg/hostpath/nodeserver.go | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/pkg/hostpath/nodeserver.go b/pkg/hostpath/nodeserver.go
+index 86ebb17..219f8a5 100644
+--- a/pkg/hostpath/nodeserver.go
++++ b/pkg/hostpath/nodeserver.go
+@@ -195,7 +195,14 @@ func (hp *hostPath) NodePublishVolume(ctx context.Context, req *csi.NodePublishV
+ 	}
+ 
+ 	vol.NodeID = hp.config.NodeID
+-	vol.Published.Add(targetPath)
++	// A repeated NodePublishVolume (the kubelet republishes after a
++	// restart) must not list the target twice: NodeUnpublishVolume removes
++	// one entry, and the volume could then never be unstaged or deleted.
++	// It returns early above for a mounted target, but a block volume
++	// published as a symbolic link (FreeBSD) is published again.
++	if !vol.Published.Has(targetPath) {
++		vol.Published.Add(targetPath)
++	}
+ 	if err := hp.state.UpdateVolume(vol); err != nil {
+ 		return nil, err
+ 	}
+-- 
+2.54.0 (Apple Git-157)
+

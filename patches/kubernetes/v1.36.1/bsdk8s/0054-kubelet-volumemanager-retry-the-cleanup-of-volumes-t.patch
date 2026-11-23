@@ -1,0 +1,253 @@
+From c4c7b4989b3cb1df7720dae308ab31bdc3bda718 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 20:47:20 -0700
+Subject: [PATCH 54/55] kubelet/volumemanager: retry the cleanup of volumes
+ that failed reconstruction
+
+cleanOrphanVolumes was one-shot: it scheduled one UnmountVolume per
+volume that could not be reconstructed after a kubelet restart, then
+forgot the volume. The cleanup runs right after the kubelet starts,
+possibly before the containers of a pod deleted while the kubelet was
+down are killed. On FreeBSD a container's nullfs mount of a subPath
+keeps the kubelet's mount below it busy (Linux mount namespaces hold
+copies), so the unmount failed with EBUSY and the volume stayed mounted
+until the next kubelet restart (e2e: "should unmount if pod is force
+deleted while kubelet is down").
+
+Keep such a volume while its directory is still on disk and try again
+every 10s for 5 minutes; cleanupMounts no longer logs the operation
+executor's expected "pending"/backoff errors.
+---
+ .../reconciler/reconciler_common.go           |  4 +
+ .../volumemanager/reconciler/reconstruct.go   | 59 ++++++++++++++-
+ .../reconciler/reconstruct_common.go          |  5 ++
+ .../reconciler/reconstruct_test.go            | 74 +++++++++++++++++++
+ 4 files changed, 139 insertions(+), 3 deletions(-)
+
+diff --git a/pkg/kubelet/volumemanager/reconciler/reconciler_common.go b/pkg/kubelet/volumemanager/reconciler/reconciler_common.go
+index fbe0a29a2b2..4e6a1e9bb55 100644
+--- a/pkg/kubelet/volumemanager/reconciler/reconciler_common.go
++++ b/pkg/kubelet/volumemanager/reconciler/reconciler_common.go
+@@ -120,6 +120,7 @@ func NewReconciler(
+ 		timeOfLastSync:                  time.Time{},
+ 		volumesFailedReconstruction:     make([]podVolume, 0),
+ 		volumesNeedUpdateFromNodeStatus: make([]v1.UniqueVolumeName, 0),
++		orphanCleanupAttempts:           map[string]orphanCleanupAttempt{},
+ 	}
+ }
+ 
+@@ -143,6 +144,9 @@ type reconciler struct {
+ 	timeOfLastSync                  time.Time
+ 	volumesFailedReconstruction     []podVolume
+ 	volumesNeedUpdateFromNodeStatus []v1.UniqueVolumeName
++	// orphanCleanupAttempts tracks the retries of cleanOrphanVolumes, by
++	// pod and volume spec name.
++	orphanCleanupAttempts map[string]orphanCleanupAttempt
+ }
+ 
+ func (rc *reconciler) unmountVolumes(logger klog.Logger) {
+diff --git a/pkg/kubelet/volumemanager/reconciler/reconstruct.go b/pkg/kubelet/volumemanager/reconciler/reconstruct.go
+index 30edb1c9fc3..5b88bca4a6a 100644
+--- a/pkg/kubelet/volumemanager/reconciler/reconstruct.go
++++ b/pkg/kubelet/volumemanager/reconciler/reconstruct.go
+@@ -18,6 +18,8 @@ package reconciler
+ 
+ import (
+ 	"context"
++	"os"
++	"time"
+ 
+ 	v1 "k8s.io/api/core/v1"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+@@ -145,26 +147,77 @@ func (rc *reconciler) updateStates(logger klog.Logger, reconstructedVolumes map[
+ 	}
+ }
+ 
++const (
++	// orphanCleanupRetryPeriod and orphanCleanupRetryWindow bound the
++	// retries of a failed cleanup of a volume that failed reconstruction.
++	orphanCleanupRetryPeriod = 10 * time.Second
++	orphanCleanupRetryWindow = 5 * time.Minute
++)
++
++type orphanCleanupAttempt struct {
++	first, last time.Time
++}
++
+ // cleanOrphanVolumes tries to clean up all volumes that failed reconstruction.
++//
++// The cleanup runs right after the kubelet starts, possibly before the
++// containers of a pod that was deleted meanwhile are killed. Where the
++// containers' mounts keep the volume busy (FreeBSD: a container's nullfs
++// mount of a subPath holds the kubelet's mount below it, while a Linux mount
++// namespace holds copies), the unmount fails once. So a volume whose
++// directory is still there is tried again every orphanCleanupRetryPeriod,
++// for orphanCleanupRetryWindow.
+ func (rc *reconciler) cleanOrphanVolumes(logger klog.Logger) {
+ 	if len(rc.volumesFailedReconstruction) == 0 {
+ 		return
+ 	}
+ 
++	now := time.Now()
++	remaining := make([]podVolume, 0)
+ 	for _, volume := range rc.volumesFailedReconstruction {
++		key := string(volume.podName) + "/" + volume.volumeSpecName
+ 		if rc.desiredStateOfWorld.VolumeExistsWithSpecName(volume.podName, volume.volumeSpecName) {
+ 			// Some pod needs the volume, don't clean it up and hope that
+ 			// reconcile() calls SetUp and reconstructs the volume in ASW.
+ 			logger.V(4).Info("Volume exists in desired state, skip cleaning up mounts", "podName", volume.podName, "volumeSpecName", volume.volumeSpecName)
++			delete(rc.orphanCleanupAttempts, key)
+ 			continue
+ 		}
++		attempt, retry := rc.orphanCleanupAttempts[key]
++		if retry {
++			if _, err := os.Lstat(volume.volumePath); err != nil {
++				logger.V(2).Info("Volume that could not be reconstructed is cleaned up", "podName", volume.podName, "volumeSpecName", volume.volumeSpecName)
++				delete(rc.orphanCleanupAttempts, key)
++				continue
++			}
++			if now.Sub(attempt.first) > orphanCleanupRetryWindow {
++				logger.Info("Giving up cleaning up mounts for volume that could not be reconstructed", "podName", volume.podName, "volumeSpecName", volume.volumeSpecName, "volumePath", volume.volumePath)
++				delete(rc.orphanCleanupAttempts, key)
++				continue
++			}
++			if now.Sub(attempt.last) < orphanCleanupRetryPeriod {
++				remaining = append(remaining, volume)
++				continue
++			}
++			attempt.last = now
++		} else {
++			attempt = orphanCleanupAttempt{first: now, last: now}
++		}
+ 		logger.Info("Cleaning up mounts for volume that could not be reconstructed", "podName", volume.podName, "volumeSpecName", volume.volumeSpecName)
+ 		rc.cleanupMounts(logger, volume)
++		if _, err := os.Lstat(volume.volumePath); err != nil {
++			// Nothing left on disk to retry.
++			delete(rc.orphanCleanupAttempts, key)
++			continue
++		}
++		rc.orphanCleanupAttempts[key] = attempt
++		remaining = append(remaining, volume)
+ 	}
+ 
+-	logger.V(2).Info("Orphan volume cleanup finished")
+-	// Clean the cache, cleanup is one shot operation.
+-	rc.volumesFailedReconstruction = make([]podVolume, 0)
++	if len(remaining) == 0 {
++		logger.V(2).Info("Orphan volume cleanup finished")
++	}
++	rc.volumesFailedReconstruction = remaining
+ }
+ 
+ // updateReconstructedFromNodeStatus tries to file devicePaths of reconstructed volumes from
+diff --git a/pkg/kubelet/volumemanager/reconciler/reconstruct_common.go b/pkg/kubelet/volumemanager/reconciler/reconstruct_common.go
+index ef8716abcc9..cae6d0e5e93 100644
+--- a/pkg/kubelet/volumemanager/reconciler/reconstruct_common.go
++++ b/pkg/kubelet/volumemanager/reconciler/reconstruct_common.go
+@@ -167,6 +167,11 @@ func (rc *reconciler) cleanupMounts(logger klog.Logger, volume podVolume) {
+ 	// to unmount both volume and device in the same routine.
+ 	err := rc.operationExecutor.UnmountVolume(mountedVolume, rc.actualStateOfWorld, rc.kubeletPodsDir)
+ 	if err != nil {
++		if isExpectedError(err) {
++			// An earlier cleanup of the volume is still running or
++			// backing off (cleanOrphanVolumes retries).
++			return
++		}
+ 		metrics.ForceCleanedFailedVolumeOperationsErrorsTotal.Inc()
+ 		logger.Error(err, mountedVolume.GenerateErrorDetailed("volumeHandler.UnmountVolumeHandler for UnmountVolume failed", err).Error())
+ 		return
+diff --git a/pkg/kubelet/volumemanager/reconciler/reconstruct_test.go b/pkg/kubelet/volumemanager/reconciler/reconstruct_test.go
+index 34e73328607..8df52506eb3 100644
+--- a/pkg/kubelet/volumemanager/reconciler/reconstruct_test.go
++++ b/pkg/kubelet/volumemanager/reconciler/reconstruct_test.go
+@@ -22,6 +22,7 @@ import (
+ 	"path/filepath"
+ 	"reflect"
+ 	"testing"
++	"time"
+ 
+ 	v1 "k8s.io/api/core/v1"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+@@ -226,6 +227,79 @@ func TestCleanOrphanVolumes(t *testing.T) {
+ 	}
+ }
+ 
++// TestCleanOrphanVolumesRetries checks that a volume that failed
++// reconstruction is cleaned up again while its directory is still on disk
++// (its first unmount can fail while a deleted pod's containers still hold
++// it), and dropped once the directory is gone.
++func TestCleanOrphanVolumesRetries(t *testing.T) {
++	tmpKubeletDir := t.TempDir()
++	tmpKubeletPodDir := filepath.Join(tmpKubeletDir, "pods")
++	volumePath := filepath.Join(tmpKubeletPodDir, "pod1uid", "volumes", "fake-plugin", "volume-name")
++	if err := os.MkdirAll(volumePath, 0755); err != nil {
++		t.Fatal(err)
++	}
++	vol := podVolume{
++		podName:        "pod1uid",
++		volumeSpecName: "volume-name",
++		volumePath:     volumePath,
++		// No such plugin: every cleanup fails, as an unmount of a busy
++		// volume would, and nothing removes the directory.
++		pluginName: "missing-plugin",
++		volumeMode: v1.PersistentVolumeFilesystem,
++	}
++	rc, _ := getReconciler(tmpKubeletDir, t, []string{}, nil /*custom kubeclient*/)
++	rcInstance, _ := rc.(*reconciler)
++	rcInstance.volumesFailedReconstruction = []podVolume{vol}
++	logger, _ := ktesting.NewTestContext(t)
++
++	rcInstance.cleanOrphanVolumes(logger)
++	if len(rcInstance.volumesFailedReconstruction) != 1 {
++		t.Fatalf("Expected the volume to be kept for a retry while %s exists, got %+v", volumePath, rcInstance.volumesFailedReconstruction)
++	}
++	key := "pod1uid/volume-name"
++	attempt := rcInstance.orphanCleanupAttempts[key]
++
++	// Within the retry period nothing is tried again.
++	rcInstance.cleanOrphanVolumes(logger)
++	if got := rcInstance.orphanCleanupAttempts[key]; got != attempt {
++		t.Errorf("Expected no new attempt within %v, got %+v", orphanCleanupRetryPeriod, got)
++	}
++
++	// After the period it is tried again.
++	attempt.last = attempt.last.Add(-orphanCleanupRetryPeriod)
++	rcInstance.orphanCleanupAttempts[key] = attempt
++	rcInstance.cleanOrphanVolumes(logger)
++	if got := rcInstance.orphanCleanupAttempts[key]; !got.last.After(attempt.last) {
++		t.Errorf("Expected a new attempt after %v, got %+v", orphanCleanupRetryPeriod, got)
++	}
++
++	// Once the directory is gone the volume is dropped.
++	if err := os.RemoveAll(volumePath); err != nil {
++		t.Fatal(err)
++	}
++	attempt = rcInstance.orphanCleanupAttempts[key]
++	attempt.last = attempt.last.Add(-orphanCleanupRetryPeriod)
++	rcInstance.orphanCleanupAttempts[key] = attempt
++	rcInstance.cleanOrphanVolumes(logger)
++	if len(rcInstance.volumesFailedReconstruction) != 0 || len(rcInstance.orphanCleanupAttempts) != 0 {
++		t.Errorf("Expected the volume to be dropped, got %+v %+v", rcInstance.volumesFailedReconstruction, rcInstance.orphanCleanupAttempts)
++	}
++
++	// A volume whose cleanup keeps failing is given up after the window.
++	if err := os.MkdirAll(volumePath, 0755); err != nil {
++		t.Fatal(err)
++	}
++	rcInstance.volumesFailedReconstruction = []podVolume{vol}
++	rcInstance.orphanCleanupAttempts[key] = orphanCleanupAttempt{
++		first: time.Now().Add(-orphanCleanupRetryWindow - time.Second),
++		last:  time.Now().Add(-orphanCleanupRetryPeriod),
++	}
++	rcInstance.cleanOrphanVolumes(logger)
++	if len(rcInstance.volumesFailedReconstruction) != 0 {
++		t.Errorf("Expected the volume to be given up after %v, got %+v", orphanCleanupRetryWindow, rcInstance.volumesFailedReconstruction)
++	}
++}
++
+ func verifyTearDownCalls(plugin *volumetesting.FakeVolumePlugin, expected int) error {
+ 	unmounters := plugin.GetUnmounters()
+ 	if len(unmounters) == 0 && (expected == 0) {
+-- 
+2.54.0 (Apple Git-157)
+

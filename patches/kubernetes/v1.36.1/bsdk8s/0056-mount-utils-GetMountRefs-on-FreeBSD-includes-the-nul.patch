@@ -1,0 +1,82 @@
+From 708e5a1e11571d89ef83797b14b30f25cffe9d18 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 20:50:33 -0700
+Subject: [PATCH] mount-utils: GetMountRefs on FreeBSD includes the nullfs
+ source mount point
+
+For a nullfs mount point, nullfsMountRefs returned the other nullfs
+mounts of the same source but not the source itself. Linux's
+GetMountRefs lists every mount of the same directory, including the
+kubelet's global mount of a device. Without it, the local plugin's
+ConstructVolumeSpec found no global mount for a local PV on a disk, so
+after a kubelet restart the volume failed reconstruction ("local volume
+source is nil or local volume path is empty"); the fallback cleanup only
+unmounts the pod's mount, and the disk stayed mounted under
+plugins/kubernetes.io/local-volume/mounts for good.
+
+Include the source when it is itself a mount point.
+---
+ .../src/k8s.io/mount-utils/mount_freebsd.go   | 19 ++++++++++++++++---
+ .../k8s.io/mount-utils/mount_freebsd_test.go  |  8 ++++++--
+ 2 files changed, 22 insertions(+), 5 deletions(-)
+
+diff --git a/staging/src/k8s.io/mount-utils/mount_freebsd.go b/staging/src/k8s.io/mount-utils/mount_freebsd.go
+index af03c7933ce..9d0e86981fb 100644
+--- a/staging/src/k8s.io/mount-utils/mount_freebsd.go
++++ b/staging/src/k8s.io/mount-utils/mount_freebsd.go
+@@ -264,9 +264,14 @@ func (mounter *Mounter) GetMountRefs(pathname string) ([]string, error) {
+ 	return nullfsMountRefs(realpath, mps), nil
+ }
+ 
+-// nullfsMountRefs returns the nullfs mount points showing the same directory
+-// as path, other than path: path's own source if path is a nullfs mount point,
+-// otherwise path itself.
++// nullfsMountRefs returns the mount points showing the same directory as
++// path, other than path: the nullfs mounts of path's own source if path is a
++// nullfs mount point (otherwise of path itself), and that source when it is a
++// mount point too. Linux's GetMountRefs lists every mount of the same
++// directory the same way; the source being missing meant that a pod's mount of
++// a local volume on a disk didn't lead to the kubelet's global mount of the
++// disk, so the volume couldn't be reconstructed after a kubelet restart and
++// the disk stayed mounted.
+ func nullfsMountRefs(path string, mps []MountPoint) []string {
+ 	path = filepath.Clean(path)
+ 	source := path
+@@ -276,6 +281,14 @@ func nullfsMountRefs(path string, mps []MountPoint) []string {
+ 		}
+ 	}
+ 	refs := []string{}
++	if source != path {
++		for _, mp := range mps {
++			if filepath.Clean(mp.Path) == source {
++				refs = append(refs, source)
++				break
++			}
++		}
++	}
+ 	for _, mp := range mps {
+ 		p := filepath.Clean(mp.Path)
+ 		if mp.Type == "nullfs" && filepath.Clean(mp.Device) == source && p != path {
+diff --git a/staging/src/k8s.io/mount-utils/mount_freebsd_test.go b/staging/src/k8s.io/mount-utils/mount_freebsd_test.go
+index c623ce7d553..b0b81ea00e7 100644
+--- a/staging/src/k8s.io/mount-utils/mount_freebsd_test.go
++++ b/staging/src/k8s.io/mount-utils/mount_freebsd_test.go
+@@ -37,9 +37,13 @@ func TestNullfsMountRefs(t *testing.T) {
+ 		path string
+ 		want []string
+ 	}{
+-		// A pod's mount point: the other pod's mount of the same source.
++		// A pod's mount point: its source, a mount point itself (the
++		// kubelet's global mount of a disk), and the other pod's mount of
++		// the same source.
+ 		{"/var/db/kubelet/pods/a/volumes/kubernetes.io~local-volume/pv",
+-			[]string{"/var/db/kubelet/pods/b/volumes/kubernetes.io~local-volume/pv"}},
++			[]string{"/var/tmp/lpv", "/var/db/kubelet/pods/b/volumes/kubernetes.io~local-volume/pv"}},
++		// A pod's mount of a plain directory: no source mount point.
++		{"/var/db/kubelet/pods/c/volumes/kubernetes.io~local-volume/pv2", []string{}},
+ 		// The source directory: every nullfs mount of it.
+ 		{"/var/tmp/lpv/", []string{
+ 			"/var/db/kubelet/pods/a/volumes/kubernetes.io~local-volume/pv",
+-- 
+2.54.0 (Apple Git-157)
+

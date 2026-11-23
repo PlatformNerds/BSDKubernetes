@@ -528,6 +528,59 @@ and 372 of them.
   before), csi-hostpath 36/36, and HostPath, EmptyDir and subPath all pass (120/120 without `[Slow]`). No md disks,
   mounts or volume directories were left.
 
+## Kubelet restarts with volumes mounted: the `[Disruptive]` storage tests (kubernetes 0054-0056, csi-driver-host-path 0003)
+
+*2026-11-23.* No storage `[Disruptive]` test had run on FreeBSD before. They stop and restart the kubelet while a pod
+uses a volume, and some delete the pod while the kubelet is down. They then check that the kubelet still serves the
+volume, or that it cleans the volume up.
+
+**The test helpers (kubernetes 0055, e2e only):**
+- They ran `systemctl stop|start kubelet` and `systemctl show kubelet` over SSH, read the host's
+  `/proc/self/mountinfo`, and hard-coded `/var/lib/kubelet`.
+- On a FreeBSD node they now use `service kubelet stop|start|status` and `mount(8)`, and the framework's
+  `--kubelet-root-dir` (the right path on any node).
+- `findMountPoints`, used for the "global mount points leaked" check, only parsed its output when the command
+  failed. So it always returned nothing, and that check couldn't fail on Linux either; it now parses on success.
+  FreeBSD has no `mountpoint(1)`, so there it reads `mount -p`.
+
+What the tests then found:
+
+1. **A volume stayed mounted after the kubelet restarted (kubernetes 0054).** All 7 "should unmount if pod is
+   force deleted while kubelet is down" subPath tests failed.
+   - A volume the kubelet can't rebuild from disk after a restart gets one cleanup: one UnmountVolume, then it's
+     forgotten.
+   - That cleanup runs about a second after the kubelet starts, before it has killed the deleted pod's containers.
+   - On FreeBSD the container's nullfs mount of the subPath keeps the kubelet's subPath mount busy, so the unmount
+     failed with `Device busy`. On Linux the container's mount namespace holds copies, so the unmount goes through.
+   - The volume then stayed mounted until the next kubelet restart.
+   - Fix: the kubelet keeps such a volume while its directory exists and tries again every 10 s, for at most 5
+     minutes. A unit test covers it.
+2. **A disk-backed local volume couldn't be rebuilt (kubernetes 0056).**
+   - FreeBSD's `GetMountRefs` gave, for a pod's nullfs mount, the other nullfs mounts of the same source, but not
+     the source itself. Linux lists every mount of the same directory, including the kubelet's global mount of the
+     disk.
+   - The local plugin's `ConstructVolumeSpec` uses that global mount to find the device. Without it, rebuilding
+     the volume failed (`local volume source is nil or local volume path is empty`).
+   - The fallback cleanup unmounts only the pod's mount, so the disk stayed mounted under
+     `plugins/kubernetes.io/local-volume/mounts` for good (found as a leftover `md` disk on node 2).
+   - Fix: the source is now included when it is itself a mount point.
+3. **A csi-hostpath block volume could never be deleted (csi-driver-host-path 0003).** This was a bug in the test
+   driver port, not the kubelet.
+   - Patch 0002 publishes a block volume as a symbolic link. Upstream's "already published" check only recognises a
+     mount, so the kubelet's republish after its restart added the target to the volume's `Published` list a second
+     time.
+   - NodeUnpublishVolume removes one entry, so the volume stayed "still published": NodeUnstageVolume and
+     DeleteVolume failed for good, and the PV was never deleted.
+   - Fix: the driver doesn't list a target twice.
+   - Building the driver: it must be built against the fork's mount-utils (the `replace` in its `go.mod`), and with
+     `-X main.version=...`. Without the `replace`, every publish fails with `util/mount on this platform is not
+     supported`; without the version, every call fails with `Driver is missing version`.
+
+**Result:** storage `[Disruptive]` (`--focus='\[sig-storage\].*\[Disruptive\]'`, `[LinuxOnly]` included,
+without cloud drivers, NFS and `NonGracefulNodeShutdown`; 161 selected, 34 apply): **34/34**. The 32 others passed
+in the full run, and the 3 csi-hostpath block tests on the fixed driver. Each run left no mounts, `md` disks or PVs
+behind.
+
 ## Node logs are rotated (CRI-O 0033)
 
 *2026-11-23.* Nothing rotated `/var/log/kubelet.log` or `/var/log/crio.log`. After eight days they had reached 535

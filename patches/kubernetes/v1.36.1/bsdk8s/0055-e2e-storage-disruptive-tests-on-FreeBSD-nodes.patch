@@ -1,0 +1,161 @@
+From 7e53ea064b49bd4365f68f1fb076808e015d34a6 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 20:47:21 -0700
+Subject: [PATCH 55/55] e2e: storage disruptive tests on FreeBSD nodes
+
+KubeletCommand and getKubeletRunning used systemctl; on a FreeBSD node
+use "service kubelet stop|start|status" (status exits 0 while it runs).
+The host's mount table is mount(8) there, not /proc/self/mountinfo.
+The block-volume and global mount point checks used /var/lib/kubelet
+instead of --kubelet-root-dir.
+
+findMountPoints only parsed its output when the command failed, so it
+always returned nothing and "global mount points leaked" could never
+fail; parse it on success. FreeBSD has no mountpoint(1): list the mount
+table's mount points below the directory instead.
+---
+ test/e2e/storage/utils/pod.go   | 15 ++++++++++++-
+ test/e2e/storage/utils/utils.go | 38 ++++++++++++++++++++++++++-------
+ 2 files changed, 44 insertions(+), 9 deletions(-)
+
+diff --git a/test/e2e/storage/utils/pod.go b/test/e2e/storage/utils/pod.go
+index a4d72721fad..eace5578773 100644
+--- a/test/e2e/storage/utils/pod.go
++++ b/test/e2e/storage/utils/pod.go
+@@ -111,6 +111,11 @@ func KubeletCommand(ctx context.Context, kOp KubeletOpt, c clientset.Interface,
+ 	nodeIP = nodeIP + ":22"
+ 
+ 	commandTemplate := "systemctl %s kubelet"
++	freebsd := podNodeIsFreeBSD(ctx, c, pod)
++	if freebsd {
++		// rc.d service; status exits 0 only while it runs.
++		commandTemplate = "service kubelet %s"
++	}
+ 	sudoPresent := isSudoPresent(ctx, nodeIP, framework.TestContext.Provider)
+ 	if sudoPresent {
+ 		commandTemplate = "sudo " + commandTemplate
+@@ -132,7 +137,7 @@ func KubeletCommand(ctx context.Context, kOp KubeletOpt, c clientset.Interface,
+ 		return
+ 	}
+ 
+-	if kOp == KStart && getKubeletRunning(ctx, nodeIP) {
++	if kOp == KStart && getKubeletRunning(ctx, nodeIP, freebsd) {
+ 		framework.Logf("Kubelet is already running on node %q", pod.Spec.NodeName)
+ 		// Just skip. Or we cannot get a new heartbeat in time.
+ 		return
+@@ -151,6 +156,14 @@ func KubeletCommand(ctx context.Context, kOp KubeletOpt, c clientset.Interface,
+ 	}
+ }
+ 
++// podNodeIsFreeBSD reports whether the pod's node runs FreeBSD, whose host
++// commands differ (rc.d services, mount(8) instead of /proc/self/mountinfo).
++func podNodeIsFreeBSD(ctx context.Context, c clientset.Interface, pod *v1.Pod) bool {
++	node, err := c.CoreV1().Nodes().Get(ctx, pod.Spec.NodeName, metav1.GetOptions{})
++	framework.ExpectNoError(err)
++	return isFreeBSD(node)
++}
++
+ // getHostAddress gets the node for a pod and returns the first
+ // address. Returns an error if the node the pod is on doesn't have an
+ // address.
+diff --git a/test/e2e/storage/utils/utils.go b/test/e2e/storage/utils/utils.go
+index a2f0a6eff4c..ca23691a7f4 100644
+--- a/test/e2e/storage/utils/utils.go
++++ b/test/e2e/storage/utils/utils.go
+@@ -75,7 +75,19 @@ func VerifyFSGroupInPod(ctx context.Context, f *framework.Framework, filePath, e
+ }
+ 
+ // getKubeletRunning return if the kubelet is running or not
+-func getKubeletRunning(ctx context.Context, nodeIP string) bool {
++func getKubeletRunning(ctx context.Context, nodeIP string, freebsd bool) bool {
++	if freebsd {
++		// "service kubelet status" exits 0 while the kubelet runs, 1 if not.
++		command := "service kubelet status"
++		if isSudoPresent(ctx, nodeIP, framework.TestContext.Provider) {
++			command = "sudo " + command
++		}
++		framework.Logf("Attempting `%s`", command)
++		sshResult, err := e2essh.SSH(ctx, command, nodeIP, framework.TestContext.Provider)
++		framework.ExpectNoError(err, fmt.Sprintf("SSH to Node %q errored.", nodeIP))
++		e2essh.LogResult(sshResult)
++		return sshResult.Code == 0
++	}
+ 	command := "systemctl show kubelet --property ActiveState --value"
+ 	framework.Logf("Attempting `%s`", command)
+ 	sshResult, err := e2essh.SSH(ctx, command, nodeIP, framework.TestContext.Provider)
+@@ -134,6 +146,11 @@ func TestVolumeUnmountsFromDeletedPodWithForceOption(ctx context.Context, c clie
+ 	nodeIP, err := getHostAddress(ctx, c, clientPod)
+ 	framework.ExpectNoError(err)
+ 	nodeIP = nodeIP + ":22"
++	// The host's mount table: FreeBSD has no /proc/self/mountinfo.
++	mountTableCmd := "cat /proc/self/mountinfo"
++	if podNodeIsFreeBSD(ctx, c, clientPod) {
++		mountTableCmd = "mount"
++	}
+ 
+ 	ginkgo.By("Expecting the volume mount to be found.")
+ 	result, err := e2essh.SSH(ctx, fmt.Sprintf("mount | grep %s | grep -v volume-subpaths", clientPod.UID), nodeIP, framework.TestContext.Provider)
+@@ -143,7 +160,7 @@ func TestVolumeUnmountsFromDeletedPodWithForceOption(ctx context.Context, c clie
+ 
+ 	if checkSubpath {
+ 		ginkgo.By("Expecting the volume subpath mount to be found.")
+-		result, err := e2essh.SSH(ctx, fmt.Sprintf("cat /proc/self/mountinfo | grep %s | grep volume-subpaths", clientPod.UID), nodeIP, framework.TestContext.Provider)
++		result, err := e2essh.SSH(ctx, fmt.Sprintf("%s | grep %s | grep volume-subpaths", mountTableCmd, clientPod.UID), nodeIP, framework.TestContext.Provider)
+ 		e2essh.LogResult(result)
+ 		framework.ExpectNoError(err, "Encountered SSH error.")
+ 		gomega.Expect(result.Code).To(gomega.Equal(0), fmt.Sprintf("Expected grep exit code of 0, got %d", result.Code))
+@@ -218,7 +235,7 @@ func TestVolumeUnmountsFromDeletedPodWithForceOption(ctx context.Context, c clie
+ 
+ 	if checkSubpath {
+ 		ginkgo.By("Expecting the volume subpath mount not to be found.")
+-		result, err = e2essh.SSH(ctx, fmt.Sprintf("cat /proc/self/mountinfo | grep %s | grep volume-subpaths", clientPod.UID), nodeIP, framework.TestContext.Provider)
++		result, err = e2essh.SSH(ctx, fmt.Sprintf("%s | grep %s | grep volume-subpaths", mountTableCmd, clientPod.UID), nodeIP, framework.TestContext.Provider)
+ 		e2essh.LogResult(result)
+ 		framework.ExpectNoError(err, "Encountered SSH error.")
+ 		gomega.Expect(result.Stdout).To(gomega.BeEmpty(), "Expected grep stdout to be empty (i.e. no subpath mount found).")
+@@ -245,13 +262,13 @@ func TestVolumeUnmapsFromDeletedPodWithForceOption(ctx context.Context, c client
+ 	nodeIP = nodeIP + ":22"
+ 
+ 	// Creating command to check whether path exists
+-	podDirectoryCmd := fmt.Sprintf("ls /var/lib/kubelet/pods/%s/volumeDevices/*/ | grep '.'", clientPod.UID)
++	podDirectoryCmd := fmt.Sprintf("ls %s/pods/%s/volumeDevices/*/ | grep '.'", framework.TestContext.KubeletRootDir, clientPod.UID)
+ 	if isSudoPresent(ctx, nodeIP, framework.TestContext.Provider) {
+ 		podDirectoryCmd = fmt.Sprintf("sudo sh -c \"%s\"", podDirectoryCmd)
+ 	}
+ 	// Directories in the global directory have unpredictable names, however, device symlinks
+ 	// have the same name as pod.UID. So just find anything with pod.UID name.
+-	globalBlockDirectoryCmd := fmt.Sprintf("find /var/lib/kubelet/plugins -name %s", clientPod.UID)
++	globalBlockDirectoryCmd := fmt.Sprintf("find %s/plugins -name %s", framework.TestContext.KubeletRootDir, clientPod.UID)
+ 	if isSudoPresent(ctx, nodeIP, framework.TestContext.Provider) {
+ 		globalBlockDirectoryCmd = fmt.Sprintf("sudo sh -c \"%s\"", globalBlockDirectoryCmd)
+ 	}
+@@ -587,10 +604,15 @@ func GetSectorSize(ctx context.Context, f *framework.Framework, pod *v1.Pod, dev
+ 
+ // findMountPoints returns all mount points on given node under specified directory.
+ func findMountPoints(ctx context.Context, hostExec HostExec, node *v1.Node, dir string) []string {
+-	result, err := hostExec.IssueCommandWithResult(ctx, fmt.Sprintf(`find %s -type d -exec mountpoint {} \; | grep 'is a mountpoint$' || true`, dir), node)
++	cmd := fmt.Sprintf(`find %s -type d -exec mountpoint {} \; | grep 'is a mountpoint$' || true`, dir)
++	if isFreeBSD(node) {
++		// No mountpoint(1): list the mount table's mount points below dir.
++		cmd = fmt.Sprintf(`mount -p | awk '{ print $2 }' | grep '^%s/' | sed 's/$/ is a mountpoint/' || true`, strings.TrimSuffix(dir, "/"))
++	}
++	result, err := hostExec.IssueCommandWithResult(ctx, cmd, node)
+ 	framework.ExpectNoError(err, "Encountered HostExec error.")
+ 	var mountPoints []string
+-	if err != nil {
++	if err == nil {
+ 		for _, line := range strings.Split(result, "\n") {
+ 			if line == "" {
+ 				continue
+@@ -603,7 +625,7 @@ func findMountPoints(ctx context.Context, hostExec HostExec, node *v1.Node, dir
+ 
+ // FindVolumeGlobalMountPoints returns all volume global mount points on the node of given pod.
+ func FindVolumeGlobalMountPoints(ctx context.Context, hostExec HostExec, node *v1.Node) sets.String {
+-	return sets.NewString(findMountPoints(ctx, hostExec, node, "/var/lib/kubelet/plugins")...)
++	return sets.NewString(findMountPoints(ctx, hostExec, node, framework.TestContext.KubeletRootDir+"/plugins")...)
+ }
+ 
+ // CreateDriverNamespace creates a namespace for CSI driver installation.
+-- 
+2.54.0 (Apple Git-157)
+

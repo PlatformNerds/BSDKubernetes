@@ -579,7 +579,7 @@ What the tests then found:
 **Result:** storage `[Disruptive]` (`--focus='\[sig-storage\].*\[Disruptive\]'`, `[LinuxOnly]` included,
 without cloud drivers, NFS and `NonGracefulNodeShutdown`; 161 selected, 34 apply): **34/34**. The 32 others passed
 in the full run, and the 3 csi-hostpath block tests on the fixed driver. Each run left no mounts, `md` disks or PVs
-behind.
+behind. With the rebuilt driver, the regular csi-hostpath tests still pass 36/36.
 
 ## Node logs are rotated (CRI-O 0033)
 

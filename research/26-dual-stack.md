@@ -86,5 +86,14 @@ IPv6 address. No policy: all open. Deny-all ingress: all blocked. Ingress from `
 both families, the other blocked on both. Ingress from `ipBlock: fd00:10:244:1::/64` (node 1's IPv6 pod range):
 `ok` open over IPv6 only, the other blocked. bsd-netpol logged no errors.
 
-Not checked: IPv6-only clusters, IPv6 egress to the
-outside (the nodes have no IPv6 uplink).
+**IPv6 egress to the outside.** The nodes had no IPv6 uplink: once a node forwards IPv6, FreeBSD ignores router
+advertisements unless `net.inet6.ip6.rfc6204w3=1`, so vtnet0 never got QEMU's `fec0::/64` address and default route
+(fixed: `ifconfig_vtnet0_ipv6="inet6 accept_rtadv"`, `rtsold_enable`, the sysctl). Pods then need NAT66, the IPv6 twin
+of the IPv4 pod egress rule: `nat on vtnet0 inet6 from fd00:10:244::/56 to ! fd00:10:244::/56 -> (vtnet0)` (pf
+leaves link-local addresses out of `(vtnet0)`). Pods on both nodes then reached `www.freebsd.org` over IPv6, 9/9,
+translated to the node's `fec0::` address. The node itself still can't: source address selection prefers its ULA
+(`fd00:100::1`) over the deprecated site-local `fec0::`, and QEMU only forwards its own prefix (on a network with a
+global IPv6 uplink address that one would win). `build-cluster.sh` adds the NAT66 rule and the sysctl with
+`NODE_IP6` (demo 485dfef). Pods resolve external names as before (CoreDNS forwards to the IPv4 resolver).
+
+Not checked: IPv6-only clusters.

@@ -1,8 +1,9 @@
 # bsd-lb: LoadBalancer Services on bare-metal FreeBSD nodes (research/25).
-# The controller assigns addresses from POOL; on each node network one speaker answers ARP for each
-# address, and kube-proxy's pf rules deliver the traffic. POOL must be free addresses on the nodes' L2
-# network (the subnet of their InternalIP).
-# Usage: sed -e "s|\${IMAGE}|localhost/bsd-lb:dev|" -e "s|\${POOL}|192.168.100.200-192.168.100.250|" \
+# The controller assigns addresses from POOL; on each node network one speaker answers ARP (IPv4) or
+# NDP (IPv6) for each address, and kube-proxy's pf rules deliver the traffic. POOL must be free addresses
+# on the nodes' L2 network (the subnets of their InternalIPs); IPv4 and IPv6 ranges or prefixes, and a
+# dual-stack Service gets one address of each family it asks for.
+# Usage: sed -e "s|\${IMAGE}|localhost/bsd-lb:dev|" -e "s|\${POOL}|192.168.100.200-192.168.100.250,fd00:100::200/120|" \
 #          bsd-lb.yaml | kubectl apply -f -
 apiVersion: v1
 kind: ServiceAccount

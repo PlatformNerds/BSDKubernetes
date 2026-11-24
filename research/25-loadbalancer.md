@@ -75,6 +75,22 @@ Both nodes boot `kernel.bsdk8s28`. All 19 affinity tests (`--focus='[Aa]ffinity'
 `[Feature:IPv6DualStack]` "Secondary IP Family" tests, and this cluster is single-stack IPv4.
 Regression on `bsdk8s28` with the new kube-proxy: sig-network `[Conformance]` **47/47**.
 
+## IPv6 (2026-11-23, on the dual-stack cluster, research/26)
+
+The pool takes IPv6 ranges and prefixes too (a prefix leaves out its Subnet-Router anycast address), and the
+controller gives a Service one address per IP family it lists, in its order (`ipFamilyPolicy: RequireDualStack`
+gets both); a family the pool doesn't cover is reported in an `AllocationFailed` event and the other one is still
+served. The speaker announces addresses in any subnet of the interface: IPv4 by ARP as before, IPv6 by NDP. The
+kernel bpf filter also passes ICMPv6 Neighbor Solicitations; the speaker answers those for its addresses with a
+solicited Neighbor Advertisement (target link-layer option, ICMPv6 checksum over the pseudo-header), joins each
+address's solicited-node multicast group so the interface passes the solicitations up at all, and sends three
+unsolicited advertisements when it takes an address over (the counterpart of gratuitous ARP). Unit tests cover the
+IPv6 pool, per-family allocation, and the NDP frames, including a checksum that verifies.
+
+Checked: a `RequireDualStack` LoadBalancer Service got `192.168.100.200` and `fd00:100::201`, both announced from
+node 2; node 1 pinged the IPv6 address and its neighbor cache then held `fd00:100::201 52:54:00:bd:01:02 vtnet1 R`
+(node 2's interface, reachable); HTTP to both addresses from node 1's host and from a pod on node 1 succeeded.
+
 ## e2e
 
 `--focus=LoadBalancer`, not Disruptive/Flaky/Serial, `[Slow]` and `[LinuxOnly]` included (18 tests). Before
@@ -88,9 +104,18 @@ upstream CI; here it runs on node 1:
 | should only allow access from service loadbalancer source ranges | The allowed ranges are the accept pod's IP and its node's IP. That node is node 1, which is also where the "outside the cluster" client runs, so that client is allowed. |
 | should be able to change the type and ports of a UDP service | With the backend scaled to 0 the test wants the UDP port refused. pf rejects the node's own packet on output, so `write(2)` returns EPERM, which the test counts as reachable. Linux does the same for a sender on the node (a REJECT in OUTPUT makes `sendmsg` fail with EPERM); a sender outside gets the ICMP port unreachable and passes. |
 
+
+On the dual-stack cluster (2026-11-24, with IPv6 support in bsd-lb): **14/18**, the 3 above plus one that passed on
+the IPv4 cluster, `ExternalTrafficPolicy: Local should only target nodes with endpoints`. It checks a Service's
+`healthCheckNodePort` on every InternalIP of every node, of both families (upstream ff7c781e251, 2025), but the
+Service is IPv4-only, and since upstream 0659a346eac (2026, in 1.36) kube-proxy's IPv4 proxier binds its health
+checks with `tcp4` only, to stop the two families colliding on dual-stack: nothing listens on the node's IPv6
+address, `connection refused`. The pf proxier uses the same upstream health server, so Linux behaves the same; a
+mismatch between the test and kube-proxy upstream, seen only on dual-stack clusters with a LoadBalancer.
+
 The control-plane node carries kubeadm's `node.kubernetes.io/exclude-from-external-load-balancers` label, so
 only node 2 ever announced: as intended.
 
-Not done: a client outside both nodes (QEMU's 192.168.100.0/24 has only the two VMs), IPv6 pools, BGP.
+Not done: a client outside both nodes (QEMU's 192.168.100.0/24 has only the two VMs), BGP.
 Delivery of traffic that arrives from outside for an address node 2 announces was verified in research/19
 (an external IP and a LoadBalancer IP routed by hand to a node, nginx logging the real client).

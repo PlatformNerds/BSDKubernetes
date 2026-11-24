@@ -76,11 +76,13 @@ Kubernetes doesn't support this either: its documentation says NAT of multi-home
 special logic in the corresponding kernel modules", which no kube-proxy backend has. Fixing it here would mean
 pf rewriting or dropping the address parameters of INIT and INIT ACK chunks it translates. Not done.
 
+**IPv6 LoadBalancer addresses:** bsd-lb now assigns and announces them (NDP), research/25.
+
 **IPv6 NetworkPolicy, checked by hand** (the upstream tests use each pod's first address, IPv4 here): a
 server on node 2, a client labelled `role=ok` on node 1 and another on node 2, each trying the server's IPv4 and
 IPv6 address. No policy: all open. Deny-all ingress: all blocked. Ingress from `role=ok` on port 8080: `ok` open on
 both families, the other blocked on both. Ingress from `ipBlock: fd00:10:244:1::/64` (node 1's IPv6 pod range):
 `ok` open over IPv6 only, the other blocked. bsd-netpol logged no errors.
 
-Not checked: IPv6-only clusters, IPv6 LoadBalancer addresses (bsd-lb's pool is IPv4-only, research/25), IPv6 egress to the
+Not checked: IPv6-only clusters, IPv6 egress to the
 outside (the nodes have no IPv6 uplink).

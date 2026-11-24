@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"net"
 	"net/netip"
+	"strings"
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
@@ -23,7 +24,7 @@ func TestParsePool(t *testing.T) {
 			t.Errorf("Contains(%s) = %v, want %v", s, got, want)
 		}
 	}
-	for _, bad := range []string{"", "1.2.3.4", "1.2.3.9-1.2.3.4", "fd00::/120", "x/24"} {
+	for _, bad := range []string{"", "1.2.3.4", "1.2.3.9-1.2.3.4", "10.0.0.1-fd00::1", "fe80::1%vtnet0-fe80::9%vtnet0", "x/24"} {
 		if _, err := ParsePool(bad); err == nil {
 			t.Errorf("ParsePool(%q) accepted", bad)
 		}
@@ -40,7 +41,7 @@ func TestAllocate(t *testing.T) {
 	used := map[netip.Addr]bool{}
 	var got []string
 	for {
-		a, ok := p.Allocate(used)
+		a, ok := p.Allocate(used, false)
 		if !ok {
 			break
 		}
@@ -57,7 +58,7 @@ func TestAllocate(t *testing.T) {
 		}
 	}
 	delete(used, netip.MustParseAddr("192.168.100.201"))
-	if a, _ := p.Allocate(used); a.String() != "192.168.100.201" {
+	if a, _ := p.Allocate(used, false); a.String() != "192.168.100.201" {
 		t.Errorf("freed address not reused: %v", a)
 	}
 }
@@ -132,5 +133,112 @@ func TestOwnership(t *testing.T) {
 	cip := &v1.Service{Spec: v1.ServiceSpec{Type: v1.ServiceTypeClusterIP}}
 	if wantsLB(cip) || !ours(cip) {
 		t.Error("ClusterIP: wantsLB or not ours (release must run after a type change)")
+	}
+}
+
+func TestPoolIPv6(t *testing.T) {
+	p, err := ParsePool("192.168.100.200-192.168.100.201, fd00:100::200/126")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !p.Has(false) || !p.Has(true) {
+		t.Fatal("families missing")
+	}
+	// The /126 leaves out its Subnet-Router anycast address (::200).
+	for s, want := range map[string]bool{
+		"fd00:100::200": false, "fd00:100::201": true, "fd00:100::203": true, "fd00:100::204": false,
+		"192.168.100.200": true,
+	} {
+		if got := p.Contains(netip.MustParseAddr(s)); got != want {
+			t.Errorf("Contains(%s) = %v, want %v", s, got, want)
+		}
+	}
+	used := map[netip.Addr]bool{}
+	var got []string
+	for {
+		a, ok := p.Allocate(used, true)
+		if !ok {
+			break
+		}
+		used[a] = true
+		got = append(got, a.String())
+	}
+	if strings.Join(got, ",") != "fd00:100::201,fd00:100::202,fd00:100::203" {
+		t.Errorf("IPv6 allocations %v", got)
+	}
+	if v4, _ := ParsePool("10.0.0.0/30"); v4.Has(true) {
+		t.Error("IPv4 pool claims IPv6")
+	}
+}
+
+func TestPickAddrs(t *testing.T) {
+	pool, _ := ParsePool("192.168.100.200-192.168.100.201,fd00:100::200/126")
+	dual := &v1.Service{Spec: v1.ServiceSpec{Type: v1.ServiceTypeLoadBalancer,
+		IPFamilies: []v1.IPFamily{v1.IPv6Protocol, v1.IPv4Protocol}}}
+	addrs, problems := pickAddrs(pool, dual, map[netip.Addr]bool{})
+	if len(problems) != 0 || len(addrs) != 2 || addrs[0].String() != "fd00:100::201" || addrs[1].String() != "192.168.100.200" {
+		t.Fatalf("dual: %v %v", addrs, problems)
+	}
+	// An address the Service has stays; a used one doesn't.
+	dual.Status.LoadBalancer.Ingress = []v1.LoadBalancerIngress{{IP: "192.168.100.201"}, {IP: "fd00:100::202"}}
+	addrs, _ = pickAddrs(pool, dual, map[netip.Addr]bool{netip.MustParseAddr("fd00:100::202"): true})
+	if addrs[0].String() != "fd00:100::201" || addrs[1].String() != "192.168.100.201" {
+		t.Errorf("keep: %v", addrs)
+	}
+	// A family the pool lacks is reported, the other one served.
+	v4pool, _ := ParsePool("10.0.0.1-10.0.0.2")
+	addrs, problems = pickAddrs(v4pool, dual, map[netip.Addr]bool{})
+	if len(addrs) != 1 || !addrs[0].Is4() || len(problems) != 1 {
+		t.Errorf("v4-only pool: %v %v", addrs, problems)
+	}
+	// No families listed: IPv4.
+	plain := &v1.Service{Spec: v1.ServiceSpec{Type: v1.ServiceTypeLoadBalancer}}
+	if addrs, _ := pickAddrs(pool, plain, map[netip.Addr]bool{}); len(addrs) != 1 || !addrs[0].Is4() {
+		t.Errorf("plain: %v", addrs)
+	}
+}
+
+func TestNDP(t *testing.T) {
+	mac := net.HardwareAddr{2, 0, 0, 0, 0, 1}
+	peer := net.HardwareAddr{2, 0, 0, 0, 0, 2}
+	vip := netip.MustParseAddr("fd00:100::201")
+	peerIP := netip.MustParseAddr("fd00:100::1")
+	if g := solicitedNode(vip).String(); g != "ff02::1:ff00:201" {
+		t.Errorf("solicited-node %s", g)
+	}
+	// A solicitation as a neighbour would send it: built with neighborAdvert's
+	// layout, then turned into an NS for vip.
+	ns := neighborAdvert(peer, peerIP, solicitedNode(vip), multicastMAC(solicitedNode(vip)), 0)
+	ns[ethHdrLen+ip6HdrLen] = icmp6NeighSol
+	copy(ns[ethHdrLen+ip6HdrLen+8:], vip.AsSlice())
+	req, ok := parseNS(ns)
+	if !ok || req.target != vip || req.srcIP != peerIP || !bytes.Equal(req.srcMAC, peer) {
+		t.Fatalf("parse: %v %+v", ok, req)
+	}
+	na := ndpReply(mac, req)
+	if _, ok := parseNS(na); ok {
+		t.Error("an advertisement parsed as a solicitation")
+	}
+	if !bytes.Equal(na[0:6], peer) || !bytes.Equal(na[6:12], mac) {
+		t.Errorf("ethernet % x", na[:12])
+	}
+	ip := na[ethHdrLen:]
+	if !bytes.Equal(ip[8:24], vip.AsSlice()) || !bytes.Equal(ip[24:40], peerIP.AsSlice()) || ip[7] != 255 {
+		t.Errorf("ip header % x", ip[:40])
+	}
+	msg := ip[ip6HdrLen:]
+	if msg[0] != icmp6NeighAdv || msg[4] != naFlagSolicited|naFlagOverride ||
+		!bytes.Equal(msg[8:24], vip.AsSlice()) || msg[24] != ndOptTgtLLAddr || !bytes.Equal(msg[26:32], mac) {
+		t.Errorf("advertisement % x", msg)
+	}
+	// The checksum verifies: summing the message with it in place gives 0.
+	if c := icmp6Checksum([16]byte(ip[8:24]), [16]byte(ip[24:40]), msg); c != 0 {
+		t.Errorf("checksum does not verify: %#x", c)
+	}
+	// Duplicate address detection (from ::) is answered to all nodes.
+	req.srcIP = netip.IPv6Unspecified()
+	if u := ndpReply(mac, req); !bytes.Equal(u[0:6], multicastMAC(netip.MustParseAddr("ff02::1"))) ||
+		u[ethHdrLen+ip6HdrLen+4] != naFlagOverride {
+		t.Errorf("DAD reply % x", u[:60])
 	}
 }

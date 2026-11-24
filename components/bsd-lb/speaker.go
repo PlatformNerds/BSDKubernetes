@@ -34,7 +34,8 @@ const (
 	excludeLabel = "node.kubernetes.io/exclude-from-external-load-balancers"
 )
 
-// announcer answers ARP for a set of addresses on one interface.
+// announcer answers ARP (IPv4) and NDP (IPv6) for a set of addresses on one
+// interface.
 type announcer interface {
 	SetAddrs(addrs []netip.Addr)
 }
@@ -81,7 +82,7 @@ type speaker struct {
 	cs        kubernetes.Interface
 	node      string
 	namespace string
-	subnet    netip.Prefix
+	subnets   []netip.Prefix
 	ann       announcer
 	factory   informers.SharedInformerFactory
 	// leases: only the speakers' namespace (the Role grants no more).
@@ -93,22 +94,22 @@ type speaker struct {
 }
 
 func runSpeaker(ctx context.Context, cs kubernetes.Interface, node, namespace, ifname string) error {
-	iface, subnet, err := pickInterface(ifname, cs, ctx, node)
+	iface, subnets, err := pickInterface(ifname, cs, ctx, node)
 	if err != nil {
 		return err
 	}
-	ann, err := newARPResponder(ctx, iface)
+	ann, err := newResponder(ctx, iface)
 	if err != nil {
 		return err
 	}
-	log.Printf("speaker: node %s, interface %s (%s, %s)", node, iface.Name, iface.HardwareAddr, subnet)
+	log.Printf("speaker: node %s, interface %s (%s, %v)", node, iface.Name, iface.HardwareAddr, subnets)
 
 	bc := record.NewBroadcaster()
 	bc.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: cs.CoreV1().Events("")})
 	defer bc.Shutdown()
 
 	s := &speaker{
-		cs: cs, node: node, namespace: namespace, subnet: subnet, ann: ann,
+		cs: cs, node: node, namespace: namespace, subnets: subnets, ann: ann,
 		factory:  informers.NewSharedInformerFactory(cs, 10*time.Minute),
 		leases:   informers.NewSharedInformerFactoryWithOptions(cs, 10*time.Minute, informers.WithNamespace(namespace)),
 		recorder: bc.NewRecorder(scheme.Scheme, v1.EventSource{Component: "bsd-lb-speaker", Host: node}),
@@ -262,7 +263,7 @@ func (s *speaker) reconcile() {
 			in.local = s.localNodes(svc)
 		}
 		for _, ip := range ingressIPs(svc) {
-			if !s.subnet.Contains(ip) || seen[ip] {
+			if !inSubnets(s.subnets, ip) || seen[ip] {
 				continue
 			}
 			seen[ip] = true
@@ -289,36 +290,39 @@ func (s *speaker) reconcile() {
 	s.ann.SetAddrs(mine)
 }
 
-// pickInterface returns the interface to announce on: the one named, else the
-// one holding the node's InternalIP.
-func pickInterface(name string, cs kubernetes.Interface, ctx context.Context, node string) (*net.Interface, netip.Prefix, error) {
-	var want netip.Addr
+// pickInterface returns the interface to announce on (the one named, else
+// the one holding one of the node's InternalIPs) and the subnets on it, IPv4
+// and IPv6 (not link-local): addresses in them are announced there, by ARP
+// or by NDP.
+func pickInterface(name string, cs kubernetes.Interface, ctx context.Context, node string) (*net.Interface, []netip.Prefix, error) {
+	want := map[netip.Addr]bool{}
 	if name == "" {
 		n, err := cs.CoreV1().Nodes().Get(ctx, node, metav1.GetOptions{})
 		if err != nil {
-			return nil, netip.Prefix{}, err
+			return nil, nil, err
 		}
 		for _, a := range n.Status.Addresses {
 			if a.Type == v1.NodeInternalIP {
-				if ip, err := netip.ParseAddr(a.Address); err == nil && ip.Is4() {
-					want = ip
-					break
+				if ip, err := netip.ParseAddr(a.Address); err == nil {
+					want[ip] = true
 				}
 			}
 		}
-		if !want.IsValid() {
-			return nil, netip.Prefix{}, fmt.Errorf("node %s has no IPv4 InternalIP; set -interface", node)
+		if len(want) == 0 {
+			return nil, nil, fmt.Errorf("node %s has no InternalIP; set -interface", node)
 		}
 	}
 	ifs, err := net.Interfaces()
 	if err != nil {
-		return nil, netip.Prefix{}, err
+		return nil, nil, err
 	}
 	for i := range ifs {
 		iface := &ifs[i]
 		if name != "" && iface.Name != name {
 			continue
 		}
+		var subnets []netip.Prefix
+		holds := false
 		addrs, _ := iface.Addrs()
 		for _, a := range addrs {
 			ipn, ok := a.(*net.IPNet)
@@ -326,16 +330,28 @@ func pickInterface(name string, cs kubernetes.Interface, ctx context.Context, no
 				continue
 			}
 			p, err := netip.ParsePrefix(ipn.String())
-			if err != nil || !p.Addr().Is4() {
+			if err != nil || p.Addr().IsLinkLocalUnicast() {
 				continue
 			}
-			if name != "" || p.Addr() == want {
-				return iface, p.Masked(), nil
-			}
+			subnets = append(subnets, p.Masked())
+			holds = holds || want[p.Addr()]
+		}
+		if (name != "" || holds) && len(subnets) > 0 {
+			return iface, subnets, nil
 		}
 	}
 	if name != "" {
-		return nil, netip.Prefix{}, fmt.Errorf("interface %s has no IPv4 address", name)
+		return nil, nil, fmt.Errorf("interface %s has no usable address", name)
 	}
-	return nil, netip.Prefix{}, fmt.Errorf("no interface holds %s", want)
+	return nil, nil, fmt.Errorf("no interface holds an InternalIP of node %s", node)
+}
+
+// inSubnets reports whether a is in one of the subnets.
+func inSubnets(subnets []netip.Prefix, a netip.Addr) bool {
+	for _, p := range subnets {
+		if p.Contains(a) {
+			return true
+		}
+	}
+	return false
 }

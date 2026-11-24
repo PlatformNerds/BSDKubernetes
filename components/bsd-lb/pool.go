@@ -6,16 +6,18 @@ import (
 	"strings"
 )
 
-// Pool is a set of IPv4 addresses the controller hands out to LoadBalancer
-// Services, from ranges ("a.b.c.d-a.b.c.e") and prefixes ("a.b.c.d/n").
+// Pool is a set of addresses the controller hands out to LoadBalancer
+// Services, from ranges ("a-b") and prefixes ("a/n"), IPv4 and IPv6.
 type Pool struct {
 	ranges []addrRange
 }
 
 type addrRange struct{ first, last netip.Addr }
 
-// ParsePool parses a comma-separated list of ranges and prefixes. For a
-// prefix shorter than /31 the network and broadcast addresses are left out.
+// ParsePool parses a comma-separated list of ranges and prefixes. For an
+// IPv4 prefix shorter than /31 the network and broadcast addresses are left
+// out; for an IPv6 prefix shorter than /127, the Subnet-Router anycast
+// address (the first one).
 func ParsePool(s string) (*Pool, error) {
 	p := &Pool{}
 	for _, part := range strings.Split(s, ",") {
@@ -29,15 +31,15 @@ func ParsePool(s string) (*Pool, error) {
 			if err != nil {
 				return nil, err
 			}
-			if !pfx.Addr().Is4() {
-				return nil, fmt.Errorf("pool %q: only IPv4 is supported", part)
-			}
 			pfx = pfx.Masked()
 			r.first = pfx.Addr()
 			r.last = lastAddr(pfx)
-			if pfx.Bits() < 31 {
+			if pfx.Addr().Is4() && pfx.Bits() < 31 {
 				r.first = r.first.Next()
 				r.last = r.last.Prev()
+			}
+			if pfx.Addr().Is6() && pfx.Bits() < 127 {
+				r.first = r.first.Next()
 			}
 		} else {
 			a, b, ok := strings.Cut(part, "-")
@@ -51,9 +53,12 @@ func ParsePool(s string) (*Pool, error) {
 			if r.last, err = netip.ParseAddr(strings.TrimSpace(b)); err != nil {
 				return nil, err
 			}
+			if r.first.Is4() != r.last.Is4() {
+				return nil, fmt.Errorf("pool %q: mixes IPv4 and IPv6", part)
+			}
 		}
-		if !r.first.Is4() || !r.last.Is4() {
-			return nil, fmt.Errorf("pool %q: only IPv4 is supported", part)
+		if r.first.Zone() != "" || r.last.Zone() != "" || r.first.Is4In6() || r.last.Is4In6() {
+			return nil, fmt.Errorf("pool %q: no zones or IPv4-mapped addresses", part)
 		}
 		if r.last.Less(r.first) {
 			return nil, fmt.Errorf("pool %q: empty range", part)
@@ -66,29 +71,43 @@ func ParsePool(s string) (*Pool, error) {
 	return p, nil
 }
 
+// lastAddr returns the last address of a prefix (of either family).
 func lastAddr(p netip.Prefix) netip.Addr {
-	b := p.Addr().As4()
-	host := 32 - p.Bits()
-	v := uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
-	if host > 0 {
-		v |= (uint32(1) << host) - 1
+	b := p.Addr().AsSlice()
+	for i := p.Bits(); i < len(b)*8; i++ {
+		b[i/8] |= 0x80 >> (i % 8)
 	}
-	return netip.AddrFrom4([4]byte{byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v)})
+	a, _ := netip.AddrFromSlice(b)
+	return a
 }
 
 // Contains reports whether a is in the pool.
 func (p *Pool) Contains(a netip.Addr) bool {
 	for _, r := range p.ranges {
-		if !a.Less(r.first) && !r.last.Less(a) {
+		if a.Is4() == r.first.Is4() && !a.Less(r.first) && !r.last.Less(a) {
 			return true
 		}
 	}
 	return false
 }
 
-// Allocate returns the lowest pool address not in used.
-func (p *Pool) Allocate(used map[netip.Addr]bool) (netip.Addr, bool) {
+// Has reports whether the pool has addresses of the family (IPv6 if v6).
+func (p *Pool) Has(v6 bool) bool {
 	for _, r := range p.ranges {
+		if r.first.Is6() == v6 {
+			return true
+		}
+	}
+	return false
+}
+
+// Allocate returns the lowest pool address of the family (IPv6 if v6) not in
+// used.
+func (p *Pool) Allocate(used map[netip.Addr]bool, v6 bool) (netip.Addr, bool) {
+	for _, r := range p.ranges {
+		if r.first.Is6() != v6 {
+			continue
+		}
 		for a := r.first; ; a = a.Next() {
 			if !used[a] {
 				return a, true

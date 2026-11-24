@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/netip"
 	"slices"
+	"strings"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
@@ -42,22 +43,75 @@ func wantsLB(svc *v1.Service) bool {
 	return svc.DeletionTimestamp == nil && svc.Spec.Type == v1.ServiceTypeLoadBalancer && ours(svc)
 }
 
-func hasIPv4(svc *v1.Service) bool {
-	if len(svc.Spec.IPFamilies) == 0 {
-		return true
+// families returns the Service's IP families in order, as "is IPv6" flags
+// (IPv4 alone if it lists none).
+func families(svc *v1.Service) []bool {
+	var f []bool
+	for _, fam := range svc.Spec.IPFamilies {
+		f = append(f, fam == v1.IPv6Protocol)
 	}
-	return slices.Contains(svc.Spec.IPFamilies, v1.IPv4Protocol)
+	if len(f) == 0 {
+		f = []bool{false}
+	}
+	return f
 }
 
-// ingressIPs returns the IPv4 addresses in a Service's load balancer status.
+// ingressIPs returns the addresses in a Service's load balancer status.
 func ingressIPs(svc *v1.Service) []netip.Addr {
 	var ips []netip.Addr
 	for _, in := range svc.Status.LoadBalancer.Ingress {
-		if a, err := netip.ParseAddr(in.IP); err == nil && a.Is4() {
+		if a, err := netip.ParseAddr(in.IP); err == nil {
 			ips = append(ips, a)
 		}
 	}
 	return ips
+}
+
+// pickAddrs chooses one address per family of the Service: the one it
+// already has if it is a free pool address, else the deprecated
+// spec.loadBalancerIP if it is of that family and free, else the lowest free
+// one. A family the pool has no addresses for is skipped. It returns the
+// addresses and, for each family it could not serve, why.
+func pickAddrs(pool *Pool, svc *v1.Service, used map[netip.Addr]bool) ([]netip.Addr, []string) {
+	var addrs []netip.Addr
+	var problems []string
+	have := ingressIPs(svc)
+	requested, reqErr := netip.ParseAddr(svc.Spec.LoadBalancerIP)
+	for _, v6 := range families(svc) {
+		name := "IPv4"
+		if v6 {
+			name = "IPv6"
+		}
+		if !pool.Has(v6) {
+			problems = append(problems, "the pool has no "+name+" addresses")
+			continue
+		}
+		var ip netip.Addr
+		for _, a := range have {
+			if a.Is6() == v6 && pool.Contains(a) && !used[a] {
+				ip = a
+				break
+			}
+		}
+		if !ip.IsValid() && reqErr == nil && requested.Is6() == v6 {
+			if !pool.Contains(requested) || used[requested] {
+				problems = append(problems, fmt.Sprintf("loadBalancerIP %s is not a free address of the pool", requested))
+				continue
+			}
+			ip = requested
+		}
+		if !ip.IsValid() {
+			a, ok := pool.Allocate(used, v6)
+			if !ok {
+				problems = append(problems, "no free "+name+" address in the pool")
+				continue
+			}
+			ip = a
+		}
+		used[ip] = true
+		addrs = append(addrs, ip)
+	}
+	return addrs, problems
 }
 
 type controller struct {
@@ -68,7 +122,7 @@ type controller struct {
 	recorder record.EventRecorder
 	// assigned holds the addresses this controller wrote, by Service key,
 	// until the informer cache shows them.
-	assigned map[string]netip.Addr
+	assigned map[string][]netip.Addr
 }
 
 func runController(ctx context.Context, cs kubernetes.Interface, pool *Pool) error {
@@ -87,7 +141,7 @@ func runController(ctx context.Context, cs kubernetes.Interface, pool *Pool) err
 			workqueue.TypedRateLimitingQueueConfig[string]{Name: "bsd-lb"}),
 		pool:     pool,
 		recorder: bc.NewRecorder(scheme.Scheme, v1.EventSource{Component: "bsd-lb-controller"}),
-		assigned: map[string]netip.Addr{},
+		assigned: map[string][]netip.Addr{},
 	}
 	defer c.queue.ShutDown()
 
@@ -150,9 +204,11 @@ func (c *controller) used(key string) (map[netip.Addr]bool, error) {
 			used[a] = true
 		}
 	}
-	for k, a := range c.assigned {
+	for k, as := range c.assigned {
 		if k != key {
-			used[a] = true
+			for _, a := range as {
+				used[a] = true
+			}
 		}
 	}
 	return used, nil
@@ -186,49 +242,28 @@ func (c *controller) sync(ctx context.Context, key string) error {
 		return err // the update brings the Service back through the queue
 	}
 
-	if !hasIPv4(svc) {
-		c.recorder.Event(svc, v1.EventTypeWarning, "AllocationFailed", "bsd-lb only allocates IPv4 addresses")
-		return nil
-	}
-
 	used, err := c.used(key)
 	if err != nil {
 		return err
 	}
-	// Keep a valid address the Service already has; else take the requested
-	// spec.loadBalancerIP (deprecated) if free; else the lowest free one.
-	var ip netip.Addr
-	for _, a := range ingressIPs(svc) {
-		if c.pool.Contains(a) && !used[a] {
-			ip = a
-			break
-		}
+	addrs, problems := pickAddrs(c.pool, svc, used)
+	for _, p := range problems {
+		c.recorder.Event(svc, v1.EventTypeWarning, "AllocationFailed", p)
 	}
-	if !ip.IsValid() {
-		if a, err := netip.ParseAddr(svc.Spec.LoadBalancerIP); err == nil && svc.Spec.LoadBalancerIP != "" {
-			if !c.pool.Contains(a) || used[a] {
-				c.recorder.Eventf(svc, v1.EventTypeWarning, "AllocationFailed",
-					"loadBalancerIP %s is not a free address of the pool", a)
-				return nil
-			}
-			ip = a
+	if len(addrs) == 0 {
+		if len(problems) > 0 {
+			return fmt.Errorf("%s", strings.Join(problems, "; "))
 		}
+		return nil
 	}
-	if !ip.IsValid() {
-		a, ok := c.pool.Allocate(used)
-		if !ok {
-			c.recorder.Event(svc, v1.EventTypeWarning, "AllocationFailed", "no free address in the pool")
-			return fmt.Errorf("pool exhausted")
-		}
-		ip = a
-	}
-	c.assigned[key] = ip
+	c.assigned[key] = addrs
 
 	vip := v1.LoadBalancerIPModeVIP
-	want := []v1.LoadBalancerIngress{{IP: ip.String(), IPMode: &vip}}
-	cur := svc.Status.LoadBalancer.Ingress
-	if len(cur) == 1 && cur[0].IP == want[0].IP && cur[0].Hostname == "" &&
-		cur[0].IPMode != nil && *cur[0].IPMode == vip && len(cur[0].Ports) == 0 {
+	var want []v1.LoadBalancerIngress
+	for _, a := range addrs {
+		want = append(want, v1.LoadBalancerIngress{IP: a.String(), IPMode: &vip})
+	}
+	if ingressEqual(svc.Status.LoadBalancer.Ingress, want) {
 		return nil
 	}
 	s := svc.DeepCopy()
@@ -236,9 +271,23 @@ func (c *controller) sync(ctx context.Context, key string) error {
 	if _, err := c.cs.CoreV1().Services(ns).UpdateStatus(ctx, s, metaUpdate); err != nil {
 		return err
 	}
-	c.recorder.Eventf(svc, v1.EventTypeNormal, "IPAllocated", "assigned %s", ip)
-	log.Printf("controller: %s: assigned %s", key, ip)
+	c.recorder.Eventf(svc, v1.EventTypeNormal, "IPAllocated", "assigned %v", addrs)
+	log.Printf("controller: %s: assigned %v", key, addrs)
 	return nil
+}
+
+// ingressEqual reports whether a status already holds exactly want.
+func ingressEqual(cur, want []v1.LoadBalancerIngress) bool {
+	if len(cur) != len(want) {
+		return false
+	}
+	for i := range cur {
+		if cur[i].IP != want[i].IP || cur[i].Hostname != "" || len(cur[i].Ports) != 0 ||
+			cur[i].IPMode == nil || *cur[i].IPMode != *want[i].IPMode {
+			return false
+		}
+	}
+	return true
 }
 
 // release clears the load balancer status of a Service that no longer wants

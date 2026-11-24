@@ -106,4 +106,22 @@ translated to the node's `fec0::` address. The node itself still can't: source a
 global IPv6 uplink address that one would win). `build-cluster.sh` adds the NAT66 rule and the sysctl with
 `NODE_IP6` (demo 485dfef). Pods resolve external names as before (CoreDNS forwards to the IPv4 resolver).
 
-Not checked: IPv6-only clusters.
+## IPv6-only (2026-11-24)
+
+A separate single-node cluster on the third VM (`bsdk8s-3`, docs/MAC-DEV-VM.md), built by hand from the kubeadm config
+`build-cluster.sh` generates, with only IPv6 in it: `serviceSubnet: fd00:20:96::/112`, `podSubnet: fd00:20:244::/56`,
+the API server advertised on `fd00:100::3`, kubelet `--node-ip=fd00:100::3`, a CNI config with one IPv6 range and a
+`::/0` route, the Service CIDR routed via vtnet1, NAT66 for pod egress, and a resolver file for the kubelet pointing at
+QEMU's IPv6 DNS (`fec0::3`; IPv6-only pods can't reach the IPv4 one). `kubeadm init` came up on `[fd00:100::3]:6443`,
+the `kubernetes` Service got `fd00:20:96::1` (`ipFamilies: [IPv6]`), CoreDNS ran on IPv6 pod addresses. Checked by hand:
+pod to the `kubernetes` Service, pod to a Service by DNS name, external names resolved, pod to the internet over
+IPv6, the node to its own NodePort over IPv6 (freebsd-src 0048), and node 2 to node 3's NodePort, the pod seeing the
+real client `[fd00:100::2]`. No code change was needed beyond the dual-stack ones. (The only hitch was the usual one
+for a kubeadm node here: the kubelet's serving certificate waits for approval, `serverTLSBootstrap`, and until then
+`kubectl exec` fails with "tls: internal error".) `build-cluster.sh` has no IPv6-only mode; the steps above are what one
+would automate.
+
+sig-network `[Conformance]` on that single-node IPv6-only cluster, run from the VM itself (`--num-nodes=1`): **47/47**.
+The first run had 40/47: all 7 DNS tests timed out because their probe pod's image (`glibc-dns-testing`, a FreeBSD
+build that exists only on nodes 1 and 2) was not on the VM; with it loaded, the DNS tests passed 8/8.
+

@@ -294,6 +294,9 @@ fi
 if want nginx; then
 new "$base"
 pkgs nginx
+# Upstream's image is Debian, with coreutils: tests run e.g. "touch" in it (PersistentVolumes "should be
+# reschedulable"), which the FreeBSD runtime base lacks.
+hostbin /usr/bin/touch
 # the package's post-install script creates this symlink; `pkg -r` into an image root doesn't
 [ -e "$m/usr/local/www/nginx" ] || ln -s nginx-dist "$m/usr/local/www/nginx"
 buildah config --entrypoint '["/usr/local/sbin/nginx", "-g", "daemon off;"]' --cmd '' --port 80 "$c"

@@ -593,6 +593,42 @@ and 577 MB (kubelet) and 105 and 162 MB (CRI-O).
   100 MB and keeps 7 bzip2 copies. It signals the `daemon(8)` supervisor for the kubelet and crio itself.
 - Both nodes rotated without a restart, and the pods kept running.
 
+## A default StorageClass, and a mountPath with a trailing slash (ocijail 0021)
+
+*2026-11-24.* With no default StorageClass, 22 upstream tests skip themselves (14 sig-apps StatefulSet tests, 8
+storage tests). `components/csi-hostpath-default` deploys the csi-hostpath driver as the e2e framework does (its own
+namespace, the FreeBSD kubelet root, the health-monitor and snapshot-metadata sidecars left out) with a default
+StorageClass. A PVC with no class then bound and a pod wrote to it.
+
+The StatefulSet tests then went **17/27** in 75 minutes, 6 of them panicking. The panic is an upstream test bug (in
+`e2estatefulset.Scale` the pod list is redeclared inside the poll closure, so the error path reads a nil list and
+hides the real message), the failure under it was ours. A scale-down never got past the first pod: it was
+killed (exit 143), then stayed `Error` for good because the kubelet could not unmount its CSI volume, `Device busy`.
+With `OrderedReady` the controller waits for that pod before the next, so the StatefulSet hung, and deleting the
+namespace hung too. What held the volume: its nullfs mount inside the container root
+(`.../zfs/graph/<layer>/data`), still there after the container and even its layer were gone.
+
+The e2e StatefulSet mounts its volume at **`mountPath: /data/`**, with a trailing slash; the same pod with `/data`
+terminated in 10 s. ocijail resolved the destination element by element, and `std::filesystem` iterates `/data/` as
+`/`, `data` and an empty element, so the recorded mount point kept the trailing separator. On delete, CRI-O has
+already force-unmounted the container root when the container stopped, so the volume mount has no path that
+resolves any more; `unmount(2)` then falls back to comparing the string with the mount point the kernel stores,
+`.../data` against `.../data/`, gets EINVAL, which ocijail takes as "already gone", and the mount leaks. Kubernetes
+allows the trailing slash, and Linux never notices (the mount lives in the container's mount namespace).
+
+ocijail 0021 skips empty and `.` elements when resolving and strips a trailing separator from mount points that
+earlier versions recorded. `test_mount_trailing_slash_unmounted` puts the container root on its own tmpfs, force-
+unmounts it after the run as CRI-O does, deletes the container and checks the mount is gone: it fails with the old
+binary and passes with the fix; ocijail's `run_test` 34/34 and `create_test` 12/12. Deployed on both nodes (the old
+binary kept as `ocijail.prev-trailslash`); 29 mounts leaked before the fix were removed by hand (`umount -f` on the
+stored path). **StatefulSet tests: 27/27**, in 8 minutes.
+
+The storage tests that need a default StorageClass: PVC Protection **3/3**, and PersistentVolumes "should be
+reschedulable" **1/1** once the FreeBSD build of the nginx test image got `touch` (it runs `touch` there; upstream's image
+is Debian with coreutils; scripts/build-e2e-images-freebsd.sh). The other default-StorageClass tests are cloud-only
+(Volume metrics and the default-provisioning tests skip unless the provider is GCE, AWS, OpenStack, vSphere or Azure;
+the GenericPersistentVolume disruptive tests skip on the `local` provider).
+
 ## NFS: client, server pods, recycler (freebsd-src 0036, CRI-O a90bf43d4)
 
 *2026-11-19.* Kubelet's NFS client already worked: `mount_nfs` from the host, then nullfs into the container.

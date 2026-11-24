@@ -1,0 +1,14 @@
+# The cluster's default StorageClass: dynamic volumes from the csi-hostpath driver deployed by
+# csi-hostpath.yaml (namespace csi-hostpath). The plugin runs as one replica, so every volume lives on
+# the node where it runs; Immediate binding creates the volume there and the PV's node affinity then
+# schedules the pod onto that node. Test/demo storage: the data is a directory on that node.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: csi-hostpath
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: hostpath.csi.k8s.io
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+allowVolumeExpansion: true

@@ -75,7 +75,8 @@ restarts.
   a node address (NodePort with `externalTrafficPolicy: Cluster`) come from `(self)` and pass.
 - Changes to a policy don't cut connections that are already established; their states remain.
   iptables-based implementations behave the same, through conntrack.
-- IPv4 and IPv6 rules are rendered alike, but only IPv4 is tested (the cluster is IPv4).
+- IPv4 and IPv6 rules are rendered alike. IPv6 was checked by hand on the dual-stack cluster (pod selectors and
+  an IPv6 `ipBlock`, research/26); the upstream tests only use each pod's IPv4 address.
 - AdminNetworkPolicy / ClusterNetworkPolicy tiers (research/03 §3.2) are not implemented.
 - The 5 SCTP variants (`[Feature:SCTPConnectivity] [LinuxOnly]`) weren't counted at first: agnhost's
   SCTP library (`ishidawataru/sctp`) was Linux-only. With it ported (research/23) they pass.

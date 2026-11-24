@@ -62,6 +62,7 @@ Service's IPv6 ClusterIP from a pod and from a node all worked on the first try.
 | `[Feature:IPv6DualStack]` (23 tests, not Disruptive/Flaky) | 21/23 first; the 2 failures were node → own NodePort over IPv6 (fixed above); then **23/23** |
 | Conformance run 17 (dual-stack, `bsdk8s29`) | **437/446**, the same 9 failures as runs 13-16 |
 | `[Feature:NetworkPolicy]` and SCTP, including SCTP's dual-stack variant | 50/52: every NetworkPolicy test, the dual-stack SCTP test; the 2 failures below |
+| sig-network beyond the conformance set (not Conformance, Feature, Serial, Slow, Disruptive, Flaky, LinuxOnly; 68 tests) | **67/68**, the same as on the IPv4 cluster: the one failure is the CLOSE_WAIT test, which reads Linux conntrack (research/07) |
 
 ## Limit: SCTP Services and multi-homed pods
 

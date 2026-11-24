@@ -133,6 +133,15 @@ accounting): **437/446**, the same 9 failures as runs 13 to 15. No regressions (
 **Run 17** (2026-11-23, `kernel.bsdk8s29`, the cluster converted to IPv4/IPv6 dual-stack, research/26, with kube-proxy
 serializing its pf loads, kubernetes 0065): **437/446**, the same 9 failures as runs 13 to 16 (`conformance/run17-*`).
 
+**Run 18** (2026-11-24, after ocijail 0021, the default StorageClass and the VolumeAttachment cleanup below): **435/446**:
+the same 9 plus `Namespaces should ensure that all services are removed when a namespace is deleted`, which passed on
+its own (6 s). In the run, kube-controller-manager lost its leader-election lease at 19:58:30 (a lease renewal to the
+API server timed out while the control plane was busy with a garbage-collection test; etcd on the VM disk logs
+"apply request took too long" hundreds of times an hour) and restarted, so nothing deleted the test's namespace for
+91 s, past the test's minute. The leak before ocijail 0021 had also left 13 VolumeAttachments for PVs that no longer
+existed, which the attach/detach controller retried continuously ("nil spec for volume"); they were removed. A
+load-dependent control-plane hiccup, not a FreeBSD fault (`conformance/run18-*`).
+
 **`[NodeConformance]` beyond the conformance set** (94 tests: NodeConformance, not Conformance, not
 Serial/Slow/Disruptive): 87/94, then **91/94**. The 4 probe-while-terminating tests (2 for regular containers, 2 for
 sidecars) failed with `CreateContainerError: /bin/bash: No such file or directory`. They run `/bin/bash`, which

@@ -113,6 +113,17 @@ checks with `tcp4` only, to stop the two families colliding on dual-stack: nothi
 address, `connection refused`. The pf proxier uses the same upstream health server, so Linux behaves the same; a
 mismatch between the test and kube-proxy upstream, seen only on dual-stack clusters with a LoadBalancer.
 
+**From a client outside the cluster** (2026-11-24): a third VM (`bsdk8s-3`, not a node, on the same vde switch,
+docs/MAC-DEV-VM.md) ran the e2e binary with an address outside the node subnet (`10.99.0.3/24`, on-link routes both
+ways). The UDP type and ports test, the source ranges test and `ExternalTrafficPolicy: Local` "should work for
+type=LoadBalancer" (source address preserved: the pod saw `10.99.0.3`) all **pass**: those three failures came from
+the e2e binary running on node 1. A first try also needed `kubectl` on the client (the tests exec into pods with it)
+and dropping kubeadm's `node.kubernetes.io/exclude-from-external-load-balancers` label from the control plane:
+here it runs workloads, and with the label bsd-lb correctly never announced from it, so a Service whose only
+endpoint was there (`ExternalTrafficPolicy: Local`) had no node to announce it (in upstream CI the control plane is
+tainted, so the test never puts an endpoint there). "should only target nodes with endpoints" then got past that
+and fails only at the IPv6 health check above. So all 18 LoadBalancer tests pass except that one upstream mismatch.
+
 The control-plane node carries kubeadm's `node.kubernetes.io/exclude-from-external-load-balancers` label, so
 only node 2 ever announced: as intended.
 

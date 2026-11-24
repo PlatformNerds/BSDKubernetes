@@ -118,8 +118,12 @@ pod to the `kubernetes` Service, pod to a Service by DNS name, external names re
 IPv6, the node to its own NodePort over IPv6 (freebsd-src 0048), and node 2 to node 3's NodePort, the pod seeing the
 real client `[fd00:100::2]`. No code change was needed beyond the dual-stack ones. (The only hitch was the usual one
 for a kubeadm node here: the kubelet's serving certificate waits for approval, `serverTLSBootstrap`, and until then
-`kubectl exec` fails with "tls: internal error".) `build-cluster.sh` has no IPv6-only mode; the steps above are what one
-would automate.
+`kubectl exec` fails with "tls: internal error".) `build-cluster.sh` now does these steps with `IPV6_ONLY=yes` and `NODE_IP6` (demo 5257000): the resolver file keeps the
+node's IPv6 nameservers, the subnets, node IP, API address and CNI range are IPv6 only, kube-proxy binds `::`. Run on
+the same VM from scratch (`kubeadm reset` first), it built that cluster unattended: Ready, `kubernetes` at
+`fd00:20:96::1`, `kube-dns` at `fd00:20:96::a`, pods with only an IPv6 address, in-cluster DNS and IPv6 egress working.
+That was also the first fresh run of the script's control-plane path since the original nodes were built. sig-network
+`[Conformance]` on the script-built cluster: **47/47**, first try.
 
 sig-network `[Conformance]` on that single-node IPv6-only cluster, run from the VM itself (`--num-nodes=1`): **47/47**.
 The first run had 40/47: all 7 DNS tests timed out because their probe pod's image (`glibc-dns-testing`, a FreeBSD

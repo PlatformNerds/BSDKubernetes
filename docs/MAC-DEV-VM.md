@@ -28,6 +28,10 @@ client: `NODE=3 VM_MEM=4G VM_CPUS=4 VM_DISK=40G scripts/macos-freebsd-vm.sh crea
 `build-cluster.sh` with `IPV6_ONLY=yes` (`~/.kube/config`), has the main cluster's kubeconfig as `~/.kube/main.conf`, the
 e2e binary in `~/bin` and `kubectl`, and runs the LoadBalancer tests from outside the main cluster (research/25; pass
 `--kubeconfig=$HOME/.kube/main.conf`).
+Run the conformance and other e2e runs from there too (`--kubeconfig=$HOME/.kube/main.conf`), not from node 1: it
+keeps the test traffic off the control plane. Tests that SSH into the nodes need the e2e key on it as well (not copied).
+The VM disk has rare multi-second fsync stalls that freeze the one-member etcd (research/07, run 19); they make the
+controller-manager or scheduler lose their lease now and then, whatever runs the tests.
 
 > Gotcha found while building this: FreeBSD's nuageinit crashes ("attempt to concatenate a table value") if a
 > `runcmd` item contains an unquoted `": "`, because YAML turns it into a mapping. It then silently skips the rest

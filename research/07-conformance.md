@@ -142,6 +142,15 @@ API server timed out while the control plane was busy with a garbage-collection 
 existed, which the attach/detach controller retried continuously ("nil spec for volume"); they were removed. A
 load-dependent control-plane hiccup, not a FreeBSD fault (`conformance/run18-*`).
 
+**Run 19** (2026-11-24): the same, but with the e2e binary on the client VM `bsdk8s-3` instead of on node 1 (the
+control plane), to take the test traffic off it: **437/446**, the same 9 as runs 13-17 (`conformance/run19-*`). The
+controller-manager and the scheduler still each lost their lease once, within 5 s of each other: etcd's read loop
+stalled 5.8 s (`linearizableReadLoop took 5.78s`), the API server's handlers timed out. etcd's histograms show why:
+the VM disk is fine most of the time (99.4% of WAL fsyncs under 8 ms) but has rare multi-second stalls (10 fsyncs over
+1 s so far, one 4-8 s and one over 8 s), which a one-member etcd turns into a frozen control plane. That is the VM
+disk through QEMU and macOS, not FreeBSD; dedicated hardware with a local SSD would remove it. Running the e2e binary
+off the control-plane node is now the default for these runs (docs/MAC-DEV-VM.md).
+
 **`[NodeConformance]` beyond the conformance set** (94 tests: NodeConformance, not Conformance, not
 Serial/Slow/Disruptive): 87/94, then **91/94**. The 4 probe-while-terminating tests (2 for regular containers, 2 for
 sidecars) failed with `CreateContainerError: /bin/bash: No such file or directory`. They run `/bin/bash`, which

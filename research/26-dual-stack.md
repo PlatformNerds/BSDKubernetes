@@ -28,8 +28,18 @@ hand: `bsdk8s.io/linux-abi`, and on the control plane `node-role.kubernetes.io/c
 refused every pod ("already has an IP address 10.244.0.1/24 different from 10.244.2.1/24") until that was
 removed. Every pod not on the host network was deleted and came back with two addresses.
 
-`build-cluster.sh` in the demo does all this for a new cluster when `NODE_IP6` is set on every node
-(kubernetes-demo fork f5025e6; checked offline, not yet used for a fresh build).
+`build-cluster.sh` in the demo does all this for a new cluster when `NODE_IP6` is set on every node (kubernetes-demo
+fork f5025e6). **Tested on 2026-11-24 by joining a fresh third VM** (`bsdk8s-3`, stock 15.1-p7 userland with kernel
+`bsdk8s29`, `NODE_IP=192.168.100.3 NODE_IP6=fd00:100::3`, docs/MAC-DEV-VM.md). The first run found a bug that had nothing
+to do with IPv6: building from the fork, kubelet, kubeadm and kube-proxy reported `v0.0.0-master+$Format:%H$` (the
+branch has no release tags for `git describe`), and kubeadm's preflight refused that kubelet, so no node could join
+with a script-built kubelet (the existing nodes run kubelets cross-built on the Mac with an explicit version). The
+script now stamps `vX.Y.Z-bsdk8s+<commit>` from the branch name (demo eee4baa). The second run joined: node Ready with
+`podCIDRs [10.244.0.0/24, fd00:10:244:2::/64]` and both InternalIPs, the CNI config written with both ranges,
+bsd-hostgw routes in both families on all three nodes, kube-proxy, bsd-netpol and the bsd-lb speaker running on it,
+and pod to pod (both directions, both families) and pod to ClusterIP working. Its `sysctl.conf` matched node 2's but
+for two hand-set entries (a debugger break sequence, the ZFS ARC size). The node was then removed again
+(`kubeadm reset`): the e2e test images are built locally and exist only on nodes 1 and 2.
 
 The FreeBSD side needed nothing for the basics: the bridge CNI plugin sets `inet6` addresses and `route -6`
 routes in the pod's jail and turns on IPv6 forwarding; a pod's global address is usable at once (only its

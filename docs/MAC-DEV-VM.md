@@ -23,6 +23,9 @@ cluster network). That network is a vde virtual switch on the Mac (`brew install
 nodes used to be joined by a point-to-point QEMU `dgram` UDP link (`CLUSTER_NET=dgram`, nodes 1 and 2 only); on the
 switch the round trip between them fell from about 14 ms to 0.4 ms. A smaller extra node, e.g. as an external test
 client: `NODE=3 VM_MEM=4G VM_CPUS=4 VM_DISK=40G scripts/macos-freebsd-vm.sh create`.
+`bsdk8s-3` (ssh 127.0.0.1:2224) exists as such: it is not a cluster node (it joined once to test `build-cluster.sh`,
+research/26, and was reset), has the e2e binary in `~/bin`, `kubectl` and node 1's kubeconfig, and runs the
+LoadBalancer tests from outside the cluster (research/25).
 
 > Gotcha found while building this: FreeBSD's nuageinit crashes ("attempt to concatenate a table value") if a
 > `runcmd` item contains an unquoted `": "`, because YAML turns it into a mapping. It then silently skips the rest

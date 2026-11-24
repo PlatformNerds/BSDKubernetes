@@ -17,6 +17,13 @@ scripts/macos-freebsd-vm.sh stop|start|console
 Defaults: 8 vCPU, 12 GB RAM, 80 GB disk, ssh on 127.0.0.1:2222, API server forwarded to 127.0.0.1:6443.
 cloud-init adds `kern.racct.enable=1` to loader.conf, so **reboot once** after create (`ssh 'sudo shutdown -r now'`).
 
+More nodes: `NODE=2 scripts/macos-freebsd-vm.sh create` (ssh on 2221+NODE, `192.168.100.<NODE>` on vtnet1, the
+cluster network). That network is a vde virtual switch on the Mac (`brew install vde`; the script starts
+`vde_switch` on `~/bsdk8s/vde.ctl` when a VM starts), so any number of VMs share one L2 segment. The first two
+nodes used to be joined by a point-to-point QEMU `dgram` UDP link (`CLUSTER_NET=dgram`, nodes 1 and 2 only); on the
+switch the round trip between them fell from about 14 ms to 0.4 ms. A smaller extra node, e.g. as an external test
+client: `NODE=3 VM_MEM=4G VM_CPUS=4 VM_DISK=40G scripts/macos-freebsd-vm.sh create`.
+
 > Gotcha found while building this: FreeBSD's nuageinit crashes ("attempt to concatenate a table value") if a
 > `runcmd` item contains an unquoted `": "`, because YAML turns it into a mapping. It then silently skips the rest
 > of the run stage. The script quotes every item.

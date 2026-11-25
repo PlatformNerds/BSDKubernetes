@@ -86,7 +86,17 @@ ABORT, and the client drops the whole association. On the IPv4-only cluster a po
 none. pf follows multi-homed associations for filtering (`pf_multihome_scan`), but not through a translation.
 Kubernetes doesn't support this either: its documentation says NAT of multi-homed SCTP associations "requires
 special logic in the corresponding kernel modules", which no kube-proxy backend has. Fixing it here would mean
-pf rewriting or dropping the address parameters of INIT and INIT ACK chunks it translates. Not done.
+pf rewriting or dropping the address parameters of INIT and INIT ACK chunks it translates.
+
+**Tried (2026-11-25), not finished.** A pf change behind a new sysctl, `net.pf.sctp_nat_single_homed`, rewrites the type
+of the IPv4 and IPv6 Address parameters in INIT and INIT ACK chunks pf translates to an unassigned type whose high bits
+mean "skip" (RFC 9260 3.2.1), so the peer sees a single-homed endpoint; lengths do not change and the checksum is
+recomputed. Across nodes it fixes the case above: pod to an SCTP ClusterIP (port 95 to 9090) failed with the option off
+and connected with it on. But with the option on, a client and server **on the same node** stopped working (80 to 80,
+also three SCTP NetworkPolicy e2e tests): INIT and INIT ACK pass, the client sends COOKIE ECHO, and the server pod
+receives it (its CRC check passes, no error counter moves) and never answers. Not understood yet, so the option is off
+on both nodes; with it off the new code returns at once and the kernel (`bsdk8s30`) behaves as `bsdk8s29`. The change
+is on a local branch (`bsdk8s/pf-sctp-nat-single-homed-15.1`, freebsd-src 05cb1d0a3), not pushed or listed in patches/.
 
 **IPv6 LoadBalancer addresses:** bsd-lb now assigns and announces them (NDP), research/25.
 

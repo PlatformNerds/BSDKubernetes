@@ -96,7 +96,8 @@ showed `sctp_handle_cookie_echo` returning right after the cookie HMAC check: be
 travels by reference (epair, bridge), and rewriting the INIT in place changed bytes the server had signed into its
 cookie. 0050 writes into an unshared copy (`m_unshare`). Pod to SCTP ClusterIP, client on node 1: with the option off,
 the two port-changing Services (95 to 80) fail, on the same node and across nodes; with it on, all four cases (same and
-other node, 80 to 80 and 95 to 80) connect. Off by default in pf; the cluster turns it on.
+other node, 80 to 80 and 95 to 80) connect. Off by default in pf; the cluster turns it on. SCTP e2e (`SCTP|sctp`, not Disruptive/Flaky/Serial): **9/9**, including
+the two Granular Checks above and the SCTP NetworkPolicy tests.
 
 **IPv6 LoadBalancer addresses:** bsd-lb now assigns and announces them (NDP), research/25.
 

@@ -1,0 +1,348 @@
+From 85b1bbfb6bdbb87a386ea2284c2d9f53dd6a9b22 Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 08:10:37 -0700
+Subject: [PATCH] kubeadm: build again for Linux, Windows and macOS
+
+The FreeBSD kubeadm commit (WIP: kubeadm on FreeBSD) moved the default
+directories into per-OS files but broke every other OS:
+
+- v1beta4/defaults_common.go declared package v1beta3, and both API
+  versions declared DefaultCertificatesDir twice; the files were also
+  limited to linux || windows. Now !freebsd, deduplicated, right package.
+- constants_linux.go held KubernetesDir/KubeletRunDirectory for Linux
+  only (macOS had none); it is constants_other.go (!freebsd && !windows).
+- The CoreDNS Deployment's capabilities (drop ALL, add NET_BIND_SERVICE)
+  were commented out for every OS; they are left out on FreeBSD only.
+- The CoreDNS and kube-proxy nodeSelector took runtime.GOOS; it is
+  freebsd on FreeBSD and linux elsewhere, as upstream.
+- The dns and proxy tests' template data lacked the new OS fields, and
+  the constants and dns tests expected Linux paths and manifests on
+  FreeBSD. Adds TestCoreDNSDeploymentOS.
+
+kubeadm builds for linux/{arm64,amd64}, windows, darwin and freebsd.
+All 55 kubeadm test packages pass on Linux (arm64) except test/cmd's
+init tests, which fail identically with stock v1.36.1 kubeadm on a
+host that already runs a control plane; the changed packages also pass
+on FreeBSD 15.1 and macOS.
+---
+ .../apis/kubeadm/v1beta3/defaults_common.go   |  5 +-
+ .../apis/kubeadm/v1beta4/defaults_common.go   |  7 +-
+ ...{constants_linux.go => constants_other.go} |  2 +
+ cmd/kubeadm/app/constants/constants_test.go   |  4 +-
+ cmd/kubeadm/app/phases/addons/dns/dns.go      | 11 ++-
+ cmd/kubeadm/app/phases/addons/dns/dns_test.go | 76 +++++++++++++++++--
+ .../app/phases/addons/dns/manifests.go        | 12 +--
+ cmd/kubeadm/app/phases/addons/proxy/proxy.go  | 11 ++-
+ .../app/phases/addons/proxy/proxy_test.go     |  6 +-
+ 9 files changed, 106 insertions(+), 28 deletions(-)
+ rename cmd/kubeadm/app/constants/{constants_linux.go => constants_other.go} (96%)
+
+diff --git a/cmd/kubeadm/app/apis/kubeadm/v1beta3/defaults_common.go b/cmd/kubeadm/app/apis/kubeadm/v1beta3/defaults_common.go
+index 529ceb3278f..35d00432731 100644
+--- a/cmd/kubeadm/app/apis/kubeadm/v1beta3/defaults_common.go
++++ b/cmd/kubeadm/app/apis/kubeadm/v1beta3/defaults_common.go
+@@ -1,5 +1,4 @@
+-//go:build linux || windows
+-// +build linux windows
++//go:build !freebsd
+ 
+ /*
+ Copyright 2021 The Kubernetes Authors.
+@@ -26,6 +25,4 @@ const (
+ 	DefaultManifestsDir = "/etc/kubernetes/manifests"
+ 	// DefaultEtcdDataDir defines default location of etcd where static pods will save data to
+ 	DefaultEtcdDataDir = "/var/lib/etcd"
+-	// DefaultCertificatesDir defines default certificate directory
+-	DefaultCertificatesDir = "/etc/kubernetes/pki"
+ )
+diff --git a/cmd/kubeadm/app/apis/kubeadm/v1beta4/defaults_common.go b/cmd/kubeadm/app/apis/kubeadm/v1beta4/defaults_common.go
+index 529ceb3278f..f6b98ec87c8 100644
+--- a/cmd/kubeadm/app/apis/kubeadm/v1beta4/defaults_common.go
++++ b/cmd/kubeadm/app/apis/kubeadm/v1beta4/defaults_common.go
+@@ -1,5 +1,4 @@
+-//go:build linux || windows
+-// +build linux windows
++//go:build !freebsd
+ 
+ /*
+ Copyright 2021 The Kubernetes Authors.
+@@ -17,7 +16,7 @@ See the License for the specific language governing permissions and
+ limitations under the License.
+ */
+ 
+-package v1beta3
++package v1beta4
+ 
+ const (
+ 	// DefaultCertificatesDir defines default certificate directory
+@@ -26,6 +25,4 @@ const (
+ 	DefaultManifestsDir = "/etc/kubernetes/manifests"
+ 	// DefaultEtcdDataDir defines default location of etcd where static pods will save data to
+ 	DefaultEtcdDataDir = "/var/lib/etcd"
+-	// DefaultCertificatesDir defines default certificate directory
+-	DefaultCertificatesDir = "/etc/kubernetes/pki"
+ )
+diff --git a/cmd/kubeadm/app/constants/constants_linux.go b/cmd/kubeadm/app/constants/constants_other.go
+similarity index 96%
+rename from cmd/kubeadm/app/constants/constants_linux.go
+rename to cmd/kubeadm/app/constants/constants_other.go
+index a7b1cb8316f..9b51af04c3b 100644
+--- a/cmd/kubeadm/app/constants/constants_linux.go
++++ b/cmd/kubeadm/app/constants/constants_other.go
+@@ -1,3 +1,5 @@
++//go:build !freebsd && !windows
++
+ /*
+ Copyright 2019 The Kubernetes Authors.
+ 
+diff --git a/cmd/kubeadm/app/constants/constants_test.go b/cmd/kubeadm/app/constants/constants_test.go
+index ebd95631cff..e9add1c7c80 100644
+--- a/cmd/kubeadm/app/constants/constants_test.go
++++ b/cmd/kubeadm/app/constants/constants_test.go
+@@ -25,7 +25,7 @@ import (
+ )
+ 
+ func TestGetStaticPodDirectory(t *testing.T) {
+-	expected := filepath.FromSlash("/etc/kubernetes/manifests")
++	expected := filepath.Join(KubernetesDir, "manifests")
+ 	actual := GetStaticPodDirectory()
+ 
+ 	if actual != expected {
+@@ -51,7 +51,7 @@ func TestGetAdminKubeConfigPath(t *testing.T) {
+ }
+ 
+ func TestGetKubeletKubeConfigPath(t *testing.T) {
+-	expected := filepath.FromSlash("/etc/kubernetes/kubelet.conf")
++	expected := filepath.Join(KubernetesDir, "kubelet.conf")
+ 	actual := GetKubeletKubeConfigPath()
+ 
+ 	if actual != expected {
+diff --git a/cmd/kubeadm/app/phases/addons/dns/dns.go b/cmd/kubeadm/app/phases/addons/dns/dns.go
+index 5fcf687ccb0..c420203d770 100644
+--- a/cmd/kubeadm/app/phases/addons/dns/dns.go
++++ b/cmd/kubeadm/app/phases/addons/dns/dns.go
+@@ -114,7 +114,7 @@ func coreDNSAddon(cfg *kubeadmapi.ClusterConfiguration, client clientset.Interfa
+ 		Image:                images.GetDNSImage(cfg),
+ 		ControlPlaneTaintKey: kubeadmconstants.LabelNodeRoleControlPlane,
+ 		Replicas:             replicas,
+-		OS:                   runtime.GOOS,
++		OS:                   addonOS(),
+ 	})
+ 	if err != nil {
+ 		return errors.Wrap(err, "error when parsing CoreDNS deployment template")
+@@ -417,3 +417,12 @@ func applyCoreDNSDeploymentPatches(coreDNSDeploymentBytes []byte, patchesDir str
+ 
+ 	return coreDNSDeploymentBytes, nil
+ }
++
++// addonOS is the kubernetes.io/os the addon's pods select: the control plane's own OS where that is
++// FreeBSD, whose kubeadm deploys FreeBSD images, and linux otherwise, as upstream.
++func addonOS() string {
++	if runtime.GOOS == "freebsd" {
++		return "freebsd"
++	}
++	return "linux"
++}
+diff --git a/cmd/kubeadm/app/phases/addons/dns/dns_test.go b/cmd/kubeadm/app/phases/addons/dns/dns_test.go
+index fe5e46f71b6..af19275a3b8 100644
+--- a/cmd/kubeadm/app/phases/addons/dns/dns_test.go
++++ b/cmd/kubeadm/app/phases/addons/dns/dns_test.go
+@@ -51,12 +51,13 @@ func TestCompileManifests(t *testing.T) {
+ 			name:     "CoreDNSDeployment manifest",
+ 			manifest: CoreDNSDeployment,
+ 			data: struct {
+-				DeploymentName, Image, ControlPlaneTaintKey string
+-				Replicas                                    *int32
++				DeploymentName, Image, ControlPlaneTaintKey, OS string
++				Replicas                                        *int32
+ 			}{
+ 				DeploymentName:       "foo",
+ 				Image:                "foo",
+ 				ControlPlaneTaintKey: "foo",
++				OS:                   "linux",
+ 				Replicas:             &replicas,
+ 			},
+ 		},
+@@ -134,13 +135,14 @@ func TestDeploymentsHaveSystemClusterCriticalPriorityClassName(t *testing.T) {
+ 			name:     "CoreDNSDeployment",
+ 			manifest: CoreDNSDeployment,
+ 			data: struct {
+-				DeploymentName, Image, ControlPlaneTaintKey, CoreDNSConfigMapName string
+-				Replicas                                                          *int32
++				DeploymentName, Image, ControlPlaneTaintKey, CoreDNSConfigMapName, OS string
++				Replicas                                                              *int32
+ 			}{
+ 				DeploymentName:       "foo",
+ 				Image:                "foo",
+ 				ControlPlaneTaintKey: "foo",
+ 				CoreDNSConfigMapName: "foo",
++				OS:                   "linux",
+ 				Replicas:             &replicas,
+ 			},
+ 		},
+@@ -884,8 +886,8 @@ metadata:
+ 				t.Errorf("coreDNSAddon() error = %v, wantErr %v", err, tt.wantErr)
+ 				return
+ 			}
+-			if gotOut := out.String(); gotOut != tt.wantOut {
+-				t.Errorf("Actual output of coreDNSAddon() does not match expected.\nActual:  %v\nExpected: %v\n", gotOut, tt.wantOut)
++			if gotOut, wantOut := out.String(), manifestForAddonOS(tt.wantOut); gotOut != wantOut {
++				t.Errorf("Actual output of coreDNSAddon() does not match expected.\nActual:  %v\nExpected: %v\n", gotOut, wantOut)
+ 			}
+ 		})
+ 	}
+@@ -1173,8 +1175,8 @@ metadata:
+ 				t.Errorf("EnsureDNSAddon() error = %v, wantErr %v", err, tt.wantErr)
+ 				return
+ 			}
+-			if gotOut := out.String(); gotOut != tt.wantOut {
+-				t.Errorf("Actual output of EnsureDNSAddon() does not match expected.\nActual:  %v\nExpected: %v\n", gotOut, tt.wantOut)
++			if gotOut, wantOut := out.String(), manifestForAddonOS(tt.wantOut); gotOut != wantOut {
++				t.Errorf("Actual output of EnsureDNSAddon() does not match expected.\nActual:  %v\nExpected: %v\n", gotOut, wantOut)
+ 			}
+ 		})
+ 	}
+@@ -1786,3 +1788,61 @@ func newMockClientForTest(t *testing.T, replicas int32, deploymentSize int, imag
+ 	}
+ 	return client
+ }
++
++func TestCoreDNSDeploymentOS(t *testing.T) {
++	replicas := int32(2)
++	for _, tc := range []struct {
++		os           string
++		capabilities bool
++	}{
++		{os: "linux", capabilities: true},
++		{os: "windows", capabilities: true},
++		{os: "freebsd", capabilities: false},
++	} {
++		t.Run(tc.os, func(t *testing.T) {
++			b, err := kubeadmutil.ParseTemplate(CoreDNSDeployment, struct {
++				DeploymentName, Image, ControlPlaneTaintKey, CoreDNSConfigMapName, OS string
++				Replicas                                                              *int32
++			}{
++				DeploymentName:       "foo",
++				Image:                "foo",
++				ControlPlaneTaintKey: "foo",
++				CoreDNSConfigMapName: "foo",
++				OS:                   tc.os,
++				Replicas:             &replicas,
++			})
++			if err != nil {
++				t.Fatalf("ParseTemplate: %v", err)
++			}
++			d := &apps.Deployment{}
++			if err := runtime.DecodeInto(clientsetscheme.Codecs.UniversalDecoder(), b, d); err != nil {
++				t.Fatalf("decode: %v", err)
++			}
++			if got := d.Spec.Template.Spec.NodeSelector[v1.LabelOSStable]; got != tc.os {
++				t.Errorf("nodeSelector %s = %q, want %q", v1.LabelOSStable, got, tc.os)
++			}
++			caps := d.Spec.Template.Spec.Containers[0].SecurityContext.Capabilities
++			if (caps != nil) != tc.capabilities {
++				t.Errorf("capabilities = %v, want present: %v", caps, tc.capabilities)
++			}
++			if tc.capabilities && (len(caps.Drop) != 1 || caps.Drop[0] != "ALL" || len(caps.Add) != 1 || caps.Add[0] != "NET_BIND_SERVICE") {
++				t.Errorf("capabilities = %+v, want drop ALL, add NET_BIND_SERVICE", caps)
++			}
++		})
++	}
++}
++
++// manifestForAddonOS adapts an expected CoreDNS manifest, written for Linux, to the OS kubeadm deploys
++// CoreDNS for here: on FreeBSD it selects freebsd nodes and has no capabilities block.
++func manifestForAddonOS(m string) string {
++	if addonOS() != "freebsd" {
++		return m
++	}
++	m = strings.ReplaceAll(m, "kubernetes.io/os: linux", "kubernetes.io/os: freebsd")
++	return strings.ReplaceAll(m, `          capabilities:
++            add:
++            - NET_BIND_SERVICE
++            drop:
++            - ALL
++`, "")
++}
+diff --git a/cmd/kubeadm/app/phases/addons/dns/manifests.go b/cmd/kubeadm/app/phases/addons/dns/manifests.go
+index f032f81a900..d058e870d55 100644
+--- a/cmd/kubeadm/app/phases/addons/dns/manifests.go
++++ b/cmd/kubeadm/app/phases/addons/dns/manifests.go
+@@ -143,11 +143,13 @@ spec:
+             scheme: HTTP
+         securityContext:
+           allowPrivilegeEscalation: false
+-          #capabilities:
+-          #  add:
+-          #  - NET_BIND_SERVICE
+-          #  drop:
+-          #  - ALL
++{{- if ne .OS "freebsd" }}
++          capabilities:
++            add:
++            - NET_BIND_SERVICE
++            drop:
++            - ALL
++{{- end }}
+           readOnlyRootFilesystem: true
+       dnsPolicy: Default
+       volumes:
+diff --git a/cmd/kubeadm/app/phases/addons/proxy/proxy.go b/cmd/kubeadm/app/phases/addons/proxy/proxy.go
+index 6b5c0bb2cd6..5cb2f0296b5 100644
+--- a/cmd/kubeadm/app/phases/addons/proxy/proxy.go
++++ b/cmd/kubeadm/app/phases/addons/proxy/proxy.go
+@@ -251,7 +251,7 @@ func createKubeProxyAddon(cfg *kubeadmapi.ClusterConfiguration, client clientset
+ 		Image:             images.GetKubernetesImage(constants.KubeProxy, cfg),
+ 		ProxyConfigMap:    constants.KubeProxyConfigMap,
+ 		ProxyConfigMapKey: constants.KubeProxyConfigMapKey,
+-		ProxyOS:           runtime.GOOS,
++		ProxyOS:           addonOS(),
+ 	})
+ 	if err != nil {
+ 		return []byte(""), errors.Wrap(err, "error when parsing kube-proxy daemonset template")
+@@ -272,3 +272,12 @@ func createKubeProxyAddon(cfg *kubeadmapi.ClusterConfiguration, client clientset
+ 	// Create the DaemonSet for kube-proxy or update it in case it already exists
+ 	return []byte(""), apiclient.CreateOrUpdate(client.AppsV1().DaemonSets(kubeproxyDaemonSet.GetNamespace()), kubeproxyDaemonSet)
+ }
++
++// addonOS is the kubernetes.io/os the addon's pods select: the control plane's own OS where that is
++// FreeBSD, whose kubeadm deploys FreeBSD images, and linux otherwise, as upstream.
++func addonOS() string {
++	if runtime.GOOS == "freebsd" {
++		return "freebsd"
++	}
++	return "linux"
++}
+diff --git a/cmd/kubeadm/app/phases/addons/proxy/proxy_test.go b/cmd/kubeadm/app/phases/addons/proxy/proxy_test.go
+index 2f7b722d1d2..33b9f57cbaf 100644
+--- a/cmd/kubeadm/app/phases/addons/proxy/proxy_test.go
++++ b/cmd/kubeadm/app/phases/addons/proxy/proxy_test.go
+@@ -61,10 +61,11 @@ func TestCompileManifests(t *testing.T) {
+ 		{
+ 			name:     "KubeProxyDaemonSet19",
+ 			manifest: KubeProxyDaemonSet19,
+-			data: struct{ Image, ProxyConfigMap, ProxyConfigMapKey string }{
++			data: struct{ Image, ProxyConfigMap, ProxyConfigMapKey, ProxyOS string }{
+ 				Image:             "foo",
+ 				ProxyConfigMap:    "bar",
+ 				ProxyConfigMapKey: "baz",
++				ProxyOS:           "linux",
+ 			},
+ 		},
+ 	}
+@@ -187,10 +188,11 @@ func TestDaemonSetsHaveSystemNodeCriticalPriorityClassName(t *testing.T) {
+ 		{
+ 			name:     "KubeProxyDaemonSet19",
+ 			manifest: KubeProxyDaemonSet19,
+-			data: struct{ Image, ProxyConfigMap, ProxyConfigMapKey string }{
++			data: struct{ Image, ProxyConfigMap, ProxyConfigMapKey, ProxyOS string }{
+ 				Image:             "foo",
+ 				ProxyConfigMap:    "foo",
+ 				ProxyConfigMapKey: "foo",
++				ProxyOS:           "linux",
+ 			},
+ 		},
+ 	}
+-- 
+2.54.0 (Apple Git-157)
+

@@ -54,10 +54,20 @@ the package's binary as `portmap.pkg`. After that, the hostPort answered on 127.
 and from the Linux node, and `--focus=HostPort` passed 2/2. A connection from 127.0.0.1 to 127.0.0.1 still doesn't
 translate (the known limit in research/20).
 
-Not fixed, and not needed here: the fork's kubeadm doesn't build for Linux or Windows. dfr's "WIP: kubeadm on
-FreeBSD" commit left `apis/kubeadm/v1beta4/defaults_common.go` declaring `package v1beta3`, and both API versions
-redeclare `DefaultCertificatesDir`. FreeBSD builds are fine. Linux uses stock kubeadm anyway. Worth fixing
-before offering the kubeadm series upstream.
+**The fork's kubeadm didn't build for Linux, Windows or macOS (fixed, kubernetes 0067).** Linux uses stock kubeadm
+here, so this didn't block the cluster, but the kubeadm series has to build everywhere before it goes upstream.
+dfr's "WIP: kubeadm on FreeBSD" commit moved the default directories into per-OS files:
+`v1beta4/defaults_common.go` declared `package v1beta3`, both API versions declared `DefaultCertificatesDir` twice,
+and `KubernetesDir` existed only for Linux and FreeBSD. The same commit also commented out CoreDNS's capabilities
+(`drop: ALL`, `add: NET_BIND_SERVICE`) on every OS, and took the addons' `kubernetes.io/os` from `runtime.GOOS`.
+Those two changes would have reached Linux control planes as soon as the code compiled. 0067 keeps the
+capabilities everywhere except FreeBSD, selects `linux` everywhere except FreeBSD (as upstream does), and fixes the
+tests that broke with the templates or hardcoded Linux paths. kubeadm now builds for linux/arm64, linux/amd64,
+windows, darwin and freebsd. On Linux, all 55 kubeadm test packages pass except `test/cmd`'s `init` tests, and stock
+v1.36.1 kubeadm fails those identically (53 pass and the same 10 fail for both) on a host that already runs a
+control plane. The changed packages also pass on FreeBSD and macOS. On Linux, the rendered CoreDNS and kube-proxy
+manifests equal upstream's. The one remaining Linux difference is a second container removal in `kubeadm reset`,
+before unmounting (FreeBSD needs it); on Linux it finds nothing.
 
 ## Cross-OS checks (by hand)
 

@@ -63,9 +63,14 @@ and `KubernetesDir` existed only for Linux and FreeBSD. The same commit also com
 Those two changes would have reached Linux control planes as soon as the code compiled. 0067 keeps the
 capabilities everywhere except FreeBSD, selects `linux` everywhere except FreeBSD (as upstream does), and fixes the
 tests that broke with the templates or hardcoded Linux paths. kubeadm now builds for linux/arm64, linux/amd64,
-windows, darwin and freebsd. On Linux, all 55 kubeadm test packages pass except `test/cmd`'s `init` tests, and stock
-v1.36.1 kubeadm fails those identically (53 pass and the same 10 fail for both) on a host that already runs a
-control plane. The changed packages also pass on FreeBSD and macOS. On Linux, the rendered CoreDNS and kube-proxy
+windows, darwin and freebsd. On Linux, all 55 kubeadm test packages pass. `test/cmd` drives a kubeadm binary
+(`KUBEADM_PATH`). On the control-plane VM, its `init` tests failed for stock v1.36.1 kubeadm too: a dry-run `init`
+there reuses the existing `/etc/kubernetes/pki/ca.crt` and can't read its root-only key. On a clean Debian 13 VM
+(`NODE=11 scripts/macos-linux-vm.sh create`, no Kubernetes installed), both the fork's kubeadm (`85b1bbfb6bd`) and
+stock v1.36.1 (dl.k8s.io, sha256-checked) pass **63/63**, all 24 `init` tests included. A dry-run
+`kubeadm init` with both binaries also gives the same result: the 1346-line output differs only in the bootstrap
+token's expiration (one second apart), and the 34 written files are the same, with the 12 that aren't
+certificates (static pod manifests, kubelet config, kubeconfigs) identical apart from certificate data. The changed packages also pass on FreeBSD and macOS. On Linux, the rendered CoreDNS and kube-proxy
 manifests equal upstream's. The one remaining Linux difference is a second container removal in `kubeadm reset`,
 before unmounting (FreeBSD needs it); on Linux it finds nothing.
 

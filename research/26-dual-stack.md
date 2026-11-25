@@ -88,15 +88,15 @@ Kubernetes doesn't support this either: its documentation says NAT of multi-home
 special logic in the corresponding kernel modules", which no kube-proxy backend has. Fixing it here would mean
 pf rewriting or dropping the address parameters of INIT and INIT ACK chunks it translates.
 
-**Tried (2026-11-25), not finished.** A pf change behind a new sysctl, `net.pf.sctp_nat_single_homed`, rewrites the type
-of the IPv4 and IPv6 Address parameters in INIT and INIT ACK chunks pf translates to an unassigned type whose high bits
-mean "skip" (RFC 9260 3.2.1), so the peer sees a single-homed endpoint; lengths do not change and the checksum is
-recomputed. Across nodes it fixes the case above: pod to an SCTP ClusterIP (port 95 to 9090) failed with the option off
-and connected with it on. But with the option on, a client and server **on the same node** stopped working (80 to 80,
-also three SCTP NetworkPolicy e2e tests): INIT and INIT ACK pass, the client sends COOKIE ECHO, and the server pod
-receives it (its CRC check passes, no error counter moves) and never answers. Not understood yet, so the option is off
-on both nodes; with it off the new code returns at once and the kernel (`bsdk8s30`) behaves as `bsdk8s29`. The change
-is on a local branch (`bsdk8s/pf-sctp-nat-single-homed-15.1`, freebsd-src 05cb1d0a3), not pushed or listed in patches/.
+**Fixed (2026-11-25), freebsd-src 0049-0050, kernel `bsdk8s31`, `net.pf.sctp_nat_single_homed=1` on both nodes.** pf rewrites
+the type of the IPv4 and IPv6 Address parameters in INIT and INIT ACK chunks it translates to an unassigned type whose
+high bits mean "skip" (RFC 9260 3.2.1), so the peer sees a single-homed endpoint; lengths stay, the checksum is
+recomputed. The first version broke client and server **on the same node**: the server ignored the COOKIE ECHO. DTrace
+showed `sctp_handle_cookie_echo` returning right after the cookie HMAC check: between jails on one host the packet
+travels by reference (epair, bridge), and rewriting the INIT in place changed bytes the server had signed into its
+cookie. 0050 writes into an unshared copy (`m_unshare`). Pod to SCTP ClusterIP, client on node 1: with the option off,
+the two port-changing Services (95 to 80) fail, on the same node and across nodes; with it on, all four cases (same and
+other node, 80 to 80 and 95 to 80) connect. Off by default in pf; the cluster turns it on.
 
 **IPv6 LoadBalancer addresses:** bsd-lb now assigns and announces them (NDP), research/25.
 

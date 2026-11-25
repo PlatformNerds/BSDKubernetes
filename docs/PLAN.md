@@ -278,4 +278,4 @@ These are created on demand, not empty up front, so the org doesn't fill with de
 2. Once that runs end to end, offer `bsdk8s-v1.36.1`'s cgo-free kubelet + rctl fix to `dfr/kubernetes` (first upstreaming candidate, see FORKS.md).
 3. Write the K0 ATF test to confirm or refute the rctl relink bug (`kern_rctl.c:1992`). Submit to Phabricator/GitHub if confirmed.
 4. Stand up nightly cross-compile CI against Kubernetes `master` (catches the next `possibleCPUs`-style breakage within a day).
-5. Join a FreeBSD worker to a Linux kubeadm cluster. Run the e2e conformance suite. Publish the pass rate.
+5. ~~Join a FreeBSD worker to a Linux kubeadm cluster. Run the e2e conformance suite. Publish the pass rate.~~ Done 2026-11-25: stock Debian 13 control plane + FreeBSD worker, upstream e2e v1.36.1 conformance 438/446 (research/27).

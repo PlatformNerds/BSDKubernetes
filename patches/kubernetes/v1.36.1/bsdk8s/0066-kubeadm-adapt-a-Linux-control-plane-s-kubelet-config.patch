@@ -1,0 +1,184 @@
+From 4d281b4b52c8771a79028cd68c41f4098ee3bacb Mon Sep 17 00:00:00 2001
+From: PePe Amengual <2208324+jamengual@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 06:51:27 -0700
+Subject: [PATCH] kubeadm: adapt a Linux control plane's kubelet config paths
+ on FreeBSD join
+
+kubeadm join downloads the cluster's KubeletConfiguration. When a Linux control
+plane generated it, clientCAFile and staticPodPath point under /etc/kubernetes,
+which on FreeBSD is /usr/local/etc/kubernetes (constants.KubernetesDir), and
+resolvConf is systemd-resolved's file; the kubelet then fails to start with
+"open /etc/kubernetes/pki/ca.crt: no such file or directory". Rewrite those
+fields like Mutate does for Windows nodes.
+---
+ .../componentconfigs/kubelet_paths_freebsd.go | 52 +++++++++++++++++++
+ .../kubelet_paths_freebsd_test.go             | 52 +++++++++++++++++++
+ .../componentconfigs/kubelet_paths_other.go   | 25 +++++++++
+ .../app/componentconfigs/kubelet_unix.go      |  1 +
+ 4 files changed, 130 insertions(+)
+ create mode 100644 cmd/kubeadm/app/componentconfigs/kubelet_paths_freebsd.go
+ create mode 100644 cmd/kubeadm/app/componentconfigs/kubelet_paths_freebsd_test.go
+ create mode 100644 cmd/kubeadm/app/componentconfigs/kubelet_paths_other.go
+
+diff --git a/cmd/kubeadm/app/componentconfigs/kubelet_paths_freebsd.go b/cmd/kubeadm/app/componentconfigs/kubelet_paths_freebsd.go
+new file mode 100644
+index 00000000000..271b84a2164
+--- /dev/null
++++ b/cmd/kubeadm/app/componentconfigs/kubelet_paths_freebsd.go
+@@ -0,0 +1,52 @@
++/*
++Copyright 2026 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package componentconfigs
++
++import (
++	"path/filepath"
++	"strings"
++
++	"k8s.io/klog/v2"
++	kubeletconfig "k8s.io/kubelet/config/v1beta1"
++
++	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
++)
++
++// linuxKubernetesDir is constants.KubernetesDir on Linux.
++const linuxKubernetesDir = "/etc/kubernetes"
++
++// mutatePlatformPaths adapts the KubeletConfiguration that "kubeadm join" downloads from the cluster
++// when a Linux control plane generated it, like Mutate does for Windows nodes: kubeadm keeps its
++// files under constants.KubernetesDir, /usr/local/etc/kubernetes on FreeBSD, so the Linux paths of
++// the client CA and the static pod directory don't exist here and the kubelet fails to start. The
++// systemd-resolved resolver file doesn't exist on FreeBSD either; the kubelet default is used.
++func mutatePlatformPaths(cfg *kubeletconfig.KubeletConfiguration) {
++	mutateStringField := func(name string, field *string) {
++		rest, ok := strings.CutPrefix(*field, linuxKubernetesDir+"/")
++		if !ok || constants.KubernetesDir == linuxKubernetesDir {
++			return
++		}
++		*field = filepath.Join(constants.KubernetesDir, rest)
++		klog.V(2).Infof("[componentconfig] kubelet/FreeBSD: adapted path for field %q to %q", name, *field)
++	}
++	mutateStringField("staticPodPath", &cfg.StaticPodPath)
++	mutateStringField("authentication.x509.clientCAFile", &cfg.Authentication.X509.ClientCAFile)
++	if cfg.ResolverConfig != nil && *cfg.ResolverConfig == kubeletSystemdResolverConfig {
++		klog.V(2).Infof("[componentconfig] kubelet/FreeBSD: dropping systemd-resolved field \"resolvConf\" %q", *cfg.ResolverConfig)
++		cfg.ResolverConfig = nil
++	}
++}
+diff --git a/cmd/kubeadm/app/componentconfigs/kubelet_paths_freebsd_test.go b/cmd/kubeadm/app/componentconfigs/kubelet_paths_freebsd_test.go
+new file mode 100644
+index 00000000000..7d380b9b1d3
+--- /dev/null
++++ b/cmd/kubeadm/app/componentconfigs/kubelet_paths_freebsd_test.go
+@@ -0,0 +1,52 @@
++/*
++Copyright 2026 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package componentconfigs
++
++import (
++	"testing"
++
++	kubeletconfig "k8s.io/kubelet/config/v1beta1"
++	"k8s.io/utils/ptr"
++)
++
++func TestMutatePlatformPathsFreeBSD(t *testing.T) {
++	cfg := &kubeletconfig.KubeletConfiguration{
++		StaticPodPath:  "/etc/kubernetes/manifests",
++		ResolverConfig: ptr.To(kubeletSystemdResolverConfig),
++	}
++	cfg.Authentication.X509.ClientCAFile = "/etc/kubernetes/pki/ca.crt"
++	mutatePlatformPaths(cfg)
++	if cfg.StaticPodPath != "/usr/local/etc/kubernetes/manifests" {
++		t.Errorf("staticPodPath = %q", cfg.StaticPodPath)
++	}
++	if cfg.Authentication.X509.ClientCAFile != "/usr/local/etc/kubernetes/pki/ca.crt" {
++		t.Errorf("clientCAFile = %q", cfg.Authentication.X509.ClientCAFile)
++	}
++	if cfg.ResolverConfig != nil {
++		t.Errorf("resolvConf = %q, want unset", *cfg.ResolverConfig)
++	}
++
++	// A FreeBSD control plane's config is left alone.
++	own := &kubeletconfig.KubeletConfiguration{
++		StaticPodPath:  "/usr/local/etc/kubernetes/manifests",
++		ResolverConfig: ptr.To("/usr/local/etc/kubernetes/resolv.conf"),
++	}
++	mutatePlatformPaths(own)
++	if own.StaticPodPath != "/usr/local/etc/kubernetes/manifests" || *own.ResolverConfig != "/usr/local/etc/kubernetes/resolv.conf" {
++		t.Errorf("FreeBSD paths changed: %q %q", own.StaticPodPath, *own.ResolverConfig)
++	}
++}
+diff --git a/cmd/kubeadm/app/componentconfigs/kubelet_paths_other.go b/cmd/kubeadm/app/componentconfigs/kubelet_paths_other.go
+new file mode 100644
+index 00000000000..2a75acd6049
+--- /dev/null
++++ b/cmd/kubeadm/app/componentconfigs/kubelet_paths_other.go
+@@ -0,0 +1,25 @@
++//go:build !windows && !freebsd
++
++/*
++Copyright 2026 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package componentconfigs
++
++import kubeletconfig "k8s.io/kubelet/config/v1beta1"
++
++// mutatePlatformPaths adapts host paths in a KubeletConfiguration that another OS generated; Linux
++// paths need no change.
++func mutatePlatformPaths(cfg *kubeletconfig.KubeletConfiguration) {}
+diff --git a/cmd/kubeadm/app/componentconfigs/kubelet_unix.go b/cmd/kubeadm/app/componentconfigs/kubelet_unix.go
+index 05849cbf8a1..4c0fc8764fe 100644
+--- a/cmd/kubeadm/app/componentconfigs/kubelet_unix.go
++++ b/cmd/kubeadm/app/componentconfigs/kubelet_unix.go
+@@ -28,6 +28,7 @@ import (
+ 
+ // Mutate allows applying pre-defined modifications to the config before it's marshaled.
+ func (kc *kubeletConfig) Mutate() error {
++	mutatePlatformPaths(&kc.config)
+ 	if err := mutateResolverConfig(&kc.config, isServiceActive); err != nil {
+ 		return err
+ 	}
+-- 
+2.54.0 (Apple Git-157)
+
